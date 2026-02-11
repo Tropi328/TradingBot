@@ -1,4 +1,9 @@
-﻿# Capital.com DEMO Multi-Asset Trading Bot (Python 3.11)
+# Capital.com DEMO Multi-Asset Trading Bot (Python 3.11)
+
+## Disclaimer (Very Early Stage)
+- This is a very early-stage project.
+- This repository is for educational purposes only and is not investment advice.
+- Trading and investing involve risk, including possible loss of capital.
 
 This repo contains a DEMO/paper trading bot for Capital.com Open API with:
 - ICT + trend-following strategy logic
@@ -11,7 +16,6 @@ This repo contains a DEMO/paper trading bot for Capital.com Open API with:
 
 ## Safety
 - DEMO only.
-- No secrets in repo (`.env` is ignored).
 - Use only official HTTP API.
 
 ## Install
@@ -179,3 +183,5 @@ Current unit tests cover:
 ## Notes
 - Epic names differ by account. For Gold on many DEMO accounts use `GOLD` (not `XAUUSD`).
 - If API returns accountId errors, verify DEMO account is active and `CAPITAL_ACCOUNT_ID` matches that account.
+
+
