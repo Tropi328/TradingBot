@@ -176,6 +176,28 @@ def format_trace_text(trace: DecisionTrace, timezone_name: str) -> str:
     penalties = ",".join(f"{key}:{value:.1f}" for key, value in trace.penalties.items()) if trace.penalties else "none"
     gates = ",".join(f"{key}:{1 if value else 0}" for key, value in trace.gates.items()) if trace.gates else "none"
     blocked_gate = trace.gate_blocked or "-"
+    orderflow_text = "of=none"
+    orderflow_raw = trace.snapshot.get("orderflow")
+    if isinstance(orderflow_raw, dict):
+        metrics = orderflow_raw.get("metrics")
+        mode = str(orderflow_raw.get("mode", "LITE")).upper()
+        confidence = orderflow_raw.get("confidence")
+        direction = str(orderflow_raw.get("direction", "NEUTRAL")).upper()
+        chop = None
+        spread_ratio = None
+        if isinstance(metrics, dict):
+            chop = metrics.get("chop_score")
+            spread_ratio = metrics.get("spread_ratio")
+        conf_text = f"{float(confidence):.2f}" if isinstance(confidence, (float, int)) else "-"
+        chop_text = f"{float(chop):.2f}" if isinstance(chop, (float, int)) else "-"
+        spr_text = f"{float(spread_ratio):.3f}" if isinstance(spread_ratio, (float, int)) else "-"
+        trigger_bonus = trace.score_breakdown.get("orderflow.trigger_bonus")
+        execution_bonus = trace.score_breakdown.get("orderflow.execution_bonus")
+        divergence_penalty = trace.score_breakdown.get("orderflow.divergence_penalty")
+        tb = f"{float(trigger_bonus):.1f}" if isinstance(trigger_bonus, (float, int)) else "-"
+        eb = f"{float(execution_bonus):.1f}" if isinstance(execution_bonus, (float, int)) else "-"
+        dp = f"{float(divergence_penalty):.1f}" if isinstance(divergence_penalty, (float, int)) else "-"
+        orderflow_text = f"of(mode={mode},conf={conf_text},dir={direction},chop={chop_text},spr={spr_text},b_t={tb},b_e={eb},p_div={dp})"
     return (
         f"{trace.asset} state | strategy={strategy_name} score={score_total} | "
         f"layers(edge={edge:.1f},trigger={trigger:.1f},execution={execution:.1f}) | "
@@ -189,7 +211,7 @@ def format_trace_text(trace: DecisionTrace, timezone_name: str) -> str:
         f"M5:{m5_update} close={_fmt_ts(trace.m5_last_closed_ts, timezone_name)} "
         f"entry={trace.m5.entry_state} mss={int(trace.m5.mss_ok)} "
         f"disp={int(trace.m5.displacement_ok)} fvg={int(trace.m5.fvg_ok)} "
-        f"fvg_range={fvg} | gates={gates} blocked_gate={blocked_gate} penalties={penalties} "
+        f"fvg_range={fvg} | gates={gates} blocked_gate={blocked_gate} penalties={penalties} {orderflow_text} "
         f"| decision={trace.final_decision} | reasons={reasons} | blocking={blocking} | would_enter_if={would_enter_if}"
         f"{pd_diag}"
     )

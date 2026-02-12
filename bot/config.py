@@ -281,6 +281,88 @@ class DecisionPolicyConfig(BaseModel):
         return self
 
 
+class BacktestTuningConfig(BaseModel):
+    wait_reaction_timeout_bars: int = 15
+    wait_mitigation_timeout_bars: int = 30
+    reaction_timeout_force_enable: bool = True
+    penalty_orb_no_retest: float = -4.0
+    penalty_orb_confirm_low: float = -3.0
+    penalty_scalp_no_displacement: float = -4.0
+    penalty_scalp_no_mss: float = -3.0
+    penalty_scalp_no_fvg: float = -2.0
+    ohlc_only_spread_soft_penalty: float = 3.0
+    thresholds_v2_trade: float = 62.0
+    thresholds_v2_small_min: float = 58.0
+    thresholds_v2_small_max: float = 61.0
+    dynamic_spread_ratio_frac: float = 0.9
+    dynamic_atr_buffer_mult: float = 1.1
+    dynamic_spread_score_penalty: float = 2.0
+    dynamic_atr_score_penalty: float = 1.0
+    assumed_spread_by_symbol: dict[str, float] = Field(default_factory=lambda: {"XAUUSD": 0.2})
+
+    @model_validator(mode="after")
+    def validate_values(self) -> "BacktestTuningConfig":
+        if self.wait_reaction_timeout_bars <= 0:
+            raise ValueError("wait_reaction_timeout_bars must be > 0")
+        if self.wait_mitigation_timeout_bars <= 0:
+            raise ValueError("wait_mitigation_timeout_bars must be > 0")
+        if self.ohlc_only_spread_soft_penalty < 0:
+            raise ValueError("ohlc_only_spread_soft_penalty must be >= 0")
+        if not (0 <= self.thresholds_v2_small_min <= self.thresholds_v2_small_max <= 100):
+            raise ValueError("thresholds_v2_small_min/thresholds_v2_small_max must be in [0,100] and min<=max")
+        if not (0 < self.thresholds_v2_trade <= 100):
+            raise ValueError("thresholds_v2_trade must be in (0,100]")
+        if not (0.0 <= self.dynamic_spread_ratio_frac <= 1.0):
+            raise ValueError("dynamic_spread_ratio_frac must be in [0,1]")
+        if self.dynamic_atr_buffer_mult <= 0:
+            raise ValueError("dynamic_atr_buffer_mult must be > 0")
+        normalized: dict[str, float] = {}
+        for key, value in self.assumed_spread_by_symbol.items():
+            symbol = str(key).strip().upper()
+            if not symbol:
+                continue
+            spread = float(value)
+            if spread < 0:
+                raise ValueError("assumed_spread_by_symbol values must be >= 0")
+            normalized[symbol] = spread
+        self.assumed_spread_by_symbol = normalized
+        return self
+
+
+class OrderflowConfig(BaseModel):
+    default_mode: str = "LITE"
+    full_symbols: list[str] = Field(default_factory=lambda: ["BTCUSD"])
+    default_window: int = 64
+    trigger_bonus_max: float = 10.0
+    execution_bonus_max: float = 5.0
+    divergence_penalty_min: float = 6.0
+    divergence_penalty_max: float = 10.0
+    small_soft_gate_confidence: float = 0.75
+    small_soft_gate_chop: float = 0.75
+
+    @model_validator(mode="after")
+    def validate_values(self) -> "OrderflowConfig":
+        self.default_mode = self.default_mode.strip().upper()
+        if self.default_mode not in {"LITE", "FULL"}:
+            raise ValueError("orderflow.default_mode must be LITE or FULL")
+        self.full_symbols = [str(item).strip().upper() for item in self.full_symbols if str(item).strip()]
+        if self.default_window <= 0:
+            raise ValueError("orderflow.default_window must be > 0")
+        if self.trigger_bonus_max < 0:
+            raise ValueError("orderflow.trigger_bonus_max must be >= 0")
+        if self.execution_bonus_max < 0:
+            raise ValueError("orderflow.execution_bonus_max must be >= 0")
+        if self.divergence_penalty_min < 0 or self.divergence_penalty_max < 0:
+            raise ValueError("orderflow divergence penalties must be >= 0")
+        if self.divergence_penalty_min > self.divergence_penalty_max:
+            raise ValueError("orderflow.divergence_penalty_min must be <= divergence_penalty_max")
+        if not (0 <= self.small_soft_gate_confidence <= 1):
+            raise ValueError("orderflow.small_soft_gate_confidence must be in [0,1]")
+        if not (0 <= self.small_soft_gate_chop <= 1):
+            raise ValueError("orderflow.small_soft_gate_chop must be in [0,1]")
+        return self
+
+
 class AppConfig(BaseModel):
     timezone: str = "Europe/Warsaw"
     instrument: InstrumentConfig = Field(default_factory=InstrumentConfig)
@@ -303,6 +385,8 @@ class AppConfig(BaseModel):
     scalp: ScalpStrategyConfig = Field(default_factory=ScalpStrategyConfig)
     portfolio: PortfolioSupervisorConfig = Field(default_factory=PortfolioSupervisorConfig)
     decision_policy: DecisionPolicyConfig = Field(default_factory=DecisionPolicyConfig)
+    backtest_tuning: BacktestTuningConfig = Field(default_factory=BacktestTuningConfig)
+    orderflow: OrderflowConfig = Field(default_factory=OrderflowConfig)
 
     @model_validator(mode="after")
     def normalize_assets(self) -> "AppConfig":

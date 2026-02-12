@@ -52,7 +52,7 @@ def test_quality_gate_blocks_when_score_high_but_execution_bad() -> None:
         now=datetime(2026, 2, 11, 12, 0, tzinfo=timezone.utc),
         timezone_name="Europe/Warsaw",
     )
-    assert "GATE_EXECUTION_FAIL" in reasons
+    assert "EXEC_FAIL_SPREAD_TOO_HIGH" in reasons
 
 
 def test_schedule_blocks_index_outside_window() -> None:
@@ -79,7 +79,7 @@ def test_schedule_blocks_index_outside_window() -> None:
         now=datetime(2026, 2, 15, 11, 0, tzinfo=timezone.utc),  # Sunday
         timezone_name="Europe/Warsaw",
     )
-    assert "GATE_SCHEDULE_FAIL" in reasons
+    assert "EXEC_FAIL_MARKET_CLOSED" in reasons
 
 
 def test_scoring_v2_outputs_layers_penalties_and_total() -> None:

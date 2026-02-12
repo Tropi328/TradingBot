@@ -36,6 +36,9 @@ dist/
 runtime_dashboard.json
 *.pid
 *.tmp
+reports/
+data/
+bot/data/*.csv
 
 # Editor/IDE
 .vscode/

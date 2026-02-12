@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from collections import Counter
@@ -14,7 +16,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from bot.backtest.engine import run_backtest_from_csv, run_walk_forward_from_csv
+from bot.backtest.data_provider import AutoDataLoader, MissingDataError, normalize_timeframe
+from bot.backtest.engine import (
+    BacktestVariant,
+    run_backtest,
+    run_backtest_from_csv,
+    run_backtest_multi_strategy,
+    run_walk_forward,
+    run_walk_forward_from_csv,
+    run_walk_forward_multi_strategy,
+)
+from bot.backtest.runner import BacktestRunner
 from bot.clock import (
     is_trading_weekday,
     should_poll_closed_candle,
@@ -47,6 +59,11 @@ from bot.strategy.candidate_queue import CandidateQueue
 from bot.strategy.index_existing import IndexExistingStrategy
 from bot.strategy.orb_h4_retest import OrbH4RetestStrategy
 from bot.strategy.portfolio_supervisor import EntryProposal, PortfolioSupervisor
+from bot.strategy.orderflow import (
+    CompositeOrderflowProvider,
+    OrderflowProvider,
+    OrderflowSnapshot,
+)
 from bot.strategy.ranker import rank_score
 from bot.strategy.risk import RiskEngine
 from bot.strategy.router import StrategyRouter
@@ -140,6 +157,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backtest-data", default=None)
     parser.add_argument("--backtest-epic", default=None)
     parser.add_argument("--backtest-spread", type=float, default=0.2)
+    parser.add_argument("--backtest-symbols", default=None, help="Comma-separated symbols for auto data mode.")
+    parser.add_argument("--backtest-start", default=None, help="UTC start (e.g. 2023-01-01)")
+    parser.add_argument("--backtest-end", default=None, help="UTC end (exclusive if datetime, inclusive date if YYYY-MM-DD)")
+    parser.add_argument("--backtest-tf", default="5m", help="Target timeframe, e.g. 5m")
+    parser.add_argument("--backtest-price", choices=["mid", "bid", "ask"], default="mid")
+    parser.add_argument("--backtest-data-root", default="data")
+    parser.add_argument("--backtest-source-priority", default="", help="Comma-separated source priority.")
+    parser.add_argument("--backtest-slippage-points", type=float, default=0.0)
+    parser.add_argument("--backtest-slippage-atr-multiplier", type=float, default=0.0)
+    parser.add_argument("--backtest-autofetch", action="store_true")
+    parser.add_argument("--backtest-fetch-script", default="fetch_market_data.py")
+    parser.add_argument("--backtest-variants", default="W0", help="Comma-separated variants: W0,W1,W2[,W3]")
+    parser.add_argument("--backtest-reports-dir", default="reports")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--wf-splits", type=int, default=4)
 
@@ -408,17 +438,360 @@ def place_single_test_order(order_executor: OrderExecutor, market_data: MarketDa
         LOGGER.info("Dry-run test fill=%s", bool(filled))
 
 
-def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig]) -> None:
-    if not args.backtest_data:
-        raise RuntimeError("--backtest-data is required in --backtest mode")
-    epic = (args.backtest_epic or os.getenv("CAPITAL_EPIC") or assets[0].epic).strip().upper()
-    selected = next((a for a in assets if a.epic == epic), assets[0])
-    if args.walk_forward:
-        report = run_walk_forward_from_csv(config=config, asset=selected, csv_path=args.backtest_data, wf_splits=args.wf_splits, assumed_spread=args.backtest_spread)
-        LOGGER.info("Walk-forward report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
-    else:
-        report = run_backtest_from_csv(config=config, asset=selected, csv_path=args.backtest_data, assumed_spread=args.backtest_spread)
-        LOGGER.info("Backtest report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
+def _is_date_only(value: str) -> bool:
+    raw = value.strip()
+    return len(raw) == 10 and raw[4] == "-" and raw[7] == "-"
+
+
+def _parse_backtest_datetime(value: str, *, end_value: bool = False) -> datetime:
+    raw = value.strip()
+    normalized = raw.replace(" ", "T")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    if end_value and _is_date_only(raw):
+        dt += timedelta(days=1)
+    return dt
+
+
+def _resolve_runtime_path(root: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    cwd_candidate = Path.cwd() / path
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return root / path
+
+
+def _autofetch_backtest_data(
+    *,
+    fetch_script: Path,
+    symbols: list[str],
+    timeframe: str,
+    start_raw: str,
+    end_raw: str,
+) -> None:
+    if not fetch_script.exists():
+        raise RuntimeError(f"--backtest-autofetch requested, but script not found: {fetch_script}")
+    command = [
+        sys.executable,
+        str(fetch_script),
+        "--symbols",
+        ",".join(symbols),
+        "--tf",
+        timeframe,
+        "--start",
+        start_raw,
+        "--end",
+        end_raw,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip() or f"exit={result.returncode}"
+        raise RuntimeError(f"Autofetch failed: {details}")
+
+
+def _backtest_symbols(args: argparse.Namespace, assets: list[AssetConfig]) -> list[str]:
+    symbols = parse_epics_csv(args.backtest_symbols)
+    if symbols:
+        return symbols
+    if args.backtest_epic:
+        return [str(args.backtest_epic).strip().upper()]
+    env_epic = (os.getenv("CAPITAL_EPIC") or "").strip().upper()
+    if env_epic:
+        return [env_epic]
+    trade_enabled = [asset.epic for asset in assets if asset.trade_enabled]
+    if trade_enabled:
+        return trade_enabled
+    return [assets[0].epic]
+
+
+def _asset_map_for_symbols(symbols: list[str], assets: list[AssetConfig], config: AppConfig) -> dict[str, AssetConfig]:
+    by_epic = {asset.epic.upper(): asset for asset in assets}
+    template = assets[0] if assets else AssetConfig(**config.instrument.model_dump(), trade_enabled=True)
+    out: dict[str, AssetConfig] = {}
+    for symbol in symbols:
+        if symbol in by_epic:
+            out[symbol] = by_epic[symbol]
+        else:
+            out[symbol] = _asset_from_template(symbol, template, True)
+    return out
+
+
+def _parse_backtest_variants(raw: str) -> list[BacktestVariant]:
+    mapping: dict[str, BacktestVariant] = {
+        "W0": BacktestVariant(code="W0", reaction_timeout_reset=False, soft_reason_penalties=False, thresholds_v2=False, dynamic_threshold_bump=False),
+        "W1": BacktestVariant(code="W1", reaction_timeout_reset=True, soft_reason_penalties=False, thresholds_v2=False, dynamic_threshold_bump=False),
+        "W2": BacktestVariant(code="W2", reaction_timeout_reset=True, soft_reason_penalties=True, thresholds_v2=False, dynamic_threshold_bump=False),
+        "W3": BacktestVariant(code="W3", reaction_timeout_reset=True, soft_reason_penalties=True, thresholds_v2=True, dynamic_threshold_bump=True),
+    }
+    variants: list[BacktestVariant] = []
+    seen: set[str] = set()
+    for item in str(raw or "W0").split(","):
+        code = item.strip().upper()
+        if not code or code in seen:
+            continue
+        if code not in mapping:
+            raise RuntimeError(f"Unknown backtest variant '{code}'. Allowed: W0,W1,W2,W3")
+        variants.append(mapping[code])
+        seen.add(code)
+    if not variants:
+        variants.append(mapping["W0"])
+    return variants
+
+
+def _month_label(value: str, fallback: datetime) -> str:
+    raw = value.strip()
+    if len(raw) >= 7 and raw[4] == "-":
+        return raw[:7]
+    return fallback.strftime("%Y-%m")
+
+
+def _variant_report_filename(*, variant: BacktestVariant, start_raw: str, end_raw: str, start_dt: datetime, end_dt: datetime, symbol: str) -> str:
+    start_label = _month_label(start_raw, start_dt)
+    end_label = _month_label(end_raw, end_dt)
+    return f"{variant.code}_{start_label}_{end_label}_{symbol}.json"
+
+
+def _top3_blockers(report_dict: dict[str, object]) -> str:
+    blockers_raw = report_dict.get("top_blockers")
+    if not isinstance(blockers_raw, dict) or not blockers_raw:
+        return "-"
+    items = list(blockers_raw.items())[:3]
+    return ",".join(f"{k}:{v}" for k, v in items)
+
+
+def _log_variant_comparison(*, variant_payloads: dict[str, dict[str, object]], symbols: list[str]) -> None:
+    LOGGER.info("Backtest variant comparison:")
+    LOGGER.info("variant | symbol | trades | win_rate | pnl | expectancy | avg_r | max_dd | candidates | top3_blockers")
+    for code, payload in variant_payloads.items():
+        reports_raw = payload.get("reports")
+        if not isinstance(reports_raw, dict):
+            continue
+        for symbol in symbols:
+            report = reports_raw.get(symbol)
+            if not isinstance(report, dict):
+                continue
+            LOGGER.info(
+                "%s | %s | %s | %.4f | %.4f | %.4f | %.4f | %.4f | %s | %s",
+                code,
+                symbol,
+                report.get("trades", 0),
+                float(report.get("win_rate", 0.0)),
+                float(report.get("total_pnl", 0.0)),
+                float(report.get("expectancy", 0.0)),
+                float(report.get("avg_r", 0.0)),
+                float(report.get("max_drawdown", 0.0)),
+                report.get("signal_candidates", 0),
+                _top3_blockers(report),
+            )
+
+
+def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig], root: Path) -> None:
+    # Legacy CSV path mode (kept for backward compatibility).
+    if args.backtest_data:
+        epic = (args.backtest_epic or os.getenv("CAPITAL_EPIC") or assets[0].epic).strip().upper()
+        selected = next((a for a in assets if a.epic == epic), assets[0])
+        csv_path = _resolve_runtime_path(root, str(args.backtest_data))
+        if args.walk_forward:
+            report = run_walk_forward_from_csv(
+                config=config,
+                asset=selected,
+                csv_path=csv_path,
+                wf_splits=args.wf_splits,
+                assumed_spread=args.backtest_spread,
+                slippage_points=args.backtest_slippage_points,
+                slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+            )
+            LOGGER.info("Walk-forward report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
+        else:
+            report = run_backtest_from_csv(
+                config=config,
+                asset=selected,
+                csv_path=csv_path,
+                assumed_spread=args.backtest_spread,
+                slippage_points=args.backtest_slippage_points,
+                slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+            )
+            LOGGER.info("Backtest report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
+        return
+
+    # New automatic parquet data mode (without --backtest-data).
+    if not args.backtest_start or not args.backtest_end:
+        raise RuntimeError("--backtest-start and --backtest-end are required when --backtest-data is not provided")
+
+    timeframe = normalize_timeframe(args.backtest_tf)
+    start = _parse_backtest_datetime(args.backtest_start, end_value=False)
+    end = _parse_backtest_datetime(args.backtest_end, end_value=True)
+    if start >= end:
+        raise RuntimeError("--backtest-start must be before --backtest-end")
+
+    symbols = _backtest_symbols(args, assets)
+    source_priority = [item.strip() for item in str(args.backtest_source_priority).split(",") if item.strip()]
+    data_root = _resolve_runtime_path(root, str(args.backtest_data_root))
+    fetch_script = _resolve_runtime_path(root, str(args.backtest_fetch_script))
+    reports_dir = _resolve_runtime_path(root, str(args.backtest_reports_dir))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    loader = AutoDataLoader(data_root=data_root, source_priority=source_priority)
+    asset_map = _asset_map_for_symbols(symbols, assets, config)
+    variants = _parse_backtest_variants(args.backtest_variants)
+    if args.walk_forward and len(variants) > 1:
+        raise RuntimeError("Walk-forward supports one variant at a time. Use --backtest-variants W0 or W3.")
+
+    def _run_auto() -> dict[str, dict[str, object]]:
+        payloads: dict[str, dict[str, object]] = {}
+        for variant in variants:
+            reports: dict[str, dict[str, object]] = {}
+            for symbol in symbols:
+                loaded = loader.load_symbol_data(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start=start,
+                    end=end,
+                    price_mode=args.backtest_price,
+                )
+                data_health = loaded.diagnostics.get("data_health", {})
+                LOGGER.info(
+                    "Backtest data health | symbol=%s tf=%s bars=%s min_ts=%s max_ts=%s dups=%s gaps=%s",
+                    symbol,
+                    timeframe,
+                    data_health.get("bars"),
+                    data_health.get("min_ts_utc"),
+                    data_health.get("max_ts_utc"),
+                    data_health.get("duplicate_timestamps"),
+                    data_health.get("gap_count_over_1bar"),
+                )
+                frame = loaded.frame
+                candles = BacktestRunner._frame_to_candles(frame)
+                spread_series = frame.get("spread")
+                spread_from_data = (
+                    float(spread_series.dropna().median())
+                    if spread_series is not None and hasattr(spread_series, "dropna") and not spread_series.dropna().empty
+                    else None
+                )
+                symbol_spread_map = config.backtest_tuning.assumed_spread_by_symbol
+                symbol_spread_default = symbol_spread_map.get(symbol.upper())
+                if symbol_spread_default is None:
+                    symbol_spread_default = symbol_spread_map.get(asset_map[symbol].epic.upper())
+                if spread_from_data is not None:
+                    assumed_spread = spread_from_data
+                elif symbol_spread_default is not None:
+                    assumed_spread = float(symbol_spread_default)
+                else:
+                    assumed_spread = float(args.backtest_spread)
+
+                nan_counts = data_health.get("nan_counts", {}) if isinstance(data_health, dict) else {}
+                bars_count = int(data_health.get("bars", 0)) if isinstance(data_health, dict) and data_health.get("bars") is not None else 0
+                close_bid_nan = int(nan_counts.get("close_bid", bars_count)) if isinstance(nan_counts, dict) else bars_count
+                close_ask_nan = int(nan_counts.get("close_ask", bars_count)) if isinstance(nan_counts, dict) else bars_count
+                spread_mode = "ASSUMED_OHLC" if bars_count > 0 and close_bid_nan >= bars_count and close_ask_nan >= bars_count else "REAL_BIDASK"
+
+                debug_file = reports_dir / f"{variant.code}_debug_exec_{symbol}.jsonl"
+                no_price_debug_file = reports_dir / f"{variant.code}_debug_no_price_{symbol}.jsonl"
+                reaction_timeout_debug_file = reports_dir / f"{variant.code}_debug_reaction_timeout_{symbol}.jsonl"
+                data_context = {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "price_mode_requested": args.backtest_price,
+                    "spread_mode": spread_mode,
+                    "assumed_spread_used": float(assumed_spread),
+                    **(loaded.diagnostics if isinstance(getattr(loaded, "diagnostics", None), dict) else {}),
+                }
+                if args.walk_forward:
+                    report = run_walk_forward_multi_strategy(
+                        config=config,
+                        asset=asset_map[symbol],
+                        candles_m5=candles,
+                        wf_splits=args.wf_splits,
+                        assumed_spread=assumed_spread,
+                        slippage_points=args.backtest_slippage_points,
+                        slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+                        variant=variant,
+                        execution_debug_path=debug_file,
+                        no_price_debug_path=no_price_debug_file,
+                        reaction_timeout_debug_path=reaction_timeout_debug_file,
+                        data_context=data_context,
+                    )
+                    report_dict = report.to_dict()
+                else:
+                    report = run_backtest_multi_strategy(
+                        config=config,
+                        asset=asset_map[symbol],
+                        candles_m5=candles,
+                        assumed_spread=assumed_spread,
+                        slippage_points=args.backtest_slippage_points,
+                        slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+                        variant=variant,
+                        execution_debug_path=debug_file,
+                        no_price_debug_path=no_price_debug_file,
+                        reaction_timeout_debug_path=reaction_timeout_debug_file,
+                        data_context=data_context,
+                    )
+                    report_dict = report.to_dict()
+                report_dict["data_health"] = loaded.diagnostics.get("data_health", {})
+                report_dict["price_diagnostics"] = {
+                    "price_mode_requested": loaded.diagnostics.get("price_mode_requested", args.backtest_price),
+                    "source_datasets": loaded.diagnostics.get("source_datasets", []),
+                    "source_files_count": len(loaded.diagnostics.get("source_files", [])),
+                    "fallback_counters": loaded.diagnostics.get("fallback_counters", {}),
+                    "spread_mode": spread_mode,
+                    "assumed_spread_used": float(assumed_spread),
+                }
+                reports[symbol] = report_dict
+
+                filename = _variant_report_filename(
+                    variant=variant,
+                    start_raw=str(args.backtest_start),
+                    end_raw=str(args.backtest_end),
+                    start_dt=start,
+                    end_dt=end,
+                    symbol=symbol,
+                )
+                target = reports_dir / filename
+                target.write_text(json.dumps(report_dict, indent=2, ensure_ascii=True), encoding="utf-8")
+
+            payloads[variant.code] = {
+                "variant": variant.code,
+                "mode": "walk-forward" if args.walk_forward else "backtest",
+                "symbols": symbols,
+                "timeframe": timeframe,
+                "price": args.backtest_price,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "data_root": str(data_root),
+                "reports": reports,
+            }
+        return payloads
+
+    attempt = 0
+    while True:
+        try:
+            variant_payloads = _run_auto()
+            if len(variant_payloads) == 1:
+                payload = next(iter(variant_payloads.values()))
+                LOGGER.info("Backtest auto-data report: %s", json.dumps(payload, indent=2, ensure_ascii=True))
+            else:
+                LOGGER.info("Backtest auto-data variants: %s", ",".join(variant_payloads.keys()))
+                _log_variant_comparison(variant_payloads=variant_payloads, symbols=symbols)
+            return
+        except MissingDataError as exc:
+            for item in exc.missing:
+                LOGGER.error("Missing data: %s", item.to_line())
+            if args.backtest_autofetch and attempt == 0:
+                attempt += 1
+                _autofetch_backtest_data(
+                    fetch_script=fetch_script,
+                    symbols=symbols,
+                    timeframe=timeframe,
+                    start_raw=args.backtest_start,
+                    end_raw=args.backtest_end,
+                )
+                continue
+            raise RuntimeError("Backtest data missing. Use --backtest-autofetch or provide --backtest-data CSV.") from exc
 
 
 def _timeframe_history(config: AppConfig) -> dict[str, int]:
@@ -734,15 +1107,54 @@ def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
+def _resolve_orderflow_mode(*, symbol: str, route_params: dict[str, object], default_mode: str, full_symbols: set[str]) -> str:
+    params = route_params.get("orderflow")
+    if isinstance(params, dict):
+        mode = str(params.get("mode", "")).strip().upper()
+        if mode in {"LITE", "FULL"}:
+            return mode
+    if symbol.strip().upper() in full_symbols:
+        return "FULL"
+    mode = default_mode.strip().upper()
+    return mode if mode in {"LITE", "FULL"} else "LITE"
+
+
+def _orderflow_param(
+    *,
+    route_params: dict[str, object],
+    settings: dict[str, float] | None,
+    key: str,
+    default: float,
+) -> float:
+    params = route_params.get("orderflow")
+    if isinstance(params, dict):
+        try:
+            if key in params:
+                return float(params[key])
+        except (TypeError, ValueError):
+            pass
+    if settings is not None and key in settings:
+        try:
+            return float(settings[key])
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
 def _compute_v2_score(
     *,
+    symbol: str = "",
     strategy_name: str,
     bias: BiasState,
     route_params: dict[str, object],
     evaluation: StrategyEvaluation,
     news_blocked: bool,
     schedule_open: bool,
+    orderflow_snapshot: OrderflowSnapshot | None = None,
+    setup_side: str | None = None,
+    orderflow_settings: dict[str, float] | None = None,
 ) -> StrategyEvaluation:
+    del symbol
     raw = dict(evaluation.score_breakdown)
     evaluation.metadata["raw_score_breakdown"] = raw
 
@@ -756,7 +1168,7 @@ def _compute_v2_score(
     location_score = 10.0
     pd_eq = evaluation.metadata.get("h1_pd_eq", evaluation.snapshot.get("h1_pd_eq"))
     h1_close = evaluation.metadata.get("h1_close", evaluation.snapshot.get("h1_close"))
-    side = str(evaluation.metadata.get("side", "")).upper()
+    side = str(setup_side or evaluation.metadata.get("side", "")).upper()
     if pd_eq is not None and h1_close is not None and side in {"LONG", "SHORT"}:
         try:
             eq_float = float(pd_eq)
@@ -808,6 +1220,70 @@ def _compute_v2_score(
     market_state_score = 3.0 if schedule_open else 0.0
     execution_score = _clamp(spread_ratio_score + slippage_risk_score + market_state_score, 0.0, 15.0)
 
+    of_trigger_bonus = 0.0
+    of_execution_bonus = 0.0
+    of_divergence_penalty = 0.0
+    if orderflow_snapshot is not None:
+        of_dict = orderflow_snapshot.to_dict()
+        evaluation.metadata["orderflow_snapshot"] = of_dict
+        evaluation.snapshot["orderflow"] = of_dict
+
+        confidence = float(orderflow_snapshot.confidence)
+        chop_score = float(orderflow_snapshot.metrics.chop_score)
+        of_spread_ratio = float(orderflow_snapshot.metrics.spread_ratio)
+        of_pressure = float(orderflow_snapshot.pressure)
+        of_direction = str(orderflow_snapshot.direction).upper()
+
+        trigger_bonus_cap = _orderflow_param(
+            route_params=route_params,
+            settings=orderflow_settings,
+            key="trigger_bonus_max",
+            default=10.0,
+        )
+        execution_bonus_cap = _orderflow_param(
+            route_params=route_params,
+            settings=orderflow_settings,
+            key="execution_bonus_max",
+            default=5.0,
+        )
+        divergence_penalty_min = _orderflow_param(
+            route_params=route_params,
+            settings=orderflow_settings,
+            key="divergence_penalty_min",
+            default=6.0,
+        )
+        divergence_penalty_max = _orderflow_param(
+            route_params=route_params,
+            settings=orderflow_settings,
+            key="divergence_penalty_max",
+            default=10.0,
+        )
+        if divergence_penalty_min > divergence_penalty_max:
+            divergence_penalty_min, divergence_penalty_max = divergence_penalty_max, divergence_penalty_min
+
+        flow_alignment = _clamp(abs(of_pressure), 0.0, 1.0)
+        of_trigger_bonus = _clamp(
+            confidence * (1.0 - chop_score) * (0.5 + (0.5 * flow_alignment)) * trigger_bonus_cap,
+            0.0,
+            trigger_bonus_cap,
+        )
+        execution_quality = _clamp(1.0 - (of_spread_ratio / max(max_spread_ratio, 1e-9)), 0.0, 1.0)
+        of_execution_bonus = _clamp(confidence * execution_quality * execution_bonus_cap, 0.0, execution_bonus_cap)
+
+        if side in {"LONG", "SHORT"} and of_direction in {"LONG", "SHORT"} and of_direction != side:
+            of_divergence_penalty = _clamp(
+                divergence_penalty_min + ((divergence_penalty_max - divergence_penalty_min) * flow_alignment),
+                divergence_penalty_min,
+                divergence_penalty_max,
+            )
+        evaluation.metadata["orderflow_influence"] = {
+            "trigger_bonus": round(of_trigger_bonus, 4),
+            "execution_bonus": round(of_execution_bonus, 4),
+            "divergence_penalty": round(of_divergence_penalty, 4),
+            "direction": of_direction,
+            "pressure": round(of_pressure, 4),
+        }
+
     penalties: dict[str, float] = {}
     if bias.direction == "NEUTRAL":
         penalties["NEUTRAL_BIAS"] = 5.0
@@ -821,6 +1297,8 @@ def _compute_v2_score(
         penalties["LATE_RETEST"] = 5.0
     if news_blocked:
         penalties["NEWS_MEDIUM_WINDOW"] = max(penalties.get("NEWS_MEDIUM_WINDOW", 0.0), 8.0)
+    if of_divergence_penalty > 0:
+        penalties["OF_DIVERGENCE"] = max(penalties.get("OF_DIVERGENCE", 0.0), of_divergence_penalty)
 
     for key, value in raw.items():
         if key.startswith("penalty_") and value < 0:
@@ -828,13 +1306,14 @@ def _compute_v2_score(
             penalties[mapped_key] = max(penalties.get(mapped_key, 0.0), abs(float(value)))
 
     penalty_total = sum(penalties.values())
-    score_pre_penalty = edge_score + trigger_score + execution_score
+    score_pre_penalty = edge_score + trigger_score + execution_score + of_trigger_bonus + of_execution_bonus
     score_total = _clamp(score_pre_penalty - penalty_total, 0.0, 100.0)
 
     evaluation.score_layers = {
         "edge": round(edge_score, 2),
         "trigger": round(trigger_score, 2),
         "execution": round(execution_score, 2),
+        "orderflow": round(of_trigger_bonus + of_execution_bonus, 2),
     }
     evaluation.penalties = {key: round(value, 2) for key, value in penalties.items()}
     evaluation.score_total = round(score_total, 2)
@@ -848,6 +1327,9 @@ def _compute_v2_score(
         "execution.spread_ratio_score": round(spread_ratio_score, 2),
         "execution.slippage_risk_score": round(slippage_risk_score, 2),
         "execution.market_state_score": round(market_state_score, 2),
+        "orderflow.trigger_bonus": round(of_trigger_bonus, 2),
+        "orderflow.execution_bonus": round(of_execution_bonus, 2),
+        "orderflow.divergence_penalty": round(of_divergence_penalty, 2),
         "edge_total": round(edge_score, 2),
         "trigger_total": round(trigger_score, 2),
         "execution_total": round(execution_score, 2),
@@ -881,7 +1363,7 @@ def _evaluate_hard_gates(
         schedule_open = is_schedule_open(now, schedule_cfg, timezone_name)
     if not schedule_open:
         gates["ScheduleGate"] = False
-        reasons.append("GATE_SCHEDULE_FAIL")
+        reasons.append("EXEC_FAIL_MARKET_CLOSED")
 
     gates_cfg = route_params.get("quality_gates")
     if isinstance(gates_cfg, dict):
@@ -889,9 +1371,20 @@ def _evaluate_hard_gates(
     else:
         max_spread_ratio = 0.15
     spread_ratio = evaluation.metadata.get("spread_ratio")
+    atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
+    spread_value = evaluation.snapshot.get("spread")
+    if atr_value is None:
+        gates["ExecutionGate"] = False
+        reasons.append("EXEC_FAIL_MISSING_FEATURES")
+    else:
+        try:
+            if float(atr_value) <= 0:
+                gates["ExecutionGate"] = False
+                reasons.append("EXEC_FAIL_INVALID_ATR")
+        except (TypeError, ValueError):
+            gates["ExecutionGate"] = False
+            reasons.append("EXEC_FAIL_INVALID_ATR")
     if spread_ratio is None:
-        atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-        spread_value = evaluation.snapshot.get("spread")
         if atr_value is not None and spread_value is not None:
             try:
                 atr_float = float(atr_value)
@@ -901,9 +1394,16 @@ def _evaluate_hard_gates(
                     evaluation.metadata["spread_ratio"] = spread_ratio
             except (TypeError, ValueError):
                 spread_ratio = None
-    if spread_ratio is not None and float(spread_ratio) > max_spread_ratio:
+    if spread_ratio is None:
+        if spread_value is None:
+            gates["ExecutionGate"] = False
+            reasons.append("EXEC_FAIL_NO_PRICE")
+        elif atr_value is not None and (isinstance(atr_value, (float, int)) and float(atr_value) > 0):
+            gates["ExecutionGate"] = False
+            reasons.append("EXEC_FAIL_MISSING_FEATURES")
+    elif float(spread_ratio) > max_spread_ratio:
         gates["ExecutionGate"] = False
-        reasons.append("GATE_EXECUTION_FAIL")
+        reasons.append("EXEC_FAIL_SPREAD_TOO_HIGH")
 
     setup_state = str(evaluation.metadata.get("setup_state", "READY")).upper()
     if setup_state in {"WAIT_MITIGATION", "WAIT_REACTION"}:
@@ -937,6 +1437,55 @@ def _quality_gate_reasons(
     return reasons
 
 
+def _apply_orderflow_small_soft_gate(
+    *,
+    route_params: dict[str, object],
+    evaluation: StrategyEvaluation,
+    orderflow_settings: dict[str, float] | None,
+) -> StrategyEvaluation:
+    if evaluation.action != DecisionAction.SMALL:
+        return evaluation
+    snapshot_raw = evaluation.metadata.get("orderflow_snapshot")
+    if not isinstance(snapshot_raw, dict):
+        return evaluation
+    metrics = snapshot_raw.get("metrics")
+    if not isinstance(metrics, dict):
+        return evaluation
+
+    try:
+        confidence = float(snapshot_raw.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    try:
+        chop_score = float(metrics.get("chop_score", 0.0))
+    except (TypeError, ValueError):
+        chop_score = 0.0
+
+    conf_threshold = _orderflow_param(
+        route_params=route_params,
+        settings=orderflow_settings,
+        key="small_soft_gate_confidence",
+        default=0.75,
+    )
+    chop_threshold = _orderflow_param(
+        route_params=route_params,
+        settings=orderflow_settings,
+        key="small_soft_gate_chop",
+        default=0.75,
+    )
+    if confidence >= conf_threshold and chop_score >= chop_threshold:
+        evaluation.action = DecisionAction.OBSERVE
+        if "OF_SOFT_GATE_CHOP" not in evaluation.reasons_blocking:
+            evaluation.reasons_blocking.append("OF_SOFT_GATE_CHOP")
+        if "ORDERFLOW_CHOP_CLEARED" not in evaluation.would_enter_if:
+            evaluation.would_enter_if.append("ORDERFLOW_CHOP_CLEARED")
+        evaluation.gates.setdefault("OrderflowSoftGate", True)
+        evaluation.gates["OrderflowSoftGate"] = False
+        if evaluation.gate_blocked is None:
+            evaluation.gate_blocked = "OrderflowSoftGate"
+    return evaluation
+
+
 def _risk_multiplier_for(
     *,
     evaluation: StrategyEvaluation,
@@ -965,6 +1514,7 @@ def run_multi_strategy_loop(
     risk_engine: RiskEngine,
     strategy_router: StrategyRouter,
     strategy_plugins: dict[str, StrategyPlugin],
+    orderflow_provider: OrderflowProvider,
     portfolio_supervisor: PortfolioSupervisor,
     order_executor: OrderExecutor,
     position_manager: PositionManager,
@@ -990,6 +1540,17 @@ def run_multi_strategy_loop(
     last_pending_sync_at: datetime | None = None
     last_positions_sync_at: datetime | None = None
     cycle = 0
+    orderflow_settings = {
+        "trigger_bonus_max": float(config.orderflow.trigger_bonus_max),
+        "execution_bonus_max": float(config.orderflow.execution_bonus_max),
+        "divergence_penalty_min": float(config.orderflow.divergence_penalty_min),
+        "divergence_penalty_max": float(config.orderflow.divergence_penalty_max),
+        "small_soft_gate_confidence": float(config.orderflow.small_soft_gate_confidence),
+        "small_soft_gate_chop": float(config.orderflow.small_soft_gate_chop),
+    }
+    orderflow_full_symbols = set(config.orderflow.full_symbols)
+    orderflow_default_mode = config.orderflow.default_mode
+    orderflow_default_window = int(config.orderflow.default_window)
 
     def _stop(signum: int, _frame: object) -> None:
         LOGGER.info("Received signal %s, shutting down.", signum)
@@ -1217,13 +1778,47 @@ def run_multi_strategy_loop(
                         schedule_open = True
                         if isinstance(schedule_cfg, dict):
                             schedule_open = is_schedule_open(now, schedule_cfg, config.timezone)
+                        mode_override = _resolve_orderflow_mode(
+                            symbol=epic,
+                            route_params=route.params,
+                            default_mode=orderflow_default_mode,
+                            full_symbols=orderflow_full_symbols,
+                        )
+                        route_of = route.params.get("orderflow")
+                        window = orderflow_default_window
+                        if isinstance(route_of, dict):
+                            try:
+                                window = max(8, int(route_of.get("window", orderflow_default_window)))
+                            except (TypeError, ValueError):
+                                window = orderflow_default_window
+                        atr_for_of = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
+                        atr_for_of_float: float | None
+                        try:
+                            atr_for_of_float = float(atr_for_of) if atr_for_of is not None else None
+                        except (TypeError, ValueError):
+                            atr_for_of_float = None
+                        orderflow_snapshot = orderflow_provider.get_snapshot(
+                            symbol=epic,
+                            tf=config.timeframes.m5,
+                            window=window,
+                            candles=state.cache.get(config.timeframes.m5, []),
+                            spread=spread,
+                            quote=q,
+                            atr_value=atr_for_of_float,
+                            extra=bundle.extra,
+                            mode_override=mode_override,
+                        )
                         evaluation = _compute_v2_score(
+                            symbol=epic,
                             strategy_name=route.strategy,
                             bias=bias,
                             route_params=route.params,
                             evaluation=evaluation,
                             news_blocked=news_blocked,
                             schedule_open=schedule_open,
+                            orderflow_snapshot=orderflow_snapshot,
+                            setup_side=candidate.side if candidate is not None else None,
+                            orderflow_settings=orderflow_settings,
                         )
                         _ = _normalize_action_for_score(evaluation=evaluation, config=config)
                         gate_reasons = _quality_gate_reasons(
@@ -1238,6 +1833,11 @@ def run_multi_strategy_loop(
                             for code in gate_reasons:
                                 if code not in evaluation.reasons_blocking:
                                     evaluation.reasons_blocking.append(code)
+                        evaluation = _apply_orderflow_small_soft_gate(
+                            route_params=route.params,
+                            evaluation=evaluation,
+                            orderflow_settings=orderflow_settings,
+                        )
 
                         signal_request = (
                             strategy.generate_order(epic, evaluation, candidate, bundle)
@@ -1608,7 +2208,7 @@ def run() -> None:
     LOGGER.info("Assets configured: %s", ",".join(f"{a.epic}{'' if a.trade_enabled else '(observe)'}" for a in assets))
 
     if args.backtest:
-        run_backtest_mode(args, config, assets)
+        run_backtest_mode(args, config, assets, root)
         return
 
     db_path = resolve_db_path(root, paper_mode=paper_mode)
@@ -1628,6 +2228,10 @@ def run() -> None:
         "ORB_H4_RETEST": OrbH4RetestStrategy(config),
         "TREND_PULLBACK_M15": TrendPullbackM15Strategy(config),
     }
+    orderflow_provider: OrderflowProvider = CompositeOrderflowProvider(
+        default_mode=config.orderflow.default_mode,
+        symbol_modes={symbol: "FULL" for symbol in config.orderflow.full_symbols},
+    )
     portfolio_supervisor = PortfolioSupervisor(config.portfolio)
     order_executor = OrderExecutor(client=client, journal=journal, dry_run=mode_dry_run, default_epic=assets[0].epic, default_currency=assets[0].currency)
     position_manager = PositionManager(client=client, journal=journal, dry_run=mode_dry_run)
@@ -1688,6 +2292,7 @@ def run() -> None:
         risk_engine=risk_engine,
         strategy_router=strategy_router,
         strategy_plugins=strategy_plugins,
+        orderflow_provider=orderflow_provider,
         portfolio_supervisor=portfolio_supervisor,
         order_executor=order_executor,
         position_manager=position_manager,

@@ -422,6 +422,7 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
         minimal_tick_buffer = max(1e-9, minimal_tick_buffer)
 
         created_any = False
+        side_diagnostics: list[str] = []
         for side in sides:
             sweep = detect_sweep_reject(
                 m5,
@@ -435,10 +436,14 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
                 fractal_right=self.config.swings.fractal_right,
             )
             if sweep is None:
+                side_diagnostics.append(
+                    f"{side}:NO_SWEEP(min_h={profile.sweep_min_hours},max_h={profile.sweep_max_hours},thr={profile.sweep_threshold_multiplier:.3f})"
+                )
                 continue
             sweep_ts = sweep.sweep_time.replace(second=0, microsecond=0).isoformat()
             setup_id = f"{symbol}:{side}:{sweep_ts}:{sweep.reference_swing_index}"
             if any(item.metadata.get("setup_id") == setup_id for item in state.queue):
+                side_diagnostics.append(f"{side}:DUP_SETUP")
                 continue
             candidate = SetupCandidate(
                 candidate_id=f"SCALP-{symbol}-{uuid.uuid4().hex[:10]}",
@@ -464,6 +469,13 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
 
         if created_any:
             state.last_candidate_at = data.now
+        elif data.m5_new_close and self.config.monitoring.log_decision_reasons and side_diagnostics:
+            LOGGER.info(
+                "SCALP candidate wait symbol=%s bias=%s diag=%s",
+                symbol,
+                bias.direction,
+                ";".join(side_diagnostics),
+            )
         return list(state.queue)
 
     def evaluate_candidate(
@@ -546,10 +558,13 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             displacement_ratio = body / max(displacement_threshold, 1e-9)
             displacement_ok = body > displacement_threshold
 
+        # Search from sweep origin instead of MSS-only window to avoid missing valid FVG
+        # that forms between sweep and later MSS confirmation.
+        fvg_start_index = max(0, sweep_idx)
         fvg = detect_latest_fvg(
             m5,
             side=candidate.side,
-            start_index=max(0, (mss.candle_index - 2) if mss is not None else 0),
+            start_index=fvg_start_index,
         )
         fvg_size = (fvg.upper - fvg.lower) if fvg is not None else 0.0
         fvg_min_size = profile.fvg_min_atr * atr_m5
@@ -690,6 +705,11 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             "trigger_confirmations": trigger_confirmations,
             "execution_penalty": 0.0 if spread_ok_soft else 2.0,
             "setup_state": setup_state,
+            "sweep_index": sweep_idx,
+            "fvg_search_start_index": fvg_start_index,
+            "fvg_detected": fvg is not None,
+            "fvg_size": fvg_size,
+            "fvg_min_size": fvg_min_size,
         }
         if penalties:
             signal_meta["score_penalties"] = penalties
@@ -706,8 +726,8 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             signal_meta["fvg_mid"] = fvg.midpoint
             signal_meta["fvg_lower"] = fvg.lower
             signal_meta["fvg_upper"] = fvg.upper
-            signal_meta["fvg_size"] = fvg_size
-            signal_meta["fvg_min_size"] = fvg_min_size
+            signal_meta["fvg_c1_index"] = fvg.c1_index
+            signal_meta["fvg_c3_index"] = fvg.c3_index
         if mss is not None:
             signal_meta["mss_index"] = mss.candle_index
             signal_meta["displacement_threshold"] = displacement_threshold

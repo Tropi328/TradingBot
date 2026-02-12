@@ -297,3 +297,88 @@ def test_miss_rate_is_hits_divided_by_probes() -> None:
     assert hits == 1
     assert probes == 2
     assert strategy.missed_opportunity_rate("BTCUSD") == 0.5
+
+
+def test_fvg_detection_uses_sweep_window_not_only_mss_window(monkeypatch) -> None:
+    config = AppConfig()
+    strategy = ScalpIctPriceActionStrategy(config)
+    now = datetime(2026, 2, 11, 18, 0, tzinfo=timezone.utc)
+    candles_m15 = _candles(now - timedelta(hours=20), 15, 220, 2500.0, -0.2)
+    candles_m5 = _candles(now - timedelta(hours=10), 5, 300, 2500.0, -0.05)
+
+    # Bearish FVG appears earlier after sweep, before later MSS candle.
+    fvg_c1 = 120
+    candles_m5[fvg_c1] = Candle(
+        timestamp=candles_m5[fvg_c1].timestamp,
+        open=2498.0,
+        high=2499.0,
+        low=2496.0,
+        close=2496.5,
+    )
+    candles_m5[fvg_c1 + 1] = Candle(
+        timestamp=candles_m5[fvg_c1 + 1].timestamp,
+        open=2496.5,
+        high=2497.0,
+        low=2493.0,
+        close=2493.5,
+    )
+    candles_m5[fvg_c1 + 2] = Candle(
+        timestamp=candles_m5[fvg_c1 + 2].timestamp,
+        open=2493.2,
+        high=2495.0,  # < c1.low(2496.0) -> valid SHORT FVG
+        low=2490.5,
+        close=2491.0,
+    )
+
+    mss_index = 150
+    candles_m5[mss_index] = Candle(
+        timestamp=candles_m5[mss_index].timestamp,
+        open=2492.0,
+        high=2492.5,
+        low=2486.0,
+        close=2486.5,
+    )
+
+    bundle = _bundle(
+        symbol="GOLD",
+        now=now,
+        candles_m15=candles_m15,
+        candles_m5=candles_m5,
+        strategy_params={
+            "displacement_multiplier": 0.2,
+            "fvg_min_atr": 0.0,
+            "allow_neutral_bias": False,
+            "h1_bos_mode": "IGNORE",
+            "pd_filter_mode": "IGNORE",
+        },
+    )
+
+    state = strategy._state("GOLD")
+    state.bias = BiasState(
+        symbol="GOLD",
+        strategy_name="SCALP_ICT_PA",
+        direction="SHORT",
+        timeframe="M15",
+        updated_at=now,
+        metadata={},
+    )
+    candidate = _candidate(symbol="GOLD", now=now, candles_m5=candles_m5, side="SHORT", setup_id="SWEEP-FVG-WINDOW")
+    candidate.metadata["sweep_time"] = candles_m5[100].timestamp.isoformat()
+    candidate.metadata["sweep_level"] = candles_m5[100].high
+
+    def _fake_mss(*args, **kwargs) -> MSSSignal:
+        return MSSSignal(
+            side="SHORT",
+            broken_level=2488.0,
+            source_swing_index=mss_index - 3,
+            candle_index=mss_index,
+            candle_time=candles_m5[mss_index].timestamp,
+        )
+
+    monkeypatch.setattr(scalp_module, "detect_mss", _fake_mss)
+
+    evaluation = strategy.evaluate_candidate("GOLD", candidate, bundle)
+
+    assert "SCALP_NO_FVG" not in evaluation.reasons_blocking
+    assert evaluation.metadata.get("fvg_detected") is True
+    assert evaluation.metadata.get("fvg_mid") is not None

@@ -34,6 +34,10 @@ This repo contains a DEMO/paper trading bot for Capital.com Open API with:
 CSV must include columns: `timestamp,open,high,low,close` (M5 candles).
 - Backtest: `python main.py --backtest --backtest-data data.csv --backtest-epic GOLD`
 - Walk-forward: `python main.py --backtest --walk-forward --wf-splits 4 --backtest-data data.csv --backtest-epic GOLD`
+- Auto data loader (parquet folder `data/<source>/<SYMBOL>/<SIDE>/<TF>/YYYY/MM.parquet`):
+  `python main.py --backtest --backtest-symbols XAUUSD,EURUSD --backtest-tf 5m --backtest-start 2023-01-01 --backtest-end 2023-12-31 --backtest-price mid`
+- Auto loader + optional fetch:
+  `python main.py --backtest --backtest-symbols XAUUSD,EURUSD,US100,US500,BTCUSD --backtest-start 2023-01-01 --backtest-end 2023-12-31 --backtest-autofetch`
 
 ## Key .env fields
 ```env
@@ -183,5 +187,4 @@ Current unit tests cover:
 ## Notes
 - Epic names differ by account. For Gold on many DEMO accounts use `GOLD` (not `XAUUSD`).
 - If API returns accountId errors, verify DEMO account is active and `CAPITAL_ACCOUNT_ID` matches that account.
-
 
