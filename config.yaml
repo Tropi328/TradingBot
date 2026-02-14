@@ -127,11 +127,31 @@ decision_policy:
   trade_risk_multiplier: 1.0
   small_risk_multiplier_default: 0.45
 backtest_tuning:
-  wait_reaction_timeout_bars: 15
-  wait_mitigation_timeout_bars: 30
+  wait_reaction_timeout_bars: 6
+  wait_mitigation_timeout_bars: 10
+  wait_hard_block_bars: 0
   reaction_timeout_force_enable: true
-  penalty_orb_no_retest: -4.0
-  penalty_orb_confirm_low: -3.0
+  wait_timeout_soft_penalty: 2.0
+  wait_timeout_small_risk_multiplier: 0.4
+  wait_timeout_soft_grace_bars: 3
+  max_loss_r_cap: 1.0
+  tp1_trigger_r: 1.2
+  tp1_fraction: 0.35
+  be_offset_r: 0.05
+  be_delay_bars_after_tp1: 2
+  tp_target_min_r: 2.0
+  tp_target_max_r: 2.0
+  tp_target_a_plus_r: 3.0
+  tp_profile_mode: "strict_tp_price"
+  trailing_after_tp1: true
+  trailing_swing_window_bars: 10
+  trailing_buffer_r: 0.08
+  expected_rr_min: 2.0
+  expected_rr_lookback_bars: 120
+  segment_soft_gap_minutes: 120
+  segment_hard_gap_minutes: 600
+  penalty_orb_no_retest: -2.5
+  penalty_orb_confirm_low: -1.5
   penalty_scalp_no_displacement: -4.0
   penalty_scalp_no_mss: -3.0
   penalty_scalp_no_fvg: -2.0
@@ -143,9 +163,21 @@ backtest_tuning:
   dynamic_atr_buffer_mult: 1.1
   dynamic_spread_score_penalty: 2.0
   dynamic_atr_score_penalty: 1.0
+  dynamic_assumed_spread_enabled: true
+  dynamic_assumed_spread_min_by_symbol:
+    XAUUSD: 0.5
+    GOLD: 0.5
+  dynamic_assumed_spread_max_by_symbol:
+    XAUUSD: 0.8
+    GOLD: 0.8
   assumed_spread_by_symbol:
-    XAUUSD: 0.2
-    GOLD: 0.2
+    XAUUSD: 0.65
+    GOLD: 0.65
+  broker_leverage: 20.0
+  broker_margin_requirement_pct: 5.0
+  overnight_swap_time_utc: "23:00"
+  overnight_swap_long_pct: -0.016
+  overnight_swap_short_pct: 0.0076
 orderflow:
   default_mode: "LITE"
   full_symbols: ["BTCUSD"]
@@ -159,121 +191,104 @@ orderflow:
 strategy_router:
   symbols:
     - symbol: "GOLD"
-      strategy: "SCALP_ICT_PA"
+      strategy: "TREND_PULLBACK_M15"
       params:
-        candidate_relaxed: true
-        sweep_lookback_min_hours: 1
-        sweep_lookback_max_hours: 8
-        sweep_threshold_multiplier: 0.09
-        displacement_multiplier: 1.1
-        fvg_min_atr: 0.0
-        candidate_ttl_minutes: 75
-        candidate_min_interval_minutes: 12
-        relaxed_tick_buffer_multiplier: 0.4
-        allow_neutral_bias: true
-        neutral_bias_trade_mode: "SMALL"
-        neutral_bias_penalty: 6
-        neutral_bias_risk_multiplier: 0.4
+        trend_strength_min: 0.16
+        trigger_displacement_atr: 0.9
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_trend_strength_min: 0.42
+        a_plus_displacement_atr: 1.35
+        a_plus_spread_ratio_max: 0.12
         quality_gates:
-          spread_ratio_max: 0.17
-          min_confirm: 2
+          spread_ratio_max: 0.15
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
           min_atr_m5: 0.15
       risk:
         trade_risk_multiplier: 1.0
         small_risk_multiplier: 0.45
-        max_trades_per_day: 3
-      priority: 90
-      cooldown_seconds: 1800
-    - symbol: "GOLD"
-      strategy: "TREND_PULLBACK_M15"
-      params:
-        trend_strength_min: 0.2
-        trigger_displacement_atr: 1.0
-        min_confirm: 2
-        quality_gates:
-          spread_ratio_max: 0.15
-          min_confirm: 2
-          min_atr_m5: 0.2
-      risk:
-        trade_risk_multiplier: 1.0
-        small_risk_multiplier: 0.45
-        max_trades_per_day: 3
+        max_trades_per_day: 5
       priority: 78
-      cooldown_seconds: 2400
+      cooldown_seconds: 900
     - symbol: "GOLD"
       strategy: "ORB_H4_RETEST"
       params:
-        max_retest_minutes: 90
-        min_displacement_atr: 0.9
-        min_confirm: 2
+        max_retest_minutes: 120
+        retest_tolerance_atr: 0.22
+        min_displacement_atr: 0.8
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_displacement_atr: 1.25
+        a_plus_breakout_quality_min: 18.0
+        a_plus_spread_ratio_max: 0.12
         quality_gates:
           spread_ratio_max: 0.15
-          min_confirm: 2
-          min_atr_m5: 0.2
-      risk:
-        trade_risk_multiplier: 1.0
-        small_risk_multiplier: 0.4
-        max_trades_per_day: 1
-      priority: 72
-      cooldown_seconds: 3600
-    - symbol: "XAUUSD"
-      strategy: "SCALP_ICT_PA"
-      params:
-        candidate_relaxed: true
-        sweep_lookback_min_hours: 1
-        sweep_lookback_max_hours: 8
-        sweep_threshold_multiplier: 0.09
-        displacement_multiplier: 1.1
-        fvg_min_atr: 0.0
-        candidate_ttl_minutes: 75
-        candidate_min_interval_minutes: 12
-        relaxed_tick_buffer_multiplier: 0.4
-        allow_neutral_bias: true
-        neutral_bias_trade_mode: "SMALL"
-        neutral_bias_penalty: 6
-        neutral_bias_risk_multiplier: 0.4
-        quality_gates:
-          spread_ratio_max: 0.17
-          min_confirm: 2
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
           min_atr_m5: 0.15
       risk:
         trade_risk_multiplier: 1.0
-        small_risk_multiplier: 0.45
-        max_trades_per_day: 3
-      priority: 90
-      cooldown_seconds: 1800
+        small_risk_multiplier: 0.4
+        max_trades_per_day: 2
+      priority: 72
+      cooldown_seconds: 1200
     - symbol: "XAUUSD"
       strategy: "TREND_PULLBACK_M15"
       params:
-        trend_strength_min: 0.2
-        trigger_displacement_atr: 1.0
-        min_confirm: 2
+        trend_strength_min: 0.16
+        trigger_displacement_atr: 0.9
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_trend_strength_min: 0.42
+        a_plus_displacement_atr: 1.35
+        a_plus_spread_ratio_max: 0.12
         quality_gates:
           spread_ratio_max: 0.15
-          min_confirm: 2
-          min_atr_m5: 0.2
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
+          min_atr_m5: 0.15
+        soft_penalties:
+          TREND_CONFIRMATIONS_LOW: -2.0
       risk:
         trade_risk_multiplier: 1.0
         small_risk_multiplier: 0.45
-        max_trades_per_day: 3
+        max_trades_per_day: 5
       priority: 78
-      cooldown_seconds: 2400
+      cooldown_seconds: 900
     - symbol: "XAUUSD"
       strategy: "ORB_H4_RETEST"
       params:
-        max_retest_minutes: 90
-        min_displacement_atr: 0.9
-        min_confirm: 2
+        max_retest_minutes: 120
+        retest_tolerance_atr: 0.22
+        min_displacement_atr: 0.8
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_displacement_atr: 1.25
+        a_plus_breakout_quality_min: 18.0
+        a_plus_spread_ratio_max: 0.12
         quality_gates:
           spread_ratio_max: 0.15
-          min_confirm: 2
-          min_atr_m5: 0.2
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
+          min_atr_m5: 0.15
+        soft_penalties:
+          ORB_NO_RETEST: -2.5
+          ORB_CONFIRMATIONS_LOW: -1.5
       risk:
         trade_risk_multiplier: 1.0
         small_risk_multiplier: 0.4
-        max_trades_per_day: 1
+        max_trades_per_day: 2
       priority: 72
-      cooldown_seconds: 3600
+      cooldown_seconds: 1200
     - symbol: "BTCUSD"
       strategy: "SCALP_ICT_PA"
       params:

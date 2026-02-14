@@ -161,7 +161,14 @@ class OrbH4RetestStrategy(StrategyPlugin):
         range_high = float(candidate.metadata.get("range_high") or 0.0)
         range_low = float(candidate.metadata.get("range_low") or 0.0)
         zone = range_high if side == "LONG" else range_low
-        tolerance = self._as_float(params.get("retest_tolerance"), atr_m5 * 0.25)
+        tolerance_override = params.get("retest_tolerance")
+        if tolerance_override is not None:
+            tolerance = self._as_float(tolerance_override, atr_m5 * 0.18)
+            tolerance_mult = tolerance / max(atr_m5, 1e-9)
+        else:
+            tolerance_mult = self._as_float(params.get("retest_tolerance_atr"), 0.18)
+            tolerance_mult = max(0.10, min(0.25, tolerance_mult))
+            tolerance = atr_m5 * tolerance_mult
         max_retest_minutes = self._as_int(params.get("max_retest_minutes"), 90)
         breakout_time = datetime.fromisoformat(str(candidate.metadata.get("breakout_time")))
         cutoff = breakout_time + timedelta(minutes=max_retest_minutes)
@@ -189,20 +196,26 @@ class OrbH4RetestStrategy(StrategyPlugin):
 
         spread = data.spread or 0.0
         spread_ratio = spread / max(atr_m5, 1e-9)
-        execution_score = 10.0 if spread_ratio <= self._as_float(params.get("spread_ratio_max"), 0.15) else 3.0
+        spread_ratio_max = self._as_float(params.get("spread_ratio_max"), 0.15)
+        execution_score = 10.0 if spread_ratio <= spread_ratio_max else 3.0
 
         breakout_size = abs(float(candidate.metadata.get("range_high", 0.0)) - float(candidate.metadata.get("range_low", 0.0)))
         breakout_quality = min(30.0, (breakout_size / max(atr_m5, 1e-9)) * 6.0)
         retest_quality = 25.0 if retest_ok else 0.0
         confirmation_strength = min(25.0, (confirmations / 3.0) * 25.0)
         daily_context = 8.0
-        score_total = round(breakout_quality + retest_quality + confirmation_strength + execution_score + daily_context, 2)
+        base_score = breakout_quality + retest_quality + confirmation_strength + execution_score + daily_context
 
-        reasons: list[str] = []
+        soft_reasons: list[str] = []
+        penalties_total = 0.0
         if confirmations < min_confirm:
-            reasons.append("ORB_CONFIRMATIONS_LOW")
+            soft_reasons.append("ORB_CONFIRMATIONS_LOW")
+            penalties_total += abs(float(self.config.backtest_tuning.penalty_orb_confirm_low))
         if not retest_ok:
-            reasons.append("ORB_NO_RETEST")
+            soft_reasons.append("ORB_NO_RETEST")
+            penalties_total += abs(float(self.config.backtest_tuning.penalty_orb_no_retest))
+        score_total = round(max(0.0, min(100.0, base_score - penalties_total)), 2)
+
         setup_state = "READY"
         if not retest_ok:
             setup_state = "WAIT_MITIGATION"
@@ -210,11 +223,35 @@ class OrbH4RetestStrategy(StrategyPlugin):
             setup_state = "WAIT_REACTION"
 
         action = DecisionAction.OBSERVE
-        if not reasons:
-            if score_total >= self.config.decision_policy.trade_score_threshold:
-                action = DecisionAction.TRADE
-            elif self.config.decision_policy.small_score_min <= score_total <= self.config.decision_policy.small_score_max:
-                action = DecisionAction.SMALL
+        if score_total >= self.config.decision_policy.trade_score_threshold:
+            action = DecisionAction.TRADE
+        elif self.config.decision_policy.small_score_min <= score_total <= self.config.decision_policy.small_score_max:
+            action = DecisionAction.SMALL
+
+        trade_min_confirm = max(min_confirm, self._as_int(params.get("min_confirm_trade"), max(min_confirm, 3)))
+        small_min_confirm = max(1, self._as_int(params.get("min_confirm_small"), min_confirm))
+        if action == DecisionAction.TRADE and confirmations < trade_min_confirm and confirmations >= small_min_confirm:
+            action = DecisionAction.SMALL
+        if action == DecisionAction.TRADE and not retest_ok:
+            action = DecisionAction.SMALL
+
+        min_displacement_atr = self._as_float(params.get("min_displacement_atr"), 0.9)
+        a_plus_displacement_atr = max(
+            min_displacement_atr,
+            self._as_float(params.get("a_plus_displacement_atr"), 1.25),
+        )
+        a_plus_spread_ratio_max = min(
+            spread_ratio_max,
+            self._as_float(params.get("a_plus_spread_ratio_max"), 0.12),
+        )
+        a_plus_breakout_quality_min = self._as_float(params.get("a_plus_breakout_quality_min"), 18.0)
+        a_plus = (
+            retest_ok
+            and confirmations >= max(trade_min_confirm, 3)
+            and displacement >= (a_plus_displacement_atr * atr_m5)
+            and spread_ratio <= a_plus_spread_ratio_max
+            and breakout_quality >= a_plus_breakout_quality_min
+        )
 
         return StrategyEvaluation(
             action=action,
@@ -225,9 +262,11 @@ class OrbH4RetestStrategy(StrategyPlugin):
                 "confirmation_strength": round(confirmation_strength, 2),
                 "execution": round(execution_score, 2),
                 "daily_context": round(daily_context, 2),
+                "penalty_orb_no_retest": round(float(self.config.backtest_tuning.penalty_orb_no_retest), 2) if not retest_ok else 0.0,
+                "penalty_orb_confirm_low": round(float(self.config.backtest_tuning.penalty_orb_confirm_low), 2) if confirmations < min_confirm else 0.0,
             },
-            reasons_blocking=reasons,
-            would_enter_if=["ORB_CONFIRMATIONS>=MIN"] if reasons else [],
+            reasons_blocking=[],
+            would_enter_if=["ORB_RETEST_AND_CONFIRMATIONS_STRONGER"] if soft_reasons else [],
             snapshot={
                 "atr_m5": atr_m5,
                 "spread_ratio": spread_ratio,
@@ -243,7 +282,13 @@ class OrbH4RetestStrategy(StrategyPlugin):
                 "atr_m5": atr_m5,
                 "range_high": range_high,
                 "range_low": range_low,
+                "retest_tolerance_atr": tolerance_mult,
+                "retest_tolerance_abs": tolerance,
                 "execution_penalty": 0.0 if execution_score >= 8.0 else 2.0,
+                "a_plus": a_plus,
+                "trade_min_confirm": trade_min_confirm,
+                "small_min_confirm": small_min_confirm,
+                "soft_reasons": soft_reasons,
             },
         )
 
@@ -264,31 +309,37 @@ class OrbH4RetestStrategy(StrategyPlugin):
         if atr_m5 <= 0:
             return None
         entry = zone
+        a_plus = bool(evaluation.metadata.get("a_plus", False))
+        rr = 3.0 if a_plus else 2.0
         if side == "LONG":
             stop = range_low - 0.2 * atr_m5
             risk = entry - stop
             if risk <= 0:
                 return None
-            tp = entry + 2.0 * risk
+            tp = entry + rr * risk
         else:
             stop = range_high + 0.2 * atr_m5
             risk = stop - entry
             if risk <= 0:
                 return None
-            tp = entry - 2.0 * risk
+            tp = entry - rr * risk
+        reason_codes = [self.name, f"SCORE_{int(evaluation.score_total or 0)}"]
+        if a_plus:
+            reason_codes.append("A_PLUS")
         return StrategySignal(
             side=side,
             entry_price=entry,
             stop_price=stop,
             take_profit=tp,
-            rr=2.0,
-            a_plus=False,
+            rr=rr,
+            a_plus=a_plus,
             expires_at=data.now + timedelta(minutes=30),
-            reason_codes=[self.name, f"SCORE_{int(evaluation.score_total or 0)}"],
+            reason_codes=reason_codes,
             metadata={
                 "strategy": self.name,
                 "candidate_id": candidate.candidate_id,
                 "setup_id": candidate.metadata.get("setup_id"),
+                "a_plus": a_plus,
             },
         )
 

@@ -204,3 +204,48 @@ def test_mid_mode_falls_back_to_single_side_with_diagnostics(tmp_path: Path) -> 
     assert got.loc[0, "close"] == pytest.approx(10.2, rel=0.0, abs=1e-9)
     assert loaded.diagnostics["fallback_counters"]["MID_FALLBACK_SINGLE_SIDE"] == 2
     assert loaded.diagnostics["data_health"]["bars"] == 2
+
+
+def test_split_frame_by_gaps_creates_segments(tmp_path: Path) -> None:
+    start = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    frame = pd.DataFrame(
+        [
+            {"ts_utc": start, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=5), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=30), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=35), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+        ]
+    )
+    loader = AutoDataLoader(tmp_path / "data")
+    segments, stats = loader.split_frame_by_gaps(frame, "5m", gap_bars=3)
+
+    assert len(segments) == 2
+    assert [len(seg) for seg in segments] == [2, 2]
+    assert int(stats["gap_count_over_threshold"]) == 1
+
+
+def test_split_frame_by_gaps_soft_hard_thresholds(tmp_path: Path) -> None:
+    start = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
+    frame = pd.DataFrame(
+        [
+            {"ts_utc": start, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=5), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=190), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=195), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=840), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+            {"ts_utc": start + timedelta(minutes=845), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "volume": 1.0},
+        ]
+    )
+    loader = AutoDataLoader(tmp_path / "data")
+    segments, stats = loader.split_frame_by_gaps(
+        frame,
+        "5m",
+        gap_bars=3,
+        soft_gap_minutes=120,
+        hard_gap_minutes=600,
+    )
+
+    assert len(segments) == 2
+    assert [len(seg) for seg in segments] == [4, 2]
+    assert int(stats["gap_count_soft_only"]) == 1
+    assert int(stats["gap_count_over_threshold"]) == 1

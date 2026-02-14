@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 from typing import Iterable
@@ -142,6 +142,140 @@ class AutoDataLoader:
         self.file_cache_size = max(8, int(file_cache_size))
         self._file_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
         self._csv_bootstrap_attempted_symbols: set[str] = set()
+        self._month_index_cache: dict[str, set[tuple[int, int]]] = {}
+
+    def resolve_parquet_files(
+        self,
+        *,
+        symbol: str,
+        price_mode: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+        warmup_days: int = 0,
+        source: str = "local_csv",
+    ) -> tuple[list[Path], list[MissingDataItem], datetime]:
+        symbol_norm = symbol.strip().upper()
+        side = price_mode.strip().upper()
+        tf_norm = normalize_timeframe(timeframe)
+        start_utc = _to_utc(start)
+        end_utc = _to_utc(end)
+        if start_utc >= end_utc:
+            raise ValueError("start must be < end")
+        start_warmup = start_utc - timedelta(days=max(0, int(warmup_days)))
+        months = _iter_months(start_warmup, end_utc)
+
+        base = self.data_root / source / symbol_norm / side / tf_norm
+        index = self._month_index(base)
+        files: list[Path] = []
+        missing: list[MissingDataItem] = []
+        for year, month in months:
+            if (year, month) in index:
+                files.append(base / f"{year:04d}" / f"{month:02d}.parquet")
+            else:
+                missing.append(
+                    MissingDataItem(
+                        symbol=symbol_norm,
+                        side=side,
+                        timeframe=tf_norm,
+                        year=year,
+                        month=month,
+                    )
+                )
+        return files, missing, start_warmup
+
+    def load_symbol_data_range(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+        price_mode: str = "mid",
+        warmup_days: int = 0,
+        source: str = "local_csv",
+    ) -> DataLoadResult:
+        symbol_norm = symbol.strip().upper()
+        price_mode_norm = price_mode.strip().lower()
+        if price_mode_norm not in _PRICE_CHOICES:
+            raise ValueError(f"Unsupported price_mode '{price_mode}'. Allowed: {sorted(_PRICE_CHOICES)}")
+        tf_norm = normalize_timeframe(timeframe)
+        end_utc = _to_utc(end)
+        files, missing, start_warmup = self.resolve_parquet_files(
+            symbol=symbol_norm,
+            price_mode=price_mode_norm,
+            timeframe=tf_norm,
+            start=start,
+            end=end_utc,
+            warmup_days=warmup_days,
+            source=source,
+        )
+        if not files and missing:
+            raise MissingDataError(missing)
+
+        parts: list[pd.DataFrame] = []
+        source_files: list[str] = []
+        for path in files:
+            if not path.exists():
+                LOGGER.warning("Missing parquet shard: %s", path)
+                continue
+            source_files.append(str(path.resolve()))
+            parts.append(self._read_parquet(path))
+
+        if not parts:
+            if missing:
+                raise MissingDataError(missing)
+            raise MissingDataError(
+                [
+                    MissingDataItem(
+                        symbol=symbol_norm,
+                        side=price_mode_norm.upper(),
+                        timeframe=tf_norm,
+                        year=start_warmup.year,
+                        month=start_warmup.month,
+                    )
+                ]
+            )
+
+        merged = pd.concat(parts, ignore_index=True)
+        merged = merged.sort_values("ts_utc").drop_duplicates(subset=["ts_utc"]).reset_index(drop=True)
+        merged = merged[(merged["ts_utc"] >= start_warmup) & (merged["ts_utc"] < end_utc)].copy()
+
+        side = price_mode_norm.upper()
+        bid_df: pd.DataFrame | None = merged if side == "BID" else None
+        ask_df: pd.DataFrame | None = merged if side == "ASK" else None
+        mid_df: pd.DataFrame | None = merged if side == "MID" else None
+        frame, price_diag = self._compose_price_frame(
+            symbol=symbol_norm,
+            timeframe=tf_norm,
+            price_mode=price_mode_norm,
+            bid_df=bid_df,
+            ask_df=ask_df,
+            mid_df=mid_df,
+            start=start_warmup,
+            end=end_utc,
+        )
+        missing_lines = [item.to_line() for item in missing]
+        diagnostics = {
+            "price_mode_requested": price_mode_norm,
+            "source_files": sorted(set(source_files)),
+            "source_datasets": [source],
+            "fallback_counters": price_diag,
+            "missing_shards": missing_lines,
+            "warmup_start_utc": start_warmup.isoformat(),
+            "start_utc": _to_utc(start).isoformat(),
+            "end_utc": end_utc.isoformat(),
+            "data_health": self._compute_data_health(frame, tf_norm),
+        }
+        _, gap_segments = self.split_frame_by_gaps(frame, tf_norm, gap_bars=3)
+        diagnostics["gap_segments"] = gap_segments
+        return DataLoadResult(
+            symbol=symbol_norm,
+            timeframe=tf_norm,
+            price_mode=price_mode_norm,
+            frame=frame,
+            diagnostics=diagnostics,
+        )
 
     def available_sources(self) -> list[str]:
         if not self.data_root.exists():
@@ -308,6 +442,7 @@ class AutoDataLoader:
                 "source_datasets": sorted(source_datasets),
                 "fallback_counters": price_diag,
                 "data_health": self._compute_data_health(combined, tf_norm),
+                "gap_segments": self.split_frame_by_gaps(combined, tf_norm, gap_bars=3)[1],
             },
         )
 
@@ -681,6 +816,88 @@ class AutoDataLoader:
             "max_gap_minutes": max_gap,
         }
 
+    def split_frame_by_gaps(
+        self,
+        frame: pd.DataFrame,
+        timeframe: str,
+        *,
+        gap_bars: int = 3,
+        soft_gap_minutes: int | None = None,
+        hard_gap_minutes: int | None = None,
+    ) -> tuple[list[pd.DataFrame], dict[str, object]]:
+        if frame.empty:
+            threshold_bars = int(max(1, gap_bars))
+            default_minutes = float(timeframe_to_minutes(timeframe) * threshold_bars)
+            soft_minutes = float(soft_gap_minutes if soft_gap_minutes is not None else default_minutes)
+            hard_minutes = float(hard_gap_minutes if hard_gap_minutes is not None else default_minutes)
+            if hard_minutes < soft_minutes:
+                hard_minutes = soft_minutes
+            return [], {
+                "gap_threshold_bars": threshold_bars,
+                "gap_threshold_minutes": hard_minutes,
+                "soft_gap_minutes": soft_minutes,
+                "hard_gap_minutes": hard_minutes,
+                "segment_count": 0,
+                "segment_sizes": [],
+                "gap_count_over_threshold": 0,
+                "gap_count_soft_only": 0,
+                "gaps_over_threshold": [],
+                "gaps_soft_only": [],
+            }
+
+        tf_minutes = timeframe_to_minutes(timeframe)
+        threshold_bars = max(1, int(gap_bars))
+        default_threshold_minutes = float(tf_minutes * threshold_bars)
+        soft_minutes = float(soft_gap_minutes if soft_gap_minutes is not None else default_threshold_minutes)
+        hard_minutes = float(hard_gap_minutes if hard_gap_minutes is not None else default_threshold_minutes)
+        if hard_minutes < soft_minutes:
+            hard_minutes = soft_minutes
+        work = frame.sort_values("ts_utc").drop_duplicates(subset=["ts_utc"]).reset_index(drop=True)
+        ts = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
+        diffs = ts.diff().dt.total_seconds().div(60.0)
+
+        breakpoints: list[int] = []
+        gap_rows: list[dict[str, object]] = []
+        soft_only_rows: list[dict[str, object]] = []
+        for idx in range(1, len(work)):
+            gap = diffs.iloc[idx]
+            if pd.isna(gap):
+                continue
+            gap_minutes = float(gap)
+            prev_ts = ts.iloc[idx - 1]
+            curr_ts = ts.iloc[idx]
+            payload = {
+                "prev_ts_utc": prev_ts.isoformat() if pd.notna(prev_ts) else None,
+                "next_ts_utc": curr_ts.isoformat() if pd.notna(curr_ts) else None,
+                "gap_minutes": gap_minutes,
+            }
+            if gap_minutes > hard_minutes:
+                breakpoints.append(idx)
+                gap_rows.append(payload)
+            elif gap_minutes > soft_minutes:
+                soft_only_rows.append(payload)
+
+        segments: list[pd.DataFrame] = []
+        start_idx = 0
+        for stop_idx in breakpoints + [len(work)]:
+            part = work.iloc[start_idx:stop_idx].copy().reset_index(drop=True)
+            if not part.empty:
+                segments.append(part)
+            start_idx = stop_idx
+
+        return segments, {
+            "gap_threshold_bars": threshold_bars,
+            "gap_threshold_minutes": hard_minutes,
+            "soft_gap_minutes": soft_minutes,
+            "hard_gap_minutes": hard_minutes,
+            "segment_count": len(segments),
+            "segment_sizes": [int(len(segment)) for segment in segments],
+            "gap_count_over_threshold": len(gap_rows),
+            "gap_count_soft_only": len(soft_only_rows),
+            "gaps_over_threshold": gap_rows[:200],
+            "gaps_soft_only": soft_only_rows[:200],
+        }
+
     def _bootstrap_mid_from_csv(self, symbol: str) -> bool:
         symbol_norm = symbol.strip().upper()
         if symbol_norm in self._csv_bootstrap_attempted_symbols:
@@ -813,6 +1030,31 @@ class AutoDataLoader:
             pass
         parts = file_path.parts
         return parts[-6] if len(parts) >= 6 else "unknown"
+
+    def _month_index(self, base: Path) -> set[tuple[int, int]]:
+        key = str(base.resolve())
+        cached = self._month_index_cache.get(key)
+        if cached is not None:
+            return cached
+        out: set[tuple[int, int]] = set()
+        if base.exists():
+            for year_dir in base.iterdir():
+                if not year_dir.is_dir():
+                    continue
+                try:
+                    year = int(year_dir.name)
+                except ValueError:
+                    continue
+                for file in year_dir.glob("*.parquet"):
+                    stem = file.stem
+                    try:
+                        month = int(stem)
+                    except ValueError:
+                        continue
+                    if 1 <= month <= 12:
+                        out.add((year, month))
+        self._month_index_cache[key] = out
+        return out
 
     def _read_parquet(self, path: Path) -> pd.DataFrame:
         key = str(path.resolve())

@@ -62,7 +62,12 @@ class BacktestRunner:
             )
             candles = self._frame_to_candles(loaded.frame)
             asset = self._resolve_asset(normalized)
-            assumed_spread = self._assumed_spread(loaded.frame)
+            assumed_spread, spread_mode = self._assumed_spread(
+                frame=loaded.frame,
+                symbol=normalized,
+                asset=asset,
+                diagnostics=loaded.diagnostics,
+            )
             report = run_backtest_multi_strategy(
                 config=self.config,
                 asset=asset,
@@ -70,7 +75,14 @@ class BacktestRunner:
                 assumed_spread=assumed_spread,
                 slippage_points=slippage_points,
                 slippage_atr_multiplier=slippage_atr_multiplier,
-                data_context=loaded.diagnostics,
+                data_context={
+                    **loaded.diagnostics,
+                    "symbol": normalized,
+                    "timeframe": timeframe,
+                    "price_mode_requested": price_mode,
+                    "spread_mode": spread_mode,
+                    "assumed_spread_used": float(assumed_spread),
+                },
             )
             reports[normalized] = report
 
@@ -98,14 +110,31 @@ class BacktestRunner:
             trade_enabled=True,
         )
 
-    @staticmethod
-    def _assumed_spread(frame: pd.DataFrame) -> float:
-        if "spread" not in frame.columns:
-            return 0.0
-        spread = pd.to_numeric(frame["spread"], errors="coerce").dropna()
-        if spread.empty:
-            return 0.0
-        return float(max(0.0, spread.median()))
+    def _assumed_spread(
+        self,
+        *,
+        frame: pd.DataFrame,
+        symbol: str,
+        asset: AssetConfig,
+        diagnostics: dict[str, object],
+    ) -> tuple[float, str]:
+        spread_from_data = None
+        if "spread" in frame.columns:
+            spread = pd.to_numeric(frame["spread"], errors="coerce").dropna()
+            if not spread.empty:
+                spread_from_data = float(max(0.0, spread.median()))
+
+        symbol_spread_map = self.config.backtest_tuning.assumed_spread_by_symbol
+        configured = symbol_spread_map.get(symbol.upper()) or symbol_spread_map.get(asset.epic.upper())
+        assumed = float(spread_from_data) if spread_from_data is not None else float(configured if configured is not None else 0.2)
+
+        data_health = diagnostics.get("data_health", {}) if isinstance(diagnostics, dict) else {}
+        nan_counts = data_health.get("nan_counts", {}) if isinstance(data_health, dict) else {}
+        bars_count = int(data_health.get("bars", 0)) if isinstance(data_health, dict) and data_health.get("bars") is not None else 0
+        close_bid_nan = int(nan_counts.get("close_bid", bars_count)) if isinstance(nan_counts, dict) else bars_count
+        close_ask_nan = int(nan_counts.get("close_ask", bars_count)) if isinstance(nan_counts, dict) else bars_count
+        spread_mode = "ASSUMED_OHLC" if bars_count > 0 and close_bid_nan >= bars_count and close_ask_nan >= bars_count else "REAL_BIDASK"
+        return assumed, spread_mode
 
     @staticmethod
     def _frame_to_candles(frame: pd.DataFrame) -> list[Candle]:

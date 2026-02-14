@@ -218,6 +218,33 @@ class TrendPullbackM15Strategy(StrategyPlugin):
             elif self.config.decision_policy.small_score_min <= score_total <= self.config.decision_policy.small_score_max:
                 action = DecisionAction.SMALL
 
+        trade_min_confirm = max(min_confirm, self._as_int(params.get("min_confirm_trade"), max(min_confirm, 3)))
+        small_min_confirm = max(1, self._as_int(params.get("min_confirm_small"), min_confirm))
+        if action == DecisionAction.TRADE and confirmations < trade_min_confirm and confirmations >= small_min_confirm:
+            action = DecisionAction.SMALL
+
+        spread_ratio_max = self._as_float(params.get("spread_ratio_max"), 0.15)
+        a_plus_trend_strength_min = max(
+            trend_thr,
+            self._as_float(params.get("a_plus_trend_strength_min"), max(0.35, trend_thr + 0.08)),
+        )
+        a_plus_displacement_atr = max(
+            trigger_disp_thr,
+            self._as_float(params.get("a_plus_displacement_atr"), 1.25),
+        )
+        a_plus_spread_ratio_max = min(
+            spread_ratio_max,
+            self._as_float(params.get("a_plus_spread_ratio_max"), 0.12),
+        )
+        a_plus = (
+            trend_ok
+            and trigger_ok
+            and confirmations >= max(trade_min_confirm, 3)
+            and trend_strength >= a_plus_trend_strength_min
+            and real_body(last) >= (a_plus_displacement_atr * atr_m5)
+            and spread_ratio <= a_plus_spread_ratio_max
+        )
+
         return StrategyEvaluation(
             action=action,
             score_total=score_total,
@@ -243,6 +270,9 @@ class TrendPullbackM15Strategy(StrategyPlugin):
                 "anchor": candidate.metadata.get("anchor"),
                 "atr_m5": atr_m5,
                 "execution_penalty": 0.0 if execution_score >= 8.0 else 1.0,
+                "a_plus": a_plus,
+                "trade_min_confirm": trade_min_confirm,
+                "small_min_confirm": small_min_confirm,
             },
         )
 
@@ -267,31 +297,37 @@ class TrendPullbackM15Strategy(StrategyPlugin):
             entry = float(candidate.metadata.get("anchor", 0.0))
             if entry <= 0:
                 return None
+        a_plus = bool(evaluation.metadata.get("a_plus", False))
+        rr = 3.0 if a_plus else 2.0
         if side == "LONG":
             stop = entry - 1.2 * atr_m5
             risk = entry - stop
             if risk <= 0:
                 return None
-            tp = entry + 2.0 * risk
+            tp = entry + rr * risk
         else:
             stop = entry + 1.2 * atr_m5
             risk = stop - entry
             if risk <= 0:
                 return None
-            tp = entry - 2.0 * risk
+            tp = entry - rr * risk
+        reason_codes = [self.name, f"SCORE_{int(evaluation.score_total or 0)}"]
+        if a_plus:
+            reason_codes.append("A_PLUS")
         return StrategySignal(
             side=side,
             entry_price=entry,
             stop_price=stop,
             take_profit=tp,
-            rr=2.0,
-            a_plus=False,
+            rr=rr,
+            a_plus=a_plus,
             expires_at=data.now + timedelta(minutes=30),
-            reason_codes=[self.name, f"SCORE_{int(evaluation.score_total or 0)}"],
+            reason_codes=reason_codes,
             metadata={
                 "strategy": self.name,
                 "candidate_id": candidate.candidate_id,
                 "setup_id": candidate.metadata.get("setup_id"),
+                "a_plus": a_plus,
             },
         )
 

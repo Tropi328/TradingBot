@@ -9,16 +9,20 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
+from bot.batch_backtest import make_trade_id, orchestrate_batch
 from bot.backtest.data_provider import AutoDataLoader, MissingDataError, normalize_timeframe
 from bot.backtest.engine import (
     BacktestVariant,
+    aggregate_backtest_reports,
     run_backtest,
     run_backtest_from_csv,
     run_backtest_multi_strategy,
@@ -43,6 +47,7 @@ from bot.monitoring.alerts import AlertConfig, AlertDispatcher
 from bot.monitoring.dashboard import DashboardWriter
 from bot.news.calendar_provider import CalendarProvider, build_calendar_provider
 from bot.news.gate import is_blocked, should_cancel_pending
+from bot.reporting.backtest_reporter import BacktestMeta, BacktestReporter, BacktestRun
 from bot.storage.db import get_connection, init_db
 from bot.storage.journal import Journal
 from bot.storage.models import ClosedPositionEvent, DailyStats, StrategyDecisionRecord
@@ -170,8 +175,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backtest-fetch-script", default="fetch_market_data.py")
     parser.add_argument("--backtest-variants", default="W0", help="Comma-separated variants: W0,W1,W2[,W3]")
     parser.add_argument("--backtest-reports-dir", default="reports")
+    parser.add_argument("--report", dest="report", action="store_true", default=True, help="Generate detailed backtest artifacts.")
+    parser.add_argument("--no-report", dest="report", action="store_false", help="Disable detailed backtest artifacts.")
+    parser.add_argument("--report-dir", default="reports/backtest", help="Base directory for detailed backtest reports.")
+    parser.add_argument(
+        "--report-formats",
+        default="json,csv,png,html",
+        help="Comma-separated formats for detailed reports: json,csv,png,html",
+    )
+    parser.add_argument("--report-open", action="store_true", help="Open generated report.html after backtest completion.")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--wf-splits", type=int, default=4)
+
+    parser.add_argument("--batch-backtest", action="store_true", help="Run parquet-sharded batch backtest orchestrator.")
+    parser.add_argument("--batch-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--symbol", default=None)
+    parser.add_argument("--price-mode", default="MID")
+    parser.add_argument("--timeframe", default="1m")
+    parser.add_argument("--start", default=None)
+    parser.add_argument("--end", default=None)
+    parser.add_argument("--chunk", default="monthly")
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--warmup-days", type=int, default=60)
+    parser.add_argument("--out-root", default="runs/batch")
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--state-path", default=None)
+    parser.add_argument("--initial-equity", type=float, default=10000.0)
+    parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument("--data-root", default=None, help="Batch mode alias for --backtest-data-root")
 
     parser.add_argument("--state-log", choices=["text", "json"], default="text")
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
@@ -331,6 +362,61 @@ def _bias_to_legacy_label(direction: str) -> str:
     return "NEUTRAL"
 
 
+def _tp2_r_for_target_total_r(
+    *,
+    target_total_r: float,
+    tp1_trigger_r: float,
+    tp1_fraction: float,
+    mode: str = "strict_tp_price",
+) -> float:
+    total_r = max(0.1, float(target_total_r))
+    mode_norm = str(mode).strip().lower()
+    if mode_norm == "strict_tp_price":
+        return total_r
+    frac = max(0.0, min(0.99, float(tp1_fraction)))
+    trigger_r = max(0.0, float(tp1_trigger_r))
+    if frac <= 0.0:
+        return total_r
+    tp2_r = (total_r - (frac * trigger_r)) / max(1e-9, 1.0 - frac)
+    return max(total_r, tp2_r)
+
+
+def _apply_rr_profile_to_signal(
+    signal: StrategySignal,
+    *,
+    tp1_trigger_r: float,
+    tp1_fraction: float,
+    tp_profile_mode: str,
+) -> bool:
+    risk_distance = abs(float(signal.entry_price) - float(signal.stop_price))
+    if risk_distance <= 0:
+        return False
+
+    target_total_r = 3.0 if bool(signal.a_plus) or float(signal.rr) >= 3.0 else 2.0
+    target_tp2_r = _tp2_r_for_target_total_r(
+        target_total_r=target_total_r,
+        tp1_trigger_r=tp1_trigger_r,
+        tp1_fraction=tp1_fraction,
+        mode=tp_profile_mode,
+    )
+
+    if signal.side == "LONG":
+        signal.take_profit = float(signal.entry_price) + (target_tp2_r * risk_distance)
+    else:
+        signal.take_profit = float(signal.entry_price) - (target_tp2_r * risk_distance)
+
+    signal.rr = target_total_r
+    meta = dict(signal.metadata or {})
+    meta["tp_target_profile"] = "A_PLUS_3R" if target_total_r >= 3.0 else "STANDARD_2R"
+    meta["target_r_profile_total"] = round(target_total_r, 4)
+    meta["target_r_tp2"] = round(target_tp2_r, 4)
+    meta["tp1_trigger_r"] = float(tp1_trigger_r)
+    meta["tp1_fraction"] = float(tp1_fraction)
+    meta["tp_profile_mode"] = str(tp_profile_mode).strip().lower()
+    signal.metadata = meta
+    return True
+
+
 def create_decision_record_from_outcome(
     *,
     outcome: StrategyOutcome,
@@ -467,6 +553,20 @@ def _resolve_runtime_path(root: Path, value: str) -> Path:
     return root / path
 
 
+def _validate_batch_data_root(data_root: Path) -> None:
+    if not data_root.exists():
+        raise RuntimeError(
+            f"Batch data root does not exist: {data_root}. "
+            "Expected e.g. --data-root data with shards under data/local_csv/<SYMBOL>/<PRICE_MODE>/<TF>/YYYY/MM.parquet."
+        )
+    local_csv = data_root / "local_csv"
+    if not local_csv.exists():
+        LOGGER.warning(
+            "Batch data root has no local_csv directory: %s (expected local_csv/<SYMBOL>/<PRICE_MODE>/<TF>/YYYY/MM.parquet)",
+            data_root,
+        )
+
+
 def _autofetch_backtest_data(
     *,
     fetch_script: Path,
@@ -544,6 +644,90 @@ def _parse_backtest_variants(raw: str) -> list[BacktestVariant]:
     return variants
 
 
+def _first_variant_code(raw: str) -> str:
+    try:
+        variants = _parse_backtest_variants(raw)
+    except Exception:
+        return "W0"
+    return variants[0].code if variants else "W0"
+
+
+def _parse_report_formats(raw: str) -> tuple[str, ...]:
+    allowed = {"json", "csv", "png", "html"}
+    parts = [item.strip().lower() for item in str(raw or "").split(",") if item.strip()]
+    selected: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if part not in allowed:
+            LOGGER.warning("Unknown report format '%s' ignored (allowed: json,csv,png,html)", part)
+            continue
+        if part in seen:
+            continue
+        selected.append(part)
+        seen.add(part)
+    if not selected:
+        return ("json", "csv", "png", "html")
+    return tuple(selected)
+
+
+def _open_report_html(path: Path) -> None:
+    try:
+        webbrowser.open(path.resolve().as_uri())
+    except Exception as exc:
+        LOGGER.warning("Failed to open report HTML '%s': %s", path, exc)
+
+
+def _coerce_iso_utc(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        dt = value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return str(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
+def _trade_value(item: object, keys: tuple[str, ...]) -> object:
+    if isinstance(item, dict):
+        for key in keys:
+            if key in item:
+                return item.get(key)
+        return None
+    for key in keys:
+        if hasattr(item, key):
+            return getattr(item, key)
+    return None
+
+
+def _trade_time_bounds(trades: list[object], *, default_start: str, default_end: str) -> tuple[str, str]:
+    entry_ts: list[str] = []
+    exit_ts: list[str] = []
+    for trade in trades:
+        entry_raw = _trade_value(trade, ("entry_ts", "entry_time", "open_time_utc", "open_time"))
+        exit_raw = _trade_value(trade, ("exit_ts", "exit_time", "close_time_utc", "close_time"))
+        entry_iso = _coerce_iso_utc(entry_raw)
+        exit_iso = _coerce_iso_utc(exit_raw)
+        if entry_iso:
+            entry_ts.append(entry_iso)
+        if exit_iso:
+            exit_ts.append(exit_iso)
+    start = min(entry_ts) if entry_ts else default_start
+    end = max(exit_ts) if exit_ts else default_end
+    return start, end
+
+
 def _month_label(value: str, fallback: datetime) -> str:
     raw = value.strip()
     if len(raw) >= 7 and raw[4] == "-":
@@ -567,7 +751,7 @@ def _top3_blockers(report_dict: dict[str, object]) -> str:
 
 def _log_variant_comparison(*, variant_payloads: dict[str, dict[str, object]], symbols: list[str]) -> None:
     LOGGER.info("Backtest variant comparison:")
-    LOGGER.info("variant | symbol | trades | win_rate | pnl | expectancy | avg_r | max_dd | candidates | top3_blockers")
+    LOGGER.info("variant | symbol | trades | win_rate | pnl | expectancy | avg_r | payoff | pf | max_dd | candidates | top3_blockers")
     for code, payload in variant_payloads.items():
         reports_raw = payload.get("reports")
         if not isinstance(reports_raw, dict):
@@ -577,7 +761,7 @@ def _log_variant_comparison(*, variant_payloads: dict[str, dict[str, object]], s
             if not isinstance(report, dict):
                 continue
             LOGGER.info(
-                "%s | %s | %s | %.4f | %.4f | %.4f | %.4f | %.4f | %s | %s",
+                "%s | %s | %s | %.4f | %.4f | %.4f | %.4f | %.4f | %.4f | %.4f | %s | %s",
                 code,
                 symbol,
                 report.get("trades", 0),
@@ -585,13 +769,194 @@ def _log_variant_comparison(*, variant_payloads: dict[str, dict[str, object]], s
                 float(report.get("total_pnl", 0.0)),
                 float(report.get("expectancy", 0.0)),
                 float(report.get("avg_r", 0.0)),
+                float(report.get("payoff_ratio", 0.0)),
+                float(report.get("profit_factor", 0.0)),
                 float(report.get("max_drawdown", 0.0)),
                 report.get("signal_candidates", 0),
                 _top3_blockers(report),
             )
 
 
+def _run_multi_strategy_segmented(
+    *,
+    config: AppConfig,
+    asset: AssetConfig,
+    frame,
+    loader: AutoDataLoader,
+    timeframe: str,
+    assumed_spread: float,
+    slippage_points: float,
+    slippage_atr_multiplier: float,
+    variant: BacktestVariant,
+    execution_debug_path: Path | None,
+    no_price_debug_path: Path | None,
+    reaction_timeout_debug_path: Path | None,
+    data_context: dict[str, object],
+    trade_start_utc: datetime | None = None,
+    flatten_at_chunk_end: bool = False,
+):
+    segments, segment_info = loader.split_frame_by_gaps(
+        frame,
+        timeframe,
+        gap_bars=3,
+        soft_gap_minutes=int(config.backtest_tuning.segment_soft_gap_minutes),
+        hard_gap_minutes=int(config.backtest_tuning.segment_hard_gap_minutes),
+    )
+    if not segments:
+        segments = [frame]
+        segment_info = {
+            "segment_count": 1,
+            "segment_sizes": [int(len(frame))],
+            "gap_threshold_bars": 3,
+            "gap_threshold_minutes": 0.0,
+            "soft_gap_minutes": float(config.backtest_tuning.segment_soft_gap_minutes),
+            "hard_gap_minutes": float(config.backtest_tuning.segment_hard_gap_minutes),
+            "gap_count_over_threshold": 0,
+            "gap_count_soft_only": 0,
+            "gaps_over_threshold": [],
+            "gaps_soft_only": [],
+        }
+
+    reports = []
+    skipped_small = 0
+    warmup_bars_per_segment = max(260, int(config.execution.history_bars.m5))
+    for idx, segment in enumerate(segments):
+        segment_input = segment
+        if idx > 0 and warmup_bars_per_segment > 0:
+            prior = pd.concat(segments[:idx], ignore_index=True).tail(warmup_bars_per_segment)
+            if not prior.empty:
+                segment_input = (
+                    pd.concat([prior, segment], ignore_index=True)
+                    .sort_values("ts_utc")
+                    .drop_duplicates(subset=["ts_utc"], keep="last")
+                    .reset_index(drop=True)
+                )
+        candles = BacktestRunner._frame_to_candles(segment_input)
+        if len(candles) < 260:
+            skipped_small += 1
+            continue
+        segment_start_ts = pd.to_datetime(segment["ts_utc"].iloc[0], utc=True, errors="coerce")
+        segment_trade_start = trade_start_utc
+        if pd.notna(segment_start_ts):
+            segment_start = segment_start_ts.to_pydatetime()
+            if segment_trade_start is None or segment_trade_start < segment_start:
+                segment_trade_start = segment_start
+        segment_context = dict(data_context)
+        segment_context["segment_index"] = idx + 1
+        segment_context["segment_count"] = len(segments)
+        segment_context["segment_start_utc"] = segment["ts_utc"].iloc[0].isoformat()
+        segment_context["segment_end_utc"] = segment["ts_utc"].iloc[-1].isoformat()
+        segment_context["segment_input_bars"] = int(len(segment_input))
+        segment_context["segment_trade_bars"] = int(len(segment))
+        report = run_backtest_multi_strategy(
+            config=config,
+            asset=asset,
+            candles_m5=candles,
+            assumed_spread=assumed_spread,
+            slippage_points=slippage_points,
+            slippage_atr_multiplier=slippage_atr_multiplier,
+            variant=variant,
+            execution_debug_path=execution_debug_path,
+            no_price_debug_path=no_price_debug_path,
+            reaction_timeout_debug_path=reaction_timeout_debug_path,
+            data_context=segment_context,
+            trade_start_utc=segment_trade_start,
+            flatten_at_chunk_end=flatten_at_chunk_end,
+        )
+        reports.append(report)
+
+    if not reports:
+        candles_all = BacktestRunner._frame_to_candles(frame)
+        report = run_backtest_multi_strategy(
+            config=config,
+            asset=asset,
+            candles_m5=candles_all,
+            assumed_spread=assumed_spread,
+            slippage_points=slippage_points,
+            slippage_atr_multiplier=slippage_atr_multiplier,
+            variant=variant,
+            execution_debug_path=execution_debug_path,
+            no_price_debug_path=no_price_debug_path,
+            reaction_timeout_debug_path=reaction_timeout_debug_path,
+            data_context=data_context,
+            trade_start_utc=trade_start_utc,
+            flatten_at_chunk_end=flatten_at_chunk_end,
+        )
+        reports = [report]
+
+    if len(reports) == 1:
+        merged = reports[0]
+    else:
+        merged = aggregate_backtest_reports(
+            config=config,
+            asset=asset,
+            reports=reports,
+        )
+
+    segment_meta = dict(segment_info)
+    segment_meta["segment_run_count"] = len(reports)
+    segment_meta["segment_skipped_small"] = skipped_small
+    return merged, segment_meta
+
+
 def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig], root: Path) -> None:
+    report_formats = _parse_report_formats(args.report_formats)
+    reporter = BacktestReporter(_resolve_runtime_path(root, str(args.report_dir))) if args.report else None
+    generated_report_dirs: list[Path] = []
+
+    def _emit_detailed_report(
+        *,
+        symbol: str,
+        timeframe: str,
+        start_raw: str,
+        end_raw: str,
+        variant_code: str,
+        mode: str,
+        trades: list[object],
+        payload: dict[str, object],
+        data_root_value: str,
+    ) -> None:
+        if reporter is None:
+            return
+        meta = BacktestMeta(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start_raw,
+            end=end_raw,
+            variant=variant_code,
+            mode=mode,
+            price=str(args.backtest_price),
+            initial_equity=float(config.risk.equity),
+            config=str(args.config),
+            data_root=data_root_value,
+        )
+        run = BacktestRun(
+            meta=meta,
+            trades=trades,
+            equity=[],
+            extra={"source_report": payload},
+        )
+        reporter.generate(run=run, formats=report_formats)
+        if reporter.last_output_dir is not None:
+            generated_report_dirs.append(reporter.last_output_dir)
+            LOGGER.info("Backtest detailed report saved: %s", reporter.last_output_dir)
+
+    def _maybe_open_reports() -> None:
+        if not args.report_open or "html" not in report_formats:
+            return
+        opened = 0
+        seen: set[str] = set()
+        for report_dir in generated_report_dirs:
+            html_path = report_dir / "report.html"
+            key = str(html_path.resolve())
+            if key in seen or not html_path.exists():
+                continue
+            seen.add(key)
+            _open_report_html(html_path)
+            opened += 1
+        if opened == 0:
+            LOGGER.warning("No report.html generated to open.")
+
     # Legacy CSV path mode (kept for backward compatibility).
     if args.backtest_data:
         epic = (args.backtest_epic or os.getenv("CAPITAL_EPIC") or assets[0].epic).strip().upper()
@@ -608,6 +973,25 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                 slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
             )
             LOGGER.info("Walk-forward report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
+            aggregate_report = report.aggregate
+            default_start = str(args.backtest_start or "csv-start")
+            default_end = str(args.backtest_end or "csv-end")
+            start_label, end_label = _trade_time_bounds(
+                list(aggregate_report.trade_log),
+                default_start=default_start,
+                default_end=default_end,
+            )
+            _emit_detailed_report(
+                symbol=selected.epic,
+                timeframe=normalize_timeframe(args.backtest_tf),
+                start_raw=start_label,
+                end_raw=end_label,
+                variant_code=_first_variant_code(args.backtest_variants),
+                mode="walk-forward",
+                trades=list(aggregate_report.trade_log),
+                payload=report.to_dict(),
+                data_root_value=str(csv_path),
+            )
         else:
             report = run_backtest_from_csv(
                 config=config,
@@ -618,6 +1002,25 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                 slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
             )
             LOGGER.info("Backtest report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
+            default_start = str(args.backtest_start or "csv-start")
+            default_end = str(args.backtest_end or "csv-end")
+            start_label, end_label = _trade_time_bounds(
+                list(report.trade_log),
+                default_start=default_start,
+                default_end=default_end,
+            )
+            _emit_detailed_report(
+                symbol=selected.epic,
+                timeframe=normalize_timeframe(args.backtest_tf),
+                start_raw=start_label,
+                end_raw=end_label,
+                variant_code=_first_variant_code(args.backtest_variants),
+                mode="backtest",
+                trades=list(report.trade_log),
+                payload=report.to_dict(),
+                data_root_value=str(csv_path),
+            )
+        _maybe_open_reports()
         return
 
     # New automatic parquet data mode (without --backtest-data).
@@ -666,7 +1069,6 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     data_health.get("gap_count_over_1bar"),
                 )
                 frame = loaded.frame
-                candles = BacktestRunner._frame_to_candles(frame)
                 spread_series = frame.get("spread")
                 spread_from_data = (
                     float(spread_series.dropna().median())
@@ -705,7 +1107,7 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     report = run_walk_forward_multi_strategy(
                         config=config,
                         asset=asset_map[symbol],
-                        candles_m5=candles,
+                        candles_m5=BacktestRunner._frame_to_candles(frame),
                         wf_splits=args.wf_splits,
                         assumed_spread=assumed_spread,
                         slippage_points=args.backtest_slippage_points,
@@ -717,11 +1119,14 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                         data_context=data_context,
                     )
                     report_dict = report.to_dict()
+                    report_trades = list(report.aggregate.trade_log)
                 else:
-                    report = run_backtest_multi_strategy(
+                    report, segment_meta = _run_multi_strategy_segmented(
                         config=config,
                         asset=asset_map[symbol],
-                        candles_m5=candles,
+                        frame=frame,
+                        loader=loader,
+                        timeframe=timeframe,
                         assumed_spread=assumed_spread,
                         slippage_points=args.backtest_slippage_points,
                         slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
@@ -732,16 +1137,30 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                         data_context=data_context,
                     )
                     report_dict = report.to_dict()
+                    report_dict["segment_health"] = segment_meta
+                    report_trades = list(report.trade_log)
                 report_dict["data_health"] = loaded.diagnostics.get("data_health", {})
                 report_dict["price_diagnostics"] = {
                     "price_mode_requested": loaded.diagnostics.get("price_mode_requested", args.backtest_price),
                     "source_datasets": loaded.diagnostics.get("source_datasets", []),
                     "source_files_count": len(loaded.diagnostics.get("source_files", [])),
                     "fallback_counters": loaded.diagnostics.get("fallback_counters", {}),
+                    "gap_segments": loaded.diagnostics.get("gap_segments", {}),
                     "spread_mode": spread_mode,
-                    "assumed_spread_used": float(assumed_spread),
+                    "assumed_spread_used": float(report_dict.get("assumed_spread_used", assumed_spread)),
                 }
                 reports[symbol] = report_dict
+                _emit_detailed_report(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start_raw=str(args.backtest_start),
+                    end_raw=str(args.backtest_end),
+                    variant_code=variant.code,
+                    mode="walk-forward" if args.walk_forward else "backtest",
+                    trades=report_trades,
+                    payload=report_dict,
+                    data_root_value=str(data_root),
+                )
 
                 filename = _variant_report_filename(
                     variant=variant,
@@ -777,6 +1196,7 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
             else:
                 LOGGER.info("Backtest auto-data variants: %s", ",".join(variant_payloads.keys()))
                 _log_variant_comparison(variant_payloads=variant_payloads, symbols=symbols)
+            _maybe_open_reports()
             return
         except MissingDataError as exc:
             for item in exc.missing:
@@ -792,6 +1212,293 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                 )
                 continue
             raise RuntimeError("Backtest data missing. Use --backtest-autofetch or provide --backtest-data CSV.") from exc
+
+
+def _batch_trade_rows(
+    *,
+    report,
+    symbol: str,
+    timeframe: str,
+    price_mode: str,
+    chunk_id: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for trade in report.trade_log:
+        open_time = trade.entry_time.astimezone(timezone.utc).isoformat()
+        close_time = trade.exit_time.astimezone(timezone.utc).isoformat()
+        side = str(trade.side).lower()
+        entry_price = float(trade.entry_price)
+        trade_id = make_trade_id(
+            open_time_utc=open_time,
+            side=side,
+            entry_price=entry_price,
+            chunk_id=chunk_id,
+        )
+        rows.append(
+            {
+                "symbol": symbol.upper(),
+                "timeframe": normalize_timeframe(timeframe),
+                "price_mode": price_mode.upper(),
+                "open_time_utc": open_time,
+                "close_time_utc": close_time,
+                "side": side,
+                "entry_price": entry_price,
+                "exit_price": float(trade.exit_price),
+                "qty": float(trade.size),
+                "size": float(trade.size),
+                "pnl": float(trade.pnl),
+                "fees": float(getattr(trade, "fees", 0.0) or 0.0),
+                "r_multiple": float(trade.r_multiple) if trade.r_multiple is not None else None,
+                "score": float(trade.score) if getattr(trade, "score", None) is not None else None,
+                "forced_exit": bool(getattr(trade, "forced_exit", False)),
+                "reason_open": str(getattr(trade, "reason_open", "SIGNAL") or "SIGNAL"),
+                "reason_close": str(getattr(trade, "reason_close", "") or getattr(trade, "reason", "")),
+                "trade_id": trade_id,
+            }
+        )
+    return rows
+
+
+def run_batch_worker_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig], root: Path) -> None:
+    if not args.symbol:
+        raise RuntimeError("--batch-worker requires --symbol")
+    if not args.start or not args.end:
+        raise RuntimeError("--batch-worker requires --start and --end")
+    if not args.out_dir:
+        raise RuntimeError("--batch-worker requires --out-dir")
+
+    symbol = str(args.symbol).strip().upper()
+    timeframe = normalize_timeframe(str(args.timeframe))
+    price_mode = str(args.price_mode).strip().upper()
+    if price_mode not in {"MID", "BID", "ASK"}:
+        raise RuntimeError("--price-mode must be MID, BID, or ASK")
+    start = _parse_backtest_datetime(str(args.start), end_value=False)
+    end = _parse_backtest_datetime(str(args.end), end_value=False)
+    if start >= end:
+        raise RuntimeError("--end must be greater than --start")
+
+    out_dir = _resolve_runtime_path(root, str(args.out_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chunk_id = out_dir.name
+    marker_success = out_dir / "SUCCESS.json"
+    marker_error = out_dir / "ERROR.json"
+    if marker_success.exists():
+        marker_success.unlink()
+    if marker_error.exists():
+        marker_error.unlink()
+
+    try:
+        data_root_arg = str(args.data_root) if args.data_root else str(args.backtest_data_root)
+        data_root = _resolve_runtime_path(root, data_root_arg)
+        _validate_batch_data_root(data_root)
+        loader = AutoDataLoader(data_root=data_root, source_priority=["local_csv"])
+        loaded = loader.load_symbol_data_range(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            price_mode=price_mode.lower(),
+            warmup_days=int(args.warmup_days),
+            source="local_csv",
+        )
+        missing_shards = loaded.diagnostics.get("missing_shards", [])
+        if isinstance(missing_shards, list):
+            for item in missing_shards:
+                LOGGER.warning("Batch shard gap: %s", item)
+        frame = loaded.frame
+        if frame.empty:
+            raise RuntimeError(f"No candles loaded for chunk={chunk_id}")
+
+        by_epic = {asset.epic.upper(): asset for asset in assets}
+        template = assets[0] if assets else AssetConfig(**config.instrument.model_dump(), trade_enabled=True)
+        asset = by_epic.get(symbol, _asset_from_template(symbol, template, True))
+
+        spread_series = frame.get("spread")
+        spread_from_data = (
+            float(spread_series.dropna().median())
+            if spread_series is not None and hasattr(spread_series, "dropna") and not spread_series.dropna().empty
+            else None
+        )
+        symbol_spread_map = config.backtest_tuning.assumed_spread_by_symbol
+        configured_spread = symbol_spread_map.get(symbol.upper()) or symbol_spread_map.get(asset.epic.upper())
+        if spread_from_data is not None:
+            assumed_spread = spread_from_data
+            spread_mode = "REAL_BIDASK"
+        else:
+            assumed_spread = float(configured_spread if configured_spread is not None else args.backtest_spread)
+            spread_mode = "ASSUMED_OHLC"
+
+        report, segment_meta = _run_multi_strategy_segmented(
+            config=config,
+            asset=asset,
+            frame=frame,
+            loader=loader,
+            timeframe=timeframe,
+            assumed_spread=assumed_spread,
+            slippage_points=args.backtest_slippage_points,
+            slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+            variant=BacktestVariant(code="BATCH-W0"),
+            execution_debug_path=out_dir / "debug_exec.jsonl",
+            no_price_debug_path=out_dir / "debug_no_price.jsonl",
+            reaction_timeout_debug_path=out_dir / "debug_reaction_timeout.jsonl",
+            trade_start_utc=start,
+            flatten_at_chunk_end=True,
+            data_context={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "price_mode_requested": price_mode.lower(),
+                "spread_mode": spread_mode,
+                "assumed_spread_used": assumed_spread,
+                **(loaded.diagnostics if isinstance(loaded.diagnostics, dict) else {}),
+            },
+        )
+
+        rows = _batch_trade_rows(
+            report=report,
+            symbol=symbol,
+            timeframe=timeframe,
+            price_mode=price_mode,
+            chunk_id=chunk_id,
+        )
+        columns = [
+            "symbol",
+            "timeframe",
+            "price_mode",
+            "open_time_utc",
+            "close_time_utc",
+            "side",
+            "entry_price",
+            "exit_price",
+            "qty",
+            "size",
+            "pnl",
+            "fees",
+            "r_multiple",
+            "score",
+            "forced_exit",
+            "reason_open",
+            "reason_close",
+            "trade_id",
+        ]
+        import pandas as pd
+
+        trades_df = pd.DataFrame(rows, columns=columns)
+        trades_df.to_parquet(out_dir / "trades.parquet", index=False, engine="pyarrow")
+
+        report_dict = report.to_dict()
+        report_dict["data_health"] = loaded.diagnostics.get("data_health", {})
+        report_dict["segment_health"] = segment_meta
+        report_dict["price_diagnostics"] = {
+            "price_mode_requested": loaded.diagnostics.get("price_mode_requested", price_mode.lower()),
+            "source_datasets": loaded.diagnostics.get("source_datasets", ["local_csv"]),
+            "source_files_count": len(loaded.diagnostics.get("source_files", [])),
+            "fallback_counters": loaded.diagnostics.get("fallback_counters", {}),
+            "missing_shards": loaded.diagnostics.get("missing_shards", []),
+            "gap_segments": loaded.diagnostics.get("gap_segments", {}),
+            "spread_mode": spread_mode,
+            "assumed_spread_used": float(report_dict.get("assumed_spread_used", assumed_spread)),
+        }
+        (out_dir / "report.json").write_text(json.dumps(report_dict, indent=2, ensure_ascii=True), encoding="utf-8")
+
+        metrics = {
+            "chunk_id": chunk_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "price_mode": price_mode,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "warmup_days": int(args.warmup_days),
+            "trades": report_dict.get("trades", 0),
+            "wins": report_dict.get("wins", 0),
+            "losses": report_dict.get("losses", 0),
+            "win_rate": report_dict.get("win_rate", 0.0),
+            "total_pnl": report_dict.get("total_pnl", 0.0),
+            "expectancy": report_dict.get("expectancy", 0.0),
+            "avg_r": report_dict.get("avg_r", 0.0),
+            "max_drawdown": report_dict.get("max_drawdown", 0.0),
+            "signal_candidates": report_dict.get("signal_candidates", 0),
+            "avg_win": report_dict.get("avg_win", 0.0),
+            "avg_loss": report_dict.get("avg_loss", 0.0),
+            "payoff_ratio": report_dict.get("payoff_ratio", 0.0),
+            "profit_factor": report_dict.get("profit_factor", 0.0),
+            "spread_mode": spread_mode,
+            "assumed_spread_used": float(report_dict.get("assumed_spread_used", assumed_spread)),
+            "data_health": report_dict.get("data_health", {}),
+            "gate_block_counts": report_dict.get("gate_block_counts", {}),
+            "segment_health": segment_meta,
+        }
+        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=True), encoding="utf-8")
+        marker_success.write_text(
+            json.dumps(
+                {
+                    "chunk_id": chunk_id,
+                    "symbol": symbol,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "status": "ok",
+                },
+                indent=2,
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        marker_error.write_text(
+            json.dumps(
+                {
+                    "symbol": str(args.symbol),
+                    "start": str(args.start),
+                    "end": str(args.end),
+                    "error": str(exc),
+                },
+                indent=2,
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+        raise
+
+
+def run_batch_backtest_mode(args: argparse.Namespace, config: AppConfig, root: Path) -> None:
+    if not args.symbol:
+        raise RuntimeError("--batch-backtest requires --symbol")
+    if not args.start or not args.end:
+        raise RuntimeError("--batch-backtest requires --start and --end")
+    symbol = str(args.symbol).strip().upper()
+    timeframe = normalize_timeframe(str(args.timeframe))
+    price_mode = str(args.price_mode).strip().upper()
+    if price_mode not in {"MID", "BID", "ASK"}:
+        raise RuntimeError("--price-mode must be MID, BID, or ASK")
+    start = _parse_backtest_datetime(str(args.start), end_value=False)
+    end = _parse_backtest_datetime(str(args.end), end_value=True)
+    if start >= end:
+        raise RuntimeError("--end must be after --start")
+
+    out_root = _resolve_runtime_path(root, str(args.out_root))
+    data_root_arg = str(args.data_root) if args.data_root else str(args.backtest_data_root)
+    data_root = _resolve_runtime_path(root, data_root_arg)
+    _validate_batch_data_root(data_root)
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = root / config_path
+
+    summary = orchestrate_batch(
+        main_script=root / "main.py",
+        config_path=config_path,
+        data_root=data_root,
+        symbol=symbol,
+        price_mode=price_mode,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        chunk=str(args.chunk),
+        workers=max(1, int(args.workers)),
+        warmup_days=max(0, int(args.warmup_days)),
+        out_root=out_root,
+        initial_equity=float(args.initial_equity),
+        continue_on_error=bool(args.continue_on_error),
+    )
+    LOGGER.info("Batch backtest summary: %s", json.dumps(summary, indent=2, ensure_ascii=True))
 
 
 def _timeframe_history(config: AppConfig) -> dict[str, int]:
@@ -1861,6 +2568,12 @@ def run_multi_strategy_loop(
                                 **evaluation.metadata,
                             },
                         )
+                        soft_reasons = evaluation.metadata.get("soft_reasons")
+                        if isinstance(soft_reasons, list):
+                            for soft_reason in soft_reasons:
+                                code = f"SOFT_REASON_{str(soft_reason).upper()}"
+                                if code not in outcome.reason_codes:
+                                    outcome.reason_codes.append(code)
                         if isinstance(strategy, IndexExistingStrategy):
                             state.h1_snapshot, state.m15_snapshot, state.m5_snapshot = strategy.last_snapshots(epic)
                             legacy = strategy.last_legacy_decision(epic)
@@ -2019,6 +2732,21 @@ def run_multi_strategy_loop(
                 )
                 if size <= 0:
                     intent.outcome.reason_codes.append("SIZE_INVALID")
+                    intent.outcome.reason_codes.append("RISK_GATE_SIZE_INVALID")
+                    intent.outcome.evaluation.gates.setdefault("RiskGate", True)
+                    intent.outcome.evaluation.gates["RiskGate"] = False
+                    if intent.outcome.evaluation.gate_blocked is None:
+                        intent.outcome.evaluation.gate_blocked = "RiskGate"
+                    final_decision[intent.symbol] = "NO_SIGNAL"
+                    continue
+
+                if not _apply_rr_profile_to_signal(
+                    intent.signal,
+                    tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+                    tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+                    tp_profile_mode=str(config.backtest_tuning.tp_profile_mode),
+                ):
+                    intent.outcome.reason_codes.append("ORDER_INVALID_RISK")
                     intent.outcome.reason_codes.append("RISK_GATE_SIZE_INVALID")
                     intent.outcome.evaluation.gates.setdefault("RiskGate", True)
                     intent.outcome.evaluation.gates["RiskGate"] = False
@@ -2206,6 +2934,14 @@ def run() -> None:
     config = load_config(config_path)
     assets = build_asset_universe(config)
     LOGGER.info("Assets configured: %s", ",".join(f"{a.epic}{'' if a.trade_enabled else '(observe)'}" for a in assets))
+
+    if args.batch_worker:
+        run_batch_worker_mode(args, config, assets, root)
+        return
+
+    if args.batch_backtest:
+        run_batch_backtest_mode(args, config, root)
+        return
 
     if args.backtest:
         run_backtest_mode(args, config, assets, root)
@@ -2618,6 +3354,16 @@ def run() -> None:
                                     journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
                                     final_decision = "NO_SIGNAL"
                                 else:
+                                    if not _apply_rr_profile_to_signal(
+                                        decision.signal,
+                                        tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+                                        tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+                                        tp_profile_mode=str(config.backtest_tuning.tp_profile_mode),
+                                    ):
+                                        decision.reason_codes.append("ORDER_INVALID_RISK")
+                                        journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
+                                        final_decision = "NO_SIGNAL"
+                                        continue
                                     size = position_size_from_risk(
                                         equity=config.risk.equity,
                                         risk_per_trade=config.risk.risk_per_trade * safe_mode_multiplier,

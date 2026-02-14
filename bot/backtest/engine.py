@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections import Counter
 import csv
 import json
+import logging
+import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,8 @@ from bot.strategy.schedule import is_schedule_open
 from bot.strategy.state_machine import StrategyEngine
 from bot.strategy.trend_pullback_m15 import TrendPullbackM15Strategy
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class BacktestTrade:
@@ -46,6 +50,11 @@ class BacktestTrade:
     pnl: float
     r_multiple: float
     reason: str
+    fees: float = 0.0
+    score: float | None = None
+    forced_exit: bool = False
+    reason_open: str = "LIMIT_ENTRY"
+    reason_close: str = ""
 
 
 @dataclass(slots=True)
@@ -61,8 +70,20 @@ class BacktestReport:
     max_drawdown: float
     time_in_market_bars: int
     equity_end: float
-    trade_log: list[BacktestTrade]
+    trade_log: list[BacktestTrade] = field(default_factory=list)
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    payoff_ratio: float = 0.0
+    profit_factor: float = 0.0
+    avg_win_r: float = 0.0
+    avg_loss_r: float = 0.0
+    payoff_r: float = 0.0
+    count_be_moves: int = 0
+    count_tp1_hits: int = 0
+    exit_reason_distribution: dict[str, int] = field(default_factory=dict)
     top_blockers: dict[str, int] = field(default_factory=dict)
+    gate_block_counts: dict[str, int] = field(default_factory=dict)
+    missing_feature_counts: dict[str, int] = field(default_factory=dict)
     decision_counts: dict[str, int] = field(default_factory=dict)
     signal_candidates: int = 0
     wait_timeout_resets: dict[str, int] = field(default_factory=dict)
@@ -87,9 +108,21 @@ class BacktestReport:
             "max_drawdown": self.max_drawdown,
             "time_in_market_bars": self.time_in_market_bars,
             "equity_end": self.equity_end,
+            "avg_win": self.avg_win,
+            "avg_loss": self.avg_loss,
+            "payoff_ratio": self.payoff_ratio,
+            "profit_factor": self.profit_factor,
+            "avg_win_R": self.avg_win_r,
+            "avg_loss_R": self.avg_loss_r,
+            "payoff_R": self.payoff_r,
+            "count_BE_moves": self.count_be_moves,
+            "count_TP1_hits": self.count_tp1_hits,
+            "exit_reason_distribution": self.exit_reason_distribution,
             "signal_candidates": self.signal_candidates,
             "decision_counts": self.decision_counts,
             "top_blockers": self.top_blockers,
+            "gate_block_counts": self.gate_block_counts,
+            "missing_feature_counts": self.missing_feature_counts,
             "wait_timeout_resets": self.wait_timeout_resets,
             "wait_metrics": self.wait_metrics,
             "execution_fail_breakdown": self.execution_fail_breakdown,
@@ -124,6 +157,8 @@ class _PendingOrder:
     size: float
     expiry_index: int
     created_at: datetime
+    reason_open: str = "SIGNAL"
+    score: float | None = None
 
 
 @dataclass(slots=True)
@@ -134,8 +169,24 @@ class _OpenPosition:
     tp: float
     size: float
     opened_at: datetime
+    initial_stop: float
+    initial_risk: float
+    max_loss_r_cap: float = 1.0
+    tp1_trigger_r: float = 0.5
+    tp1_fraction: float = 0.5
+    be_offset_r: float = 0.0
+    be_delay_bars_after_tp1: int = 0
+    trailing_after_tp1: bool = True
+    trailing_window_bars: int = 8
+    trailing_buffer_r: float = 0.05
     be_moved: bool = False
+    tp1_taken: bool = False
+    tp1_hit_index: int | None = None
     realized_partial: float = 0.0
+    swap_total: float = 0.0
+    next_swap_ts: datetime | None = None
+    reason_open: str = "SIGNAL"
+    score: float | None = None
 
 
 @dataclass(slots=True)
@@ -153,6 +204,7 @@ class _WaitGateState:
     enter_bar_index: int
     enter_ts: datetime
     enter_reason: str | None = None
+    timed_out_soft: bool = False
 
 
 @dataclass(slots=True)
@@ -163,6 +215,7 @@ class _ExecutionFailSample:
     reason: str
     spread_ratio: float | None
     atr_m5: float | None
+    missing_features: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -294,12 +347,31 @@ def _calc_exit(
         return False, 0.0, ""
     # Conservative fill order when both happen in one bar.
     reason = "STOP" if stop_hit else "TP"
+    if reason == "STOP":
+        be_stop = False
+        if position.be_moved:
+            if position.side == "LONG":
+                be_stop = position.stop >= (position.entry - 1e-9)
+            else:
+                be_stop = position.stop <= (position.entry + 1e-9)
+        if be_stop:
+            reason = "BE"
+        if position.side == "LONG":
+            fill_price = position.stop - slippage
+            max_loss_price = position.entry - (position.initial_risk * position.max_loss_r_cap)
+            fill_price = max(fill_price, max_loss_price)
+        else:
+            fill_price = position.stop + slippage
+            max_loss_price = position.entry + (position.initial_risk * position.max_loss_r_cap)
+            fill_price = min(fill_price, max_loss_price)
+        return True, fill_price, reason
+
     if position.side == "LONG":
-        base_exit = candle.bid if candle.bid is not None else (candle.close - (assumed_spread * 0.5))
-        fill_price = base_exit - slippage
+        base_tp_fill = candle.bid if candle.bid is not None else (position.tp - (assumed_spread * 0.5))
+        fill_price = base_tp_fill - slippage
     else:
-        base_exit = candle.ask if candle.ask is not None else (candle.close + (assumed_spread * 0.5))
-        fill_price = base_exit + slippage
+        base_tp_fill = candle.ask if candle.ask is not None else (position.tp + (assumed_spread * 0.5))
+        fill_price = base_tp_fill + slippage
     return True, fill_price, reason
 
 
@@ -369,6 +441,147 @@ def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
+def _quantile_from_sorted(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[0])
+    q_norm = _clamp(float(q), 0.0, 1.0)
+    pos = q_norm * float(len(values) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(values[lo])
+    frac = pos - float(lo)
+    return float(values[lo]) + (float(values[hi]) - float(values[lo])) * frac
+
+
+def _resolve_dynamic_spread_bounds(
+    *,
+    config: AppConfig,
+    symbol: str,
+    fallback_spread: float,
+) -> tuple[float, float] | None:
+    tuning = config.backtest_tuning
+    if not bool(tuning.dynamic_assumed_spread_enabled):
+        return None
+    symbol_norm = str(symbol).strip().upper()
+    min_map = tuning.dynamic_assumed_spread_min_by_symbol
+    max_map = tuning.dynamic_assumed_spread_max_by_symbol
+    min_spread = min_map.get(symbol_norm)
+    max_spread = max_map.get(symbol_norm)
+    if min_spread is None and max_spread is None:
+        return None
+    fallback = max(0.0, float(fallback_spread))
+    lo = float(min_spread) if min_spread is not None else fallback
+    hi = float(max_spread) if max_spread is not None else fallback
+    lo = max(0.0, lo)
+    hi = max(0.0, hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _build_dynamic_assumed_spread_series(
+    *,
+    candles_m5: list[Candle],
+    atr_values: list[float | None],
+    min_spread: float,
+    max_spread: float,
+) -> list[float]:
+    count = len(candles_m5)
+    if count == 0:
+        return []
+    lo = max(0.0, float(min_spread))
+    hi = max(lo, float(max_spread))
+    if hi - lo <= 1e-12:
+        return [lo] * count
+
+    atr_clean: list[float] = []
+    for value in atr_values:
+        if value is None:
+            continue
+        try:
+            atr_value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if atr_value > 0:
+            atr_clean.append(atr_value)
+
+    if not atr_clean:
+        mid = (lo + hi) * 0.5
+        return [mid] * count
+
+    atr_sorted = sorted(atr_clean)
+    q10 = _quantile_from_sorted(atr_sorted, 0.10)
+    q90 = _quantile_from_sorted(atr_sorted, 0.90)
+    if q90 <= q10:
+        mid = (lo + hi) * 0.5
+        return [mid] * count
+
+    out: list[float] = []
+    for index in range(count):
+        atr_value_raw = atr_values[index] if index < len(atr_values) else None
+        ratio = 0.5
+        if atr_value_raw is not None:
+            try:
+                atr_value = float(atr_value_raw)
+                if atr_value > 0:
+                    ratio = _clamp((atr_value - q10) / (q90 - q10), 0.0, 1.0)
+            except (TypeError, ValueError):
+                ratio = 0.5
+        out.append(lo + ((hi - lo) * ratio))
+    return out
+
+
+def _parse_swap_time_utc(value: str) -> tuple[int, int]:
+    raw = str(value).strip()
+    parts = raw.split(":")
+    if len(parts) != 2:
+        return 23, 0
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return 23, 0
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return 23, 0
+    return hour, minute
+
+
+def _next_rollover_timestamp(ts: datetime, *, hour: int, minute: int) -> datetime:
+    ts_utc = ts.astimezone(timezone.utc)
+    rollover = ts_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if ts_utc >= rollover:
+        rollover += timedelta(days=1)
+    return rollover
+
+
+def _apply_overnight_swap_if_due(
+    *,
+    position: _OpenPosition,
+    candle_ts: datetime,
+    swap_hour: int,
+    swap_minute: int,
+    long_swap_pct: float,
+    short_swap_pct: float,
+) -> float:
+    if position.next_swap_ts is None:
+        position.next_swap_ts = _next_rollover_timestamp(candle_ts, hour=swap_hour, minute=swap_minute)
+        return 0.0
+
+    ts_utc = candle_ts.astimezone(timezone.utc)
+    applied = 0.0
+    while ts_utc >= position.next_swap_ts:
+        rate_pct = float(long_swap_pct) if position.side == "LONG" else float(short_swap_pct)
+        fee = float(position.entry) * float(position.size) * (rate_pct / 100.0)
+        position.realized_partial += fee
+        position.swap_total += fee
+        applied += fee
+        position.next_swap_ts = position.next_swap_ts + timedelta(days=1)
+    return applied
+
+
 def _resolve_orderflow_mode(*, symbol: str, route_params: dict[str, object], default_mode: str, full_symbols: set[str]) -> str:
     params = route_params.get("orderflow")
     if isinstance(params, dict):
@@ -403,26 +616,46 @@ def _orderflow_param(
     return default
 
 
-def _soft_reason_penalty_map(config: AppConfig) -> dict[str, float]:
+def _soft_reason_penalty_map(
+    config: AppConfig,
+    *,
+    route_params: dict[str, object] | None = None,
+) -> dict[str, float]:
     tuning = config.backtest_tuning
-    return {
+    penalties: dict[str, float] = {
         "ORB_NO_RETEST": tuning.penalty_orb_no_retest,
         "ORB_CONFIRMATIONS_LOW": tuning.penalty_orb_confirm_low,
         "SCALP_NO_DISPLACEMENT": tuning.penalty_scalp_no_displacement,
         "SCALP_NO_MSS": tuning.penalty_scalp_no_mss,
         "SCALP_NO_FVG": tuning.penalty_scalp_no_fvg,
     }
+    if isinstance(route_params, dict):
+        raw = route_params.get("soft_penalties")
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                reason = str(key).strip().upper()
+                if not reason:
+                    continue
+                try:
+                    penalty = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if penalty > 0:
+                    penalty = -penalty
+                penalties[reason] = penalty
+    return penalties
 
 
 def _apply_soft_reason_penalties(
     *,
     evaluation: StrategyEvaluation,
     config: AppConfig,
+    route_params: dict[str, object] | None = None,
     enabled: bool,
 ) -> StrategyEvaluation:
     if not enabled:
         return evaluation
-    penalties = _soft_reason_penalty_map(config)
+    penalties = _soft_reason_penalty_map(config, route_params=route_params)
     soft_reasons: list[str] = []
     remaining: list[str] = []
     for reason in evaluation.reasons_blocking:
@@ -728,12 +961,30 @@ def _evaluate_hard_gates(
     gates_cfg = route_params.get("quality_gates")
     if isinstance(gates_cfg, dict):
         max_spread_ratio = float(gates_cfg.get("spread_ratio_max", 0.15))
+        try:
+            min_confirm = max(0, int(gates_cfg.get("min_confirm", 0)))
+        except (TypeError, ValueError):
+            min_confirm = 0
+        try:
+            min_confirm_trade = max(0, int(gates_cfg.get("min_confirm_trade", min_confirm)))
+        except (TypeError, ValueError):
+            min_confirm_trade = min_confirm
+        try:
+            min_confirm_small = max(0, int(gates_cfg.get("min_confirm_small", max(0, min_confirm_trade - 1))))
+        except (TypeError, ValueError):
+            min_confirm_small = max(0, min_confirm_trade - 1)
+        if min_confirm_small > min_confirm_trade:
+            min_confirm_small = min_confirm_trade
     else:
         max_spread_ratio = 0.15
+        min_confirm = 0
+        min_confirm_trade = 0
+        min_confirm_small = 0
     spread_ratio = evaluation.metadata.get("spread_ratio")
     atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
     spread_value = evaluation.snapshot.get("spread", evaluation.metadata.get("spread"))
     spread_mode = str(evaluation.metadata.get("spread_mode", "REAL_BIDASK")).upper()
+    missing_features: list[str] = []
     if spread_value is None:
         quote = evaluation.metadata.get("quote")
         if isinstance(quote, tuple) and len(quote) >= 3:
@@ -742,14 +993,17 @@ def _evaluate_hard_gates(
     if atr_value is None:
         gates["ExecutionGate"] = False
         reasons.append("EXEC_FAIL_MISSING_FEATURES")
+        missing_features.append("atr_m5")
     else:
         try:
             if float(atr_value) <= 0:
                 gates["ExecutionGate"] = False
                 reasons.append("EXEC_FAIL_INVALID_ATR")
+                missing_features.append("atr_m5")
         except (TypeError, ValueError):
             gates["ExecutionGate"] = False
             reasons.append("EXEC_FAIL_INVALID_ATR")
+            missing_features.append("atr_m5")
     if spread_ratio is None:
         if atr_value is not None and spread_value is not None:
             try:
@@ -771,6 +1025,7 @@ def _evaluate_hard_gates(
         elif atr_value is not None and (isinstance(atr_value, (float, int)) and float(atr_value) > 0):
             gates["ExecutionGate"] = False
             reasons.append("EXEC_FAIL_MISSING_FEATURES")
+            missing_features.append("spread_or_spread_ratio")
     elif float(spread_ratio) > max_spread_ratio:
         if spread_mode == "ASSUMED_OHLC":
             evaluation.metadata["spread_gate_ohlc_hard_skipped"] = True
@@ -783,6 +1038,57 @@ def _evaluate_hard_gates(
         else:
             gates["ExecutionGate"] = False
             reasons.append("EXEC_FAIL_SPREAD_TOO_HIGH")
+
+    has_candidate = (
+        evaluation.metadata.get("candidate_id") is not None
+        or evaluation.metadata.get("setup_id") is not None
+    )
+    required_confirm = 0
+    if has_candidate:
+        if evaluation.action == DecisionAction.TRADE:
+            required_confirm = min_confirm_trade
+        elif evaluation.action == DecisionAction.SMALL:
+            required_confirm = min_confirm_small
+    if required_confirm > 0 and has_candidate:
+        trigger_raw = evaluation.metadata.get("trigger_confirmations", evaluation.snapshot.get("trigger_confirmations"))
+        if trigger_raw is None:
+            missing_features.append("trigger_confirmations")
+            gates["ExecutionGate"] = False
+            reasons.append("EXEC_FAIL_MISSING_FEATURES")
+        else:
+            try:
+                trigger_int = int(trigger_raw)
+            except (TypeError, ValueError):
+                trigger_int = -1
+            if trigger_int < required_confirm:
+                can_downgrade_to_small = (
+                    evaluation.action == DecisionAction.TRADE
+                    and min_confirm_small > 0
+                    and trigger_int >= min_confirm_small
+                )
+                if can_downgrade_to_small:
+                    evaluation.action = DecisionAction.SMALL
+                    evaluation.metadata["confirmations_downgrade"] = {
+                        "from": "TRADE",
+                        "to": "SMALL",
+                        "trigger_confirmations": trigger_int,
+                        "required_trade": min_confirm_trade,
+                        "required_small": min_confirm_small,
+                    }
+                    soft_reasons = evaluation.metadata.get("soft_reasons")
+                    if not isinstance(soft_reasons, list):
+                        soft_reasons = []
+                    if "CONFIRMATIONS_DOWNGRADE_SMALL" not in soft_reasons:
+                        soft_reasons.append("CONFIRMATIONS_DOWNGRADE_SMALL")
+                    evaluation.metadata["soft_reasons"] = soft_reasons
+                else:
+                    gates["ExecutionGate"] = False
+                    reasons.append("EXEC_FAIL_CONFIRMATIONS_LOW")
+
+    if close_value is None:
+        missing_features.append("close")
+    if missing_features:
+        evaluation.metadata["missing_features"] = list(dict.fromkeys(missing_features))
 
     evaluation.gates = gates
     if reasons:
@@ -809,6 +1115,82 @@ def _quality_gate_reasons(
     return reasons
 
 
+def _missing_execution_features(
+    *,
+    route_params: dict[str, object],
+    evaluation: StrategyEvaluation,
+) -> list[str]:
+    missing: list[str] = []
+    metadata = evaluation.metadata if isinstance(evaluation.metadata, dict) else {}
+    snapshot = evaluation.snapshot if isinstance(evaluation.snapshot, dict) else {}
+
+    atr_value = metadata.get("atr_m5", snapshot.get("atr_m5"))
+    try:
+        if atr_value is None or float(atr_value) <= 0:
+            missing.append("atr_m5")
+    except (TypeError, ValueError):
+        missing.append("atr_m5")
+
+    close_value = snapshot.get("close", metadata.get("close"))
+    try:
+        if close_value is None or float(close_value) != float(close_value):
+            missing.append("close")
+    except (TypeError, ValueError):
+        missing.append("close")
+
+    gates_cfg = route_params.get("quality_gates")
+    min_confirm = 0
+    if isinstance(gates_cfg, dict):
+        try:
+            min_confirm = max(0, int(gates_cfg.get("min_confirm", 0)))
+        except (TypeError, ValueError):
+            min_confirm = 0
+    if min_confirm > 0 and metadata.get("trigger_confirmations") is None:
+        missing.append("trigger_confirmations")
+
+    deduped = list(dict.fromkeys(missing))
+    if deduped:
+        evaluation.metadata["missing_features"] = deduped
+        evaluation.metadata["is_ready"] = False
+    else:
+        evaluation.metadata["is_ready"] = True
+    return deduped
+
+
+def _apply_wait_timeout_soft_mode(
+    *,
+    evaluation: StrategyEvaluation,
+    config: AppConfig,
+) -> StrategyEvaluation:
+    if not bool(evaluation.metadata.get("wait_timeout_soft_mode")):
+        return evaluation
+
+    soft_penalty = max(0.0, float(config.backtest_tuning.wait_timeout_soft_penalty))
+    if evaluation.score_total is not None and soft_penalty > 0:
+        score_now = max(0.0, float(evaluation.score_total) - soft_penalty)
+        evaluation.score_total = round(score_now, 2)
+        evaluation.score_breakdown["penalty_wait_timeout_soft"] = -round(soft_penalty, 4)
+
+    if evaluation.action == DecisionAction.TRADE:
+        evaluation.action = DecisionAction.SMALL
+
+    current_override = evaluation.metadata.get("risk_multiplier_override")
+    try:
+        current_value = float(current_override) if current_override is not None else 1.0
+    except (TypeError, ValueError):
+        current_value = 1.0
+    timeout_small = max(0.01, min(1.0, float(config.backtest_tuning.wait_timeout_small_risk_multiplier)))
+    evaluation.metadata["risk_multiplier_override"] = min(current_value, timeout_small)
+
+    soft_reasons = evaluation.metadata.get("soft_reasons")
+    if not isinstance(soft_reasons, list):
+        soft_reasons = []
+    if "WAIT_TIMEOUT_SOFT_MODE" not in soft_reasons:
+        soft_reasons.append("WAIT_TIMEOUT_SOFT_MODE")
+    evaluation.metadata["soft_reasons"] = soft_reasons
+    return evaluation
+
+
 def _apply_reaction_gate_with_timeout(
     *,
     strategy_key: str,
@@ -828,15 +1210,15 @@ def _apply_reaction_gate_with_timeout(
         wait_type = "REACTION"
         timeout_bars = int(config.backtest_tuning.wait_reaction_timeout_bars)
         base_reason = "GATE_REACTION_WAIT_REACTION"
-        reset_reason = "GATE_REACTION_TIMEOUT_RESET_REACTION"
+        reset_reason = "REACTION_TIMEOUT_SOFT_REACTION"
     elif setup_state == "WAIT_MITIGATION":
         wait_type = "MITIGATION"
         timeout_bars = int(config.backtest_tuning.wait_mitigation_timeout_bars)
         base_reason = "GATE_REACTION_WAIT_MITIGATION"
-        reset_reason = "GATE_REACTION_TIMEOUT_RESET_MITIGATION"
+        reset_reason = "REACTION_TIMEOUT_SOFT_MITIGATION"
     else:
         state = wait_states.pop(strategy_key, None)
-        if state is not None:
+        if state is not None and not state.timed_out_soft:
             wait_durations.setdefault(state.wait_type, []).append(max(0, bar_index - state.enter_bar_index))
         return []
 
@@ -844,8 +1226,10 @@ def _apply_reaction_gate_with_timeout(
     if locked_bar is not None and locked_bar < bar_index:
         reset_block_bar.pop(strategy_key, None)
         locked_bar = None
-    if locked_bar is not None and locked_bar == bar_index:
-        evaluation.metadata["wait_blocked_same_bar_after_reset"] = True
+    if locked_bar is not None and bar_index <= locked_bar:
+        evaluation.metadata["wait_soft_grace_active"] = True
+        evaluation.metadata["wait_timeout_soft_mode"] = True
+        evaluation.metadata["setup_state"] = "SOFT_READY"
         return []
 
     state = wait_states.get(strategy_key)
@@ -866,16 +1250,50 @@ def _apply_reaction_gate_with_timeout(
     evaluation.metadata["wait_type"] = state.wait_type
     evaluation.metadata["wait_enter_reason"] = state.enter_reason
     evaluation.metadata["wait_elapsed_bars"] = elapsed
+    if state.timed_out_soft:
+        soft_decay_bars = max(0, int(config.backtest_tuning.wait_timeout_soft_grace_bars))
+        if elapsed > (timeout_bars + soft_decay_bars):
+            wait_states.pop(strategy_key, None)
+            if soft_decay_bars > 0:
+                reset_block_bar[strategy_key] = bar_index + soft_decay_bars
+            evaluation.metadata["wait_soft_decay_cleared"] = True
+            evaluation.metadata["setup_state"] = "SOFT_READY"
+            soft_reasons = evaluation.metadata.get("soft_reasons")
+            if not isinstance(soft_reasons, list):
+                soft_reasons = []
+            clear_code = f"REACTION_SOFT_DECAY_CLEAR_{wait_type}"
+            if clear_code not in soft_reasons:
+                soft_reasons.append(clear_code)
+            evaluation.metadata["soft_reasons"] = soft_reasons
+            return []
+        evaluation.metadata["wait_timeout_soft_mode"] = True
+        evaluation.metadata["wait_timeout_type"] = wait_type
+        soft_reasons = evaluation.metadata.get("soft_reasons")
+        if not isinstance(soft_reasons, list):
+            soft_reasons = []
+        soft_code = f"REACTION_TIMEOUT_SOFT_{wait_type}"
+        if soft_code not in soft_reasons:
+            soft_reasons.append(soft_code)
+        evaluation.metadata["soft_reasons"] = soft_reasons
+        return []
     timeouts_enabled = bool(config.backtest_tuning.reaction_timeout_force_enable or variant.reaction_timeout_reset)
     if timeouts_enabled and elapsed > timeout_bars:
-        wait_states.pop(strategy_key, None)
-        reset_block_bar[strategy_key] = bar_index
+        state.timed_out_soft = True
+        wait_states[strategy_key] = state
         wait_durations.setdefault(wait_type, []).append(elapsed)
         timeout_resets[wait_type] = int(timeout_resets.get(wait_type, 0)) + 1
         timeout_resets["REACTION_TIMEOUT_RESET"] = int(timeout_resets.get("REACTION_TIMEOUT_RESET", 0)) + 1
-        evaluation.metadata["setup_state"] = "IDLE"
-        evaluation.metadata["reaction_timeout_reset"] = True
+        evaluation.metadata["reaction_timeout_reset"] = False
         evaluation.metadata["reaction_timeout_bars"] = elapsed
+        evaluation.metadata["wait_timeout_soft_mode"] = True
+        evaluation.metadata["wait_timeout_type"] = wait_type
+        soft_reasons = evaluation.metadata.get("soft_reasons")
+        if not isinstance(soft_reasons, list):
+            soft_reasons = []
+        soft_code = f"REACTION_TIMEOUT_SOFT_{wait_type}"
+        if soft_code not in soft_reasons:
+            soft_reasons.append(soft_code)
+        evaluation.metadata["soft_reasons"] = soft_reasons
         if len(timeout_samples) < 50:
             symbol, strategy = strategy_key.split(":", 1) if ":" in strategy_key else (strategy_key, "UNKNOWN")
             timeout_samples.append(
@@ -888,7 +1306,20 @@ def _apply_reaction_gate_with_timeout(
                     reason=reset_reason,
                 )
             )
-        return [reset_reason]
+        return []
+    hard_block_bars = max(0, int(config.backtest_tuning.wait_hard_block_bars))
+    if elapsed > hard_block_bars:
+        evaluation.metadata["wait_timeout_soft_mode"] = True
+        evaluation.metadata["wait_timeout_type"] = wait_type
+        evaluation.metadata["setup_state"] = "SOFT_READY"
+        soft_reasons = evaluation.metadata.get("soft_reasons")
+        if not isinstance(soft_reasons, list):
+            soft_reasons = []
+        progress_code = f"REACTION_WAIT_SOFT_{wait_type}"
+        if progress_code not in soft_reasons:
+            soft_reasons.append(progress_code)
+        evaluation.metadata["soft_reasons"] = soft_reasons
+        return []
     return [base_reason]
 
 
@@ -922,6 +1353,13 @@ def _collect_execution_fail_sample(
             reason=reason,
             spread_ratio=spread_ratio_float,
             atr_m5=atr_float,
+            missing_features=[
+                str(item)
+                for item in evaluation.metadata.get("missing_features", [])
+                if str(item).strip()
+            ]
+            if isinstance(evaluation.metadata.get("missing_features"), list)
+            else [],
         )
     )
 
@@ -939,6 +1377,7 @@ def _write_execution_fail_debug(path: Path | None, samples: list[_ExecutionFailS
                 "reason": sample.reason,
                 "spread_ratio": sample.spread_ratio,
                 "atr_m5": sample.atr_m5,
+                "missing_features": sample.missing_features,
             }
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
@@ -1128,6 +1567,345 @@ def _action_priority(action: DecisionAction) -> int:
     return 0
 
 
+def _trade_quality_metrics(trades: list[BacktestTrade]) -> tuple[float, float, float, float]:
+    if not trades:
+        return 0.0, 0.0, 0.0, 0.0
+    win_values = [float(trade.pnl) for trade in trades if trade.pnl > 0]
+    loss_values = [abs(float(trade.pnl)) for trade in trades if trade.pnl < 0]
+    avg_win = (sum(win_values) / len(win_values)) if win_values else 0.0
+    avg_loss = (sum(loss_values) / len(loss_values)) if loss_values else 0.0
+    payoff_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+    gross_profit = sum(win_values)
+    gross_loss = sum(loss_values)
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+    return avg_win, avg_loss, payoff_ratio, profit_factor
+
+
+def _trade_r_quality_metrics(trades: list[BacktestTrade]) -> tuple[float, float, float]:
+    if not trades:
+        return 0.0, 0.0, 0.0
+    win_values = [float(trade.r_multiple) for trade in trades if trade.r_multiple > 0]
+    loss_values = [abs(float(trade.r_multiple)) for trade in trades if trade.r_multiple < 0]
+    avg_win_r = (sum(win_values) / len(win_values)) if win_values else 0.0
+    avg_loss_r = (sum(loss_values) / len(loss_values)) if loss_values else 0.0
+    payoff_r = (avg_win_r / avg_loss_r) if avg_loss_r > 0 else 0.0
+    return avg_win_r, avg_loss_r, payoff_r
+
+
+def _exit_reason_distribution(trades: list[BacktestTrade]) -> dict[str, int]:
+    out: Counter[str] = Counter()
+    for trade in trades:
+        reason = str(trade.reason_close or trade.reason or "UNKNOWN").upper()
+        out[reason] += 1
+    return dict(out)
+
+
+def _estimate_structure_target(
+    *,
+    side: str,
+    entry: float,
+    candles: list[Candle],
+    lookback_bars: int,
+) -> float | None:
+    if not candles:
+        return None
+    recent = candles[-max(2, int(lookback_bars)) :]
+    if side == "LONG":
+        candidates = [float(candle.high) for candle in recent if float(candle.high) > entry]
+        return max(candidates) if candidates else None
+    candidates = [float(candle.low) for candle in recent if float(candle.low) < entry]
+    return min(candidates) if candidates else None
+
+
+def _normalize_tp_by_r(
+    *,
+    side: str,
+    entry: float,
+    stop: float,
+    requested_tp: float,
+    min_r: float,
+    max_r: float,
+) -> tuple[float, float]:
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return requested_tp, 0.0
+    if side == "LONG":
+        requested_r = (requested_tp - entry) / risk
+    else:
+        requested_r = (entry - requested_tp) / risk
+    target_r = max(min_r, min(max_r, float(requested_r)))
+    if side == "LONG":
+        tp = entry + (risk * target_r)
+    else:
+        tp = entry - (risk * target_r)
+    return tp, target_r
+
+
+def _tp2_r_for_target_total_r(
+    *,
+    target_total_r: float,
+    tp1_trigger_r: float,
+    tp1_fraction: float,
+    mode: str = "strict_tp_price",
+) -> float:
+    """
+    Compute TP2 R so that with partial TP1 the total trade payoff stays on target.
+
+    Example:
+    - TP1 at 1R with 50% size, target total=2R  -> TP2 must be 3R
+    - TP1 at 1R with 50% size, target total=3R  -> TP2 must be 5R
+    """
+    total_r = max(0.1, float(target_total_r))
+    mode_norm = str(mode).strip().lower()
+    if mode_norm == "strict_tp_price":
+        return total_r
+    frac = max(0.0, min(0.99, float(tp1_fraction)))
+    trigger_r = max(0.0, float(tp1_trigger_r))
+    if frac <= 0.0:
+        return total_r
+    tp2_r = (total_r - (frac * trigger_r)) / max(1e-9, 1.0 - frac)
+    return max(total_r, tp2_r)
+
+
+def _expected_rr(
+    *,
+    side: str,
+    entry: float,
+    stop: float,
+    target: float,
+) -> float:
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return 0.0
+    if side == "LONG":
+        reward = target - entry
+    else:
+        reward = entry - target
+    if reward <= 0:
+        return 0.0
+    return reward / risk
+
+
+def _manage_open_position(
+    *,
+    position: _OpenPosition,
+    candle: Candle,
+    candles_m5: list[Candle],
+    index: int,
+    slippage: float,
+) -> tuple[bool, bool]:
+    risk_dist = max(0.0, float(position.initial_risk))
+    if risk_dist <= 0:
+        return False, False
+
+    tp1_hit = False
+    be_moved_now = False
+    if not position.tp1_taken:
+        if position.side == "LONG":
+            tp1_level = position.entry + (risk_dist * position.tp1_trigger_r)
+            reached_tp1 = candle.high >= tp1_level
+            partial_fill = tp1_level - slippage
+        else:
+            tp1_level = position.entry - (risk_dist * position.tp1_trigger_r)
+            reached_tp1 = candle.low <= tp1_level
+            partial_fill = tp1_level + slippage
+        if reached_tp1:
+            close_size = position.size * position.tp1_fraction
+            close_size = max(0.0, min(position.size, close_size))
+            if close_size > 0:
+                if position.side == "LONG":
+                    partial_pnl = (partial_fill - position.entry) * close_size
+                else:
+                    partial_pnl = (position.entry - partial_fill) * close_size
+                position.realized_partial += partial_pnl
+                position.size -= close_size
+                position.tp1_taken = True
+                position.tp1_hit_index = int(index)
+                tp1_hit = True
+
+    if position.tp1_taken and not position.be_moved and position.tp1_hit_index is not None:
+        elapsed_since_tp1 = int(index - position.tp1_hit_index)
+        if elapsed_since_tp1 >= int(max(0, position.be_delay_bars_after_tp1)):
+            if position.side == "LONG":
+                confirm_ok = candle.close >= position.entry
+                be_price = position.entry + (risk_dist * position.be_offset_r)
+                if confirm_ok and be_price > position.stop:
+                    position.stop = be_price
+                    be_moved_now = True
+            else:
+                confirm_ok = candle.close <= position.entry
+                be_price = position.entry - (risk_dist * position.be_offset_r)
+                if confirm_ok and be_price < position.stop:
+                    position.stop = be_price
+                    be_moved_now = True
+            if be_moved_now:
+                position.be_moved = True
+
+    if position.trailing_after_tp1 and position.tp1_taken and position.size > 0 and position.be_moved:
+        window = max(2, int(position.trailing_window_bars))
+        recent = candles_m5[max(0, index - window + 1) : index + 1]
+        if recent:
+            buffer_value = risk_dist * max(0.0, float(position.trailing_buffer_r))
+            if position.side == "LONG":
+                swing_low = min(float(item.low) for item in recent)
+                trail_stop = swing_low - buffer_value
+                if trail_stop > position.stop:
+                    position.stop = trail_stop
+            else:
+                swing_high = max(float(item.high) for item in recent)
+                trail_stop = swing_high + buffer_value
+                if trail_stop < position.stop:
+                    position.stop = trail_stop
+
+    return tp1_hit, be_moved_now
+
+
+def _gate_counts_from_blockers(blockers: Counter[str]) -> dict[str, int]:
+    return {
+        key: int(value)
+        for key, value in blockers.items()
+        if key.startswith("GATE_") or key.startswith("EXEC_FAIL_") or key.startswith("PIPELINE_NOT_READY")
+    }
+
+
+def _merge_wait_metrics(reports: list[BacktestReport]) -> dict[str, float]:
+    keys: set[str] = set()
+    for report in reports:
+        keys.update(report.wait_metrics.keys())
+    merged: dict[str, float] = {}
+    for key in keys:
+        values = [float(report.wait_metrics.get(key, 0.0)) for report in reports]
+        if key.endswith("_max_bars"):
+            merged[key] = float(max(values)) if values else 0.0
+        else:
+            merged[key] = round((sum(values) / len(values)) if values else 0.0, 3)
+    return merged
+
+
+def aggregate_backtest_reports(
+    *,
+    config: AppConfig,
+    asset: AssetConfig,
+    reports: list[BacktestReport],
+) -> BacktestReport:
+    if not reports:
+        return BacktestReport(
+            epic=asset.epic,
+            trades=0,
+            wins=0,
+            losses=0,
+            win_rate=0.0,
+            total_pnl=0.0,
+            expectancy=0.0,
+            avg_r=0.0,
+            max_drawdown=0.0,
+            time_in_market_bars=0,
+            equity_end=config.risk.equity,
+            trade_log=[],
+        )
+
+    all_trades = sorted(
+        [trade for report in reports for trade in report.trade_log],
+        key=lambda item: (item.exit_time, item.entry_time),
+    )
+    trade_count = len(all_trades)
+    wins = sum(1 for trade in all_trades if trade.pnl > 0)
+    losses = sum(1 for trade in all_trades if trade.pnl <= 0)
+    total_pnl = sum(float(trade.pnl) for trade in all_trades)
+    expectancy = (total_pnl / trade_count) if trade_count else 0.0
+    avg_r = (sum(float(trade.r_multiple) for trade in all_trades) / trade_count) if trade_count else 0.0
+    win_rate = (wins / trade_count) if trade_count else 0.0
+    avg_win, avg_loss, payoff_ratio, profit_factor = _trade_quality_metrics(all_trades)
+    avg_win_r, avg_loss_r, payoff_r = _trade_r_quality_metrics(all_trades)
+    exit_reason_distribution = _exit_reason_distribution(all_trades)
+
+    equity = float(config.risk.equity)
+    peak = equity
+    max_drawdown = 0.0
+    for trade in all_trades:
+        equity += float(trade.pnl)
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+    decision_counts: Counter[str] = Counter()
+    blockers: Counter[str] = Counter()
+    gate_blocks: Counter[str] = Counter()
+    execution_fail: Counter[str] = Counter()
+    missing_feature_counts: Counter[str] = Counter()
+    timeout_resets: Counter[str] = Counter()
+    score_bins: Counter[str] = Counter()
+    spread_adjustments: Counter[str] = Counter()
+    spread_modes: set[str] = set()
+    assumed_spread_values: list[float] = []
+    score_values: list[float] = []
+    signal_candidates = 0
+    time_in_market_bars = 0
+    count_be_moves = 0
+    count_tp1_hits = 0
+    for report in reports:
+        decision_counts.update(report.decision_counts)
+        blockers.update(report.top_blockers)
+        gate_blocks.update(report.gate_block_counts)
+        execution_fail.update(report.execution_fail_breakdown)
+        missing_feature_counts.update(report.missing_feature_counts)
+        timeout_resets.update(report.wait_timeout_resets)
+        score_bins.update(report.score_bins)
+        spread_adjustments.update(report.spread_gate_adjustments)
+        spread_modes.add(report.spread_mode)
+        assumed_spread_values.append(float(report.assumed_spread_used))
+        if report.avg_score is not None:
+            score_values.append(float(report.avg_score))
+        signal_candidates += int(report.signal_candidates)
+        time_in_market_bars += int(report.time_in_market_bars)
+        count_be_moves += int(report.count_be_moves)
+        count_tp1_hits += int(report.count_tp1_hits)
+
+    return BacktestReport(
+        epic=asset.epic,
+        trades=trade_count,
+        wins=wins,
+        losses=losses,
+        win_rate=win_rate,
+        total_pnl=total_pnl,
+        expectancy=expectancy,
+        avg_r=avg_r,
+        max_drawdown=max_drawdown,
+        time_in_market_bars=time_in_market_bars,
+        equity_end=equity,
+        trade_log=all_trades,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        payoff_ratio=payoff_ratio,
+        profit_factor=profit_factor,
+        avg_win_r=avg_win_r,
+        avg_loss_r=avg_loss_r,
+        payoff_r=payoff_r,
+        count_be_moves=count_be_moves,
+        count_tp1_hits=count_tp1_hits,
+        exit_reason_distribution=exit_reason_distribution,
+        top_blockers=dict(blockers.most_common(10)),
+        gate_block_counts=dict(gate_blocks if gate_blocks else _gate_counts_from_blockers(blockers)),
+        missing_feature_counts=dict(missing_feature_counts),
+        decision_counts=dict(decision_counts),
+        signal_candidates=signal_candidates,
+        wait_timeout_resets={
+            "reaction": int(timeout_resets.get("reaction", timeout_resets.get("REACTION", 0))),
+            "mitigation": int(timeout_resets.get("mitigation", timeout_resets.get("MITIGATION", 0))),
+            "total": int(timeout_resets.get("total", timeout_resets.get("REACTION_TIMEOUT_RESET", 0))),
+        },
+        wait_metrics=_merge_wait_metrics(reports),
+        execution_fail_breakdown=dict(execution_fail),
+        avg_score=round(sum(score_values) / len(score_values), 4) if score_values else None,
+        score_bins=dict(score_bins),
+        spread_mode=next(iter(spread_modes)) if len(spread_modes) == 1 else "MIXED",
+        assumed_spread_used=round(sum(assumed_spread_values) / len(assumed_spread_values), 6) if assumed_spread_values else 0.0,
+        spread_gate_adjustments=dict(spread_adjustments),
+    )
+
+
 def _is_better_outcome(
     *,
     current: StrategyOutcome,
@@ -1161,12 +1939,27 @@ def run_backtest_multi_strategy(
     no_price_debug_path: str | Path | None = None,
     reaction_timeout_debug_path: str | Path | None = None,
     data_context: dict[str, Any] | None = None,
+    trade_start_utc: datetime | None = None,
+    flatten_at_chunk_end: bool = False,
 ) -> BacktestReport:
     variant_cfg = variant or BacktestVariant()
     debug_path = Path(execution_debug_path) if execution_debug_path is not None else None
     no_price_path = Path(no_price_debug_path) if no_price_debug_path is not None else None
     reaction_timeout_path = Path(reaction_timeout_debug_path) if reaction_timeout_debug_path is not None else None
     backtest_context: dict[str, Any] = dict(data_context or {})
+    trade_start = trade_start_utc.astimezone(timezone.utc) if trade_start_utc is not None else None
+    segment_id = str(backtest_context.get("segment_index", "1"))
+    segment_start_index = 0
+    segment_start_raw = backtest_context.get("segment_start_utc")
+    if isinstance(segment_start_raw, str) and segment_start_raw:
+        try:
+            seg_ts = _parse_dt(segment_start_raw)
+            for idx, candle in enumerate(candles_m5):
+                if candle.timestamp >= seg_ts:
+                    segment_start_index = idx
+                    break
+        except ValueError:
+            segment_start_index = 0
     spread_mode = str(backtest_context.get("spread_mode", "REAL_BIDASK")).upper()
     assumed_spread_used = float(backtest_context.get("assumed_spread_used", assumed_spread))
     risk_engine = RiskEngine(config.risk)
@@ -1197,6 +1990,21 @@ def run_backtest_multi_strategy(
     candles_m15 = aggregate_candles(candles_m5, 15)
     candles_h1 = aggregate_candles(candles_m5, 60)
     atr_values = atr(candles_m5, config.indicators.atr_period)
+    spread_bounds = _resolve_dynamic_spread_bounds(
+        config=config,
+        symbol=asset.epic,
+        fallback_spread=assumed_spread_used,
+    )
+    dynamic_assumed_spread: list[float] | None = None
+    if spread_mode == "ASSUMED_OHLC" and spread_bounds is not None:
+        dynamic_assumed_spread = _build_dynamic_assumed_spread_series(
+            candles_m5=candles_m5,
+            atr_values=atr_values,
+            min_spread=spread_bounds[0],
+            max_spread=spread_bounds[1],
+        )
+        if dynamic_assumed_spread:
+            assumed_spread_used = float(sum(dynamic_assumed_spread) / len(dynamic_assumed_spread))
 
     equity = config.risk.equity
     peak_equity = equity
@@ -1205,6 +2013,8 @@ def run_backtest_multi_strategy(
     pending: _PendingOrder | None = None
     open_pos: _OpenPosition | None = None
     time_in_market_bars = 0
+    count_be_moves = 0
+    count_tp1_hits = 0
     decision_counts: Counter[str] = Counter()
     blockers: Counter[str] = Counter()
     signal_candidates = 0
@@ -1214,11 +2024,14 @@ def run_backtest_multi_strategy(
     wait_durations: dict[str, list[int]] = {"REACTION": [], "MITIGATION": []}
     reaction_timeout_samples: list[_ReactionTimeoutSample] = []
     execution_fail_breakdown: Counter[str] = Counter()
+    missing_feature_counts: Counter[str] = Counter()
     execution_fail_samples: list[_ExecutionFailSample] = []
     no_price_samples: list[_NoPriceSample] = []
     spread_gate_adjustments: Counter[str] = Counter()
     score_values: list[float] = []
     score_bins: Counter[str] = Counter()
+    missing_feature_debug_logged = 0
+    feature_warmup_bars = max(3, int(config.indicators.atr_period) + 2)
     trade_thr_base, small_min_base, small_max_base = _thresholds_for_variant(config, variant_cfg)
     timeouts_enabled = bool(config.backtest_tuning.reaction_timeout_force_enable or variant_cfg.reaction_timeout_reset)
 
@@ -1229,11 +2042,16 @@ def run_backtest_multi_strategy(
     h1_ptr = -1
     last_h1_closed_ts: datetime | None = None
     last_m15_closed_ts: datetime | None = None
+    swap_hour, swap_minute = _parse_swap_time_utc(config.backtest_tuning.overnight_swap_time_utc)
+    long_swap_pct = float(config.backtest_tuning.overnight_swap_long_pct)
+    short_swap_pct = float(config.backtest_tuning.overnight_swap_short_pct)
 
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
         if candle.bid is not None and candle.ask is not None:
             return max(0.0, candle.ask - candle.bid)
+        if dynamic_assumed_spread is not None and index < len(dynamic_assumed_spread):
+            return max(0.0, float(dynamic_assumed_spread[index]))
         return max(0.0, assumed_spread)
 
     def _slippage_for(index: int) -> float:
@@ -1243,6 +2061,25 @@ def run_backtest_multi_strategy(
             if atr_val is not None:
                 atr_term = max(0.0, slippage_atr_multiplier * atr_val)
         return max(0.0, slippage_points) + atr_term
+
+    def _cap_size_by_margin(entry_price: float, requested_size: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        margin_requirement_pct = float(config.backtest_tuning.broker_margin_requirement_pct)
+        leverage = float(config.backtest_tuning.broker_leverage)
+        caps: list[float] = []
+        if margin_requirement_pct > 0:
+            caps.append((equity / (margin_requirement_pct / 100.0)) / entry_price)
+        if leverage > 0:
+            caps.append((equity * leverage) / entry_price)
+        if not caps:
+            return max(0.0, requested_size)
+        max_size = max(0.0, min(caps))
+        step = asset.size_step if asset.size_step > 0 else 0.01
+        max_size = math.floor(max_size / step) * step
+        if max_size < asset.min_size:
+            return 0.0
+        return min(max(0.0, requested_size), max_size)
 
     start_idx = max(config.indicators.ema_period_h1 + 10, 250)
     for i in range(start_idx, len(candles_m5)):
@@ -1259,19 +2096,25 @@ def run_backtest_multi_strategy(
                     else int(config.backtest_tuning.wait_mitigation_timeout_bars)
                 )
                 elapsed = max(0, i - state.enter_bar_index)
+                if state.timed_out_soft:
+                    soft_decay_bars = max(0, int(config.backtest_tuning.wait_timeout_soft_grace_bars))
+                    if elapsed > (timeout_bars + soft_decay_bars):
+                        wait_states.pop(key, None)
+                        if soft_decay_bars > 0:
+                            wait_reset_block_bar[key] = i + soft_decay_bars
+                    continue
                 if elapsed <= timeout_bars:
                     continue
-                wait_states.pop(key, None)
-                wait_reset_block_bar[key] = i
+                state.timed_out_soft = True
+                wait_states[key] = state
                 wait_durations.setdefault(state.wait_type, []).append(elapsed)
                 timeout_resets[state.wait_type] = int(timeout_resets.get(state.wait_type, 0)) + 1
                 timeout_resets["REACTION_TIMEOUT_RESET"] = int(timeout_resets.get("REACTION_TIMEOUT_RESET", 0)) + 1
                 reason = (
-                    "GATE_REACTION_TIMEOUT_RESET_REACTION"
+                    "REACTION_TIMEOUT_SOFT_REACTION"
                     if state.wait_type == "REACTION"
-                    else "GATE_REACTION_TIMEOUT_RESET_MITIGATION"
+                    else "REACTION_TIMEOUT_SOFT_MITIGATION"
                 )
-                blockers[reason] += 1
                 if len(reaction_timeout_samples) < 50:
                     symbol, strategy = key.split(":", 1) if ":" in key else (key, "UNKNOWN")
                     reaction_timeout_samples.append(
@@ -1284,6 +2127,9 @@ def run_backtest_multi_strategy(
                             reason=reason,
                         )
                     )
+
+        if trade_start is not None and candle.timestamp < trade_start:
+            continue
 
         if pending is not None and i > pending.expiry_index:
             pending = None
@@ -1298,6 +2144,7 @@ def run_backtest_multi_strategy(
                 else:
                     base_entry = candle.bid if candle.bid is not None else (candle.close - (_spread_for(i) * 0.5))
                     entry_fill = base_entry - slippage
+                initial_risk = abs(pending.entry - pending.stop)
                 open_pos = _OpenPosition(
                     side=pending.side,
                     entry=entry_fill,
@@ -1305,21 +2152,47 @@ def run_backtest_multi_strategy(
                     tp=pending.tp,
                     size=pending.size,
                     opened_at=candle.timestamp,
+                    initial_stop=pending.stop,
+                    initial_risk=initial_risk,
+                    max_loss_r_cap=float(config.backtest_tuning.max_loss_r_cap),
+                    tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+                    tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+                    be_offset_r=float(config.backtest_tuning.be_offset_r),
+                    be_delay_bars_after_tp1=int(config.backtest_tuning.be_delay_bars_after_tp1),
+                    trailing_after_tp1=bool(config.backtest_tuning.trailing_after_tp1),
+                    trailing_window_bars=int(config.backtest_tuning.trailing_swing_window_bars),
+                    trailing_buffer_r=float(config.backtest_tuning.trailing_buffer_r),
+                    next_swap_ts=_next_rollover_timestamp(
+                        candle.timestamp,
+                        hour=swap_hour,
+                        minute=swap_minute,
+                    ),
+                    reason_open=pending.reason_open,
+                    score=pending.score,
                 )
                 pending = None
 
         if open_pos is not None:
             time_in_market_bars += 1
-            risk_dist = abs(open_pos.entry - open_pos.stop)
-            if risk_dist > 0 and not open_pos.be_moved:
-                one_r = open_pos.entry + risk_dist if open_pos.side == "LONG" else open_pos.entry - risk_dist
-                reached_1r = candle.high >= one_r if open_pos.side == "LONG" else candle.low <= one_r
-                if reached_1r:
-                    half = open_pos.size * 0.5
-                    open_pos.be_moved = True
-                    open_pos.stop = open_pos.entry
-                    open_pos.size = open_pos.size - half
-                    open_pos.realized_partial += half * risk_dist
+            _apply_overnight_swap_if_due(
+                position=open_pos,
+                candle_ts=candle.timestamp,
+                swap_hour=swap_hour,
+                swap_minute=swap_minute,
+                long_swap_pct=long_swap_pct,
+                short_swap_pct=short_swap_pct,
+            )
+            tp1_hit, be_moved_now = _manage_open_position(
+                position=open_pos,
+                candle=candle,
+                candles_m5=candles_m5,
+                index=i,
+                slippage=_slippage_for(i),
+            )
+            if tp1_hit:
+                count_tp1_hits += 1
+            if be_moved_now:
+                count_be_moves += 1
 
             should_close, exit_price, reason = _calc_exit(
                 open_pos,
@@ -1347,8 +2220,12 @@ def run_backtest_multi_strategy(
                         exit_price=exit_price,
                         size=open_pos.size,
                         pnl=total_pnl,
+                        fees=open_pos.swap_total,
                         r_multiple=r_mult,
                         reason=reason,
+                        score=open_pos.score,
+                        reason_open=open_pos.reason_open,
+                        reason_close=reason,
                     )
                 )
                 open_pos = None
@@ -1446,6 +2323,7 @@ def run_backtest_multi_strategy(
                     "strategy_params": route.params,
                     "strategy_risk": route.risk,
                     "origin_strategy": route.strategy,
+                    "suppress_missed_opportunity_logs": True,
                 },
             )
             strategy.preprocess(asset.epic, bundle)
@@ -1506,6 +2384,27 @@ def run_backtest_multi_strategy(
             evaluation.metadata["spread_mode"] = spread_mode
             evaluation.metadata["assumed_spread_used"] = assumed_spread_used
             evaluation.metadata["data_context"] = backtest_context
+            bars_since_segment_start = max(0, i - segment_start_index)
+            evaluation.metadata["bars_since_segment_start"] = bars_since_segment_start
+            atr_runtime = atr_values[i] if 0 <= i < len(atr_values) else None
+            if bars_since_segment_start >= feature_warmup_bars and atr_runtime is not None:
+                try:
+                    atr_runtime_f = float(atr_runtime)
+                except (TypeError, ValueError):
+                    atr_runtime_f = None
+                if atr_runtime_f is not None and atr_runtime_f > 0:
+                    evaluation.metadata.setdefault("atr_m5", atr_runtime_f)
+                    evaluation.snapshot.setdefault("atr_m5", atr_runtime_f)
+            trigger_value = evaluation.metadata.get("trigger_confirmations")
+            if trigger_value is None:
+                alt_trigger = evaluation.metadata.get("confirmations")
+                if alt_trigger is None:
+                    alt_trigger = evaluation.snapshot.get("trigger_confirmations")
+                try:
+                    trigger_int = int(alt_trigger) if alt_trigger is not None else 0
+                except (TypeError, ValueError):
+                    trigger_int = 0
+                evaluation.metadata["trigger_confirmations"] = max(0, trigger_int)
             if quote is not None:
                 evaluation.metadata["quote"] = quote
                 evaluation.metadata["bid"] = quote[0]
@@ -1513,6 +2412,7 @@ def run_backtest_multi_strategy(
             evaluation = _apply_soft_reason_penalties(
                 evaluation=evaluation,
                 config=config,
+                route_params=route.params,
                 enabled=variant_cfg.soft_reason_penalties,
             )
             evaluation = _compute_v2_score(
@@ -1545,12 +2445,32 @@ def run_backtest_multi_strategy(
                 small_min=small_min,
                 small_max=small_max,
             )
-            gate_reasons = _quality_gate_reasons(
-                route_params=route.params,
-                evaluation=evaluation,
-                now=t,
-                timezone_name=config.timezone,
-            )
+            if candidate is None or bars_since_segment_start < feature_warmup_bars:
+                missing_features = []
+                evaluation.metadata["is_ready"] = True
+            else:
+                missing_features = _missing_execution_features(
+                    route_params=route.params,
+                    evaluation=evaluation,
+                )
+                if missing_features and missing_feature_debug_logged < 10:
+                    missing_feature_debug_logged += 1
+                    LOGGER.info(
+                        "Missing features | ts=%s segment=%s bars_since_segment_start=%d missing=%s",
+                        t.isoformat(),
+                        segment_id,
+                        bars_since_segment_start,
+                        ",".join(str(item) for item in missing_features),
+                    )
+            if missing_features:
+                gate_reasons = ["PIPELINE_NOT_READY_MISSING_FEATURES"]
+            else:
+                gate_reasons = _quality_gate_reasons(
+                    route_params=route.params,
+                    evaluation=evaluation,
+                    now=t,
+                    timezone_name=config.timezone,
+                )
             reaction_reasons = _apply_reaction_gate_with_timeout(
                 strategy_key=f"{asset.epic}:{route.strategy}",
                 bar_index=i,
@@ -1565,15 +2485,15 @@ def run_backtest_multi_strategy(
                 timeout_samples=reaction_timeout_samples,
             )
             gate_reasons.extend(reaction_reasons)
-            for code in reaction_reasons:
-                if code.startswith("GATE_REACTION_TIMEOUT_RESET_"):
-                    blockers[code] += 1
+            evaluation = _apply_wait_timeout_soft_mode(
+                evaluation=evaluation,
+                config=config,
+            )
             if gate_reasons:
                 for code in gate_reasons:
                     if code not in evaluation.reasons_blocking:
                         evaluation.reasons_blocking.append(code)
-                if not any(code.startswith("GATE_REACTION_TIMEOUT_RESET_") for code in gate_reasons):
-                    evaluation.action = DecisionAction.OBSERVE
+                evaluation.action = DecisionAction.OBSERVE
             evaluation = _apply_orderflow_small_soft_gate(
                 route_params=route.params,
                 evaluation=evaluation,
@@ -1629,6 +2549,14 @@ def run_backtest_multi_strategy(
 
         if best_outcome.order_request is None:
             reasons = best_outcome.reason_codes or ["NO_SIGNAL"]
+            if "PIPELINE_NOT_READY_MISSING_FEATURES" in reasons:
+                missing_items = best_outcome.evaluation.metadata.get("missing_features")
+                if isinstance(missing_items, list) and missing_items:
+                    for item in missing_items:
+                        key = str(item).strip() or "UNKNOWN"
+                        missing_feature_counts[key] += 1
+                else:
+                    missing_feature_counts["UNKNOWN"] += 1
             for reason in reasons:
                 blockers[reason] += 1
                 if reason.startswith("EXEC_FAIL_"):
@@ -1655,6 +2583,76 @@ def run_backtest_multi_strategy(
             decision_counts["NO_SIGNAL"] += 1
             continue
 
+        order_request = best_outcome.order_request
+        risk_dist = abs(float(order_request.entry_price) - float(order_request.stop_price))
+        if risk_dist <= 0:
+            blockers["ORDER_INVALID_RISK"] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+
+        expected_rr_min = float(config.backtest_tuning.expected_rr_min)
+        expected_rr_lookback = max(10, int(config.backtest_tuning.expected_rr_lookback_bars))
+        structure_target = _estimate_structure_target(
+            side=order_request.side,
+            entry=float(order_request.entry_price),
+            candles=candles_m5[max(0, i - expected_rr_lookback + 1) : i + 1],
+            lookback_bars=expected_rr_lookback,
+        )
+        requested_tp = float(order_request.take_profit)
+        if structure_target is None:
+            rr_target = requested_tp
+        elif order_request.side == "LONG":
+            rr_target = max(requested_tp, float(structure_target))
+        else:
+            rr_target = min(requested_tp, float(structure_target))
+        expected_rr_value = _expected_rr(
+            side=order_request.side,
+            entry=float(order_request.entry_price),
+            stop=float(order_request.stop_price),
+            target=rr_target,
+        )
+        signal_rr = getattr(order_request, "rr", None)
+        try:
+            if signal_rr is not None:
+                expected_rr_value = max(expected_rr_value, float(signal_rr))
+        except (TypeError, ValueError):
+            pass
+        best_outcome.evaluation.metadata["expected_rr"] = round(expected_rr_value, 4)
+        if structure_target is not None:
+            best_outcome.evaluation.metadata["expected_rr_target_structure"] = float(structure_target)
+        if expected_rr_value < expected_rr_min:
+            blockers["EXPECTED_RR_TOO_LOW"] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+
+        is_a_plus = bool(getattr(order_request, "a_plus", False))
+        if is_a_plus:
+            target_total_r = float(config.backtest_tuning.tp_target_a_plus_r)
+            best_outcome.evaluation.metadata["tp_target_profile"] = "A_PLUS_3R"
+        else:
+            target_total_r = float(config.backtest_tuning.tp_target_min_r)
+            best_outcome.evaluation.metadata["tp_target_profile"] = "STANDARD_2R"
+        target_min_r = _tp2_r_for_target_total_r(
+            target_total_r=target_total_r,
+            tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+            tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+            mode=str(config.backtest_tuning.tp_profile_mode),
+        )
+        target_max_r = target_min_r
+        best_outcome.evaluation.metadata["target_r_profile_total"] = round(target_total_r, 4)
+        best_outcome.evaluation.metadata["target_r_tp2"] = round(target_min_r, 4)
+        tp_source = rr_target
+        normalized_tp, normalized_r = _normalize_tp_by_r(
+            side=order_request.side,
+            entry=float(order_request.entry_price),
+            stop=float(order_request.stop_price),
+            requested_tp=tp_source,
+            min_r=target_min_r,
+            max_r=target_max_r,
+        )
+        order_request.take_profit = normalized_tp
+        best_outcome.evaluation.metadata["target_r_normalized"] = round(normalized_r, 4)
+
         signal_candidates += 1
         risk_multiplier = _risk_multiplier_for(
             evaluation=best_outcome.evaluation,
@@ -1664,24 +2662,28 @@ def run_backtest_multi_strategy(
         size = position_size_from_risk(
             equity=config.risk.equity,
             risk_per_trade=config.risk.risk_per_trade * risk_multiplier,
-            entry_price=best_outcome.order_request.entry_price,
-            stop_price=best_outcome.order_request.stop_price,
+            entry_price=order_request.entry_price,
+            stop_price=order_request.stop_price,
             min_size=asset.min_size,
             size_step=asset.size_step,
         )
+        size = _cap_size_by_margin(float(order_request.entry_price), float(size))
         if size <= 0:
+            blockers["SIZE_MARGIN_LIMIT"] += 1
             blockers["SIZE_INVALID"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
 
         pending = _PendingOrder(
-            side=best_outcome.order_request.side,
-            entry=best_outcome.order_request.entry_price,
-            stop=best_outcome.order_request.stop_price,
-            tp=best_outcome.order_request.take_profit,
+            side=order_request.side,
+            entry=order_request.entry_price,
+            stop=order_request.stop_price,
+            tp=order_request.take_profit,
             size=size,
             expiry_index=i + config.execution.limit_ttl_bars,
             created_at=t,
+            reason_open=",".join(best_outcome.reason_codes) if best_outcome.reason_codes else "SIGNAL",
+            score=best_outcome.evaluation.score_total,
         )
         daily_trades[day_key] += 1
         decision_counts[best_outcome.evaluation.action.value] += 1
@@ -1689,6 +2691,8 @@ def run_backtest_multi_strategy(
     if candles_m5:
         last_index = len(candles_m5) - 1
         for state in wait_states.values():
+            if state.timed_out_soft:
+                continue
             wait_durations.setdefault(state.wait_type, []).append(max(0, last_index - state.enter_bar_index))
 
     _write_execution_fail_debug(debug_path, execution_fail_samples)
@@ -1706,6 +2710,43 @@ def run_backtest_multi_strategy(
 
     avg_score = round(sum(score_values) / len(score_values), 4) if score_values else None
 
+    if flatten_at_chunk_end and open_pos is not None and candles_m5:
+        last_candle = candles_m5[-1]
+        spread_now = _spread_for(len(candles_m5) - 1)
+        if open_pos.side == "LONG":
+            exit_price = last_candle.bid if last_candle.bid is not None else (last_candle.close - (spread_now * 0.5))
+            remaining_pnl = (exit_price - open_pos.entry) * open_pos.size
+        else:
+            exit_price = last_candle.ask if last_candle.ask is not None else (last_candle.close + (spread_now * 0.5))
+            remaining_pnl = (open_pos.entry - exit_price) * open_pos.size
+        total_pnl = open_pos.realized_partial + remaining_pnl
+        equity += total_pnl
+        r_denom = risk_engine.per_trade_risk_amount(equity=config.risk.equity)
+        r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                epic=asset.epic,
+                side=open_pos.side,
+                entry_time=open_pos.opened_at,
+                exit_time=last_candle.timestamp,
+                entry_price=open_pos.entry,
+                exit_price=exit_price,
+                size=open_pos.size,
+                pnl=total_pnl,
+                fees=open_pos.swap_total,
+                r_multiple=r_mult,
+                reason="FORCED_CHUNK_END",
+                forced_exit=True,
+                score=open_pos.score,
+                reason_open=open_pos.reason_open,
+                reason_close="FORCED_CHUNK_END",
+            )
+        )
+        peak_equity = max(peak_equity, equity)
+        drawdown = peak_equity - equity
+        max_drawdown = max(max_drawdown, drawdown)
+        open_pos = None
+
     wins = sum(1 for trade in trades if trade.pnl > 0)
     losses = sum(1 for trade in trades if trade.pnl <= 0)
     total_pnl = sum(trade.pnl for trade in trades)
@@ -1713,6 +2754,9 @@ def run_backtest_multi_strategy(
     expectancy = (total_pnl / trade_count) if trade_count else 0.0
     avg_r = (sum(trade.r_multiple for trade in trades) / trade_count) if trade_count else 0.0
     win_rate = (wins / trade_count) if trade_count else 0.0
+    avg_win, avg_loss, payoff_ratio, profit_factor = _trade_quality_metrics(trades)
+    avg_win_r, avg_loss_r, payoff_r = _trade_r_quality_metrics(trades)
+    exit_reason_distribution = _exit_reason_distribution(trades)
 
     return BacktestReport(
         epic=asset.epic,
@@ -1727,7 +2771,19 @@ def run_backtest_multi_strategy(
         time_in_market_bars=time_in_market_bars,
         equity_end=config.risk.equity + total_pnl,
         trade_log=trades,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        payoff_ratio=payoff_ratio,
+        profit_factor=profit_factor,
+        avg_win_r=avg_win_r,
+        avg_loss_r=avg_loss_r,
+        payoff_r=payoff_r,
+        count_be_moves=count_be_moves,
+        count_tp1_hits=count_tp1_hits,
+        exit_reason_distribution=exit_reason_distribution,
         top_blockers=dict(blockers.most_common(10)),
+        gate_block_counts=_gate_counts_from_blockers(blockers),
+        missing_feature_counts=dict(missing_feature_counts),
         decision_counts=dict(decision_counts),
         signal_candidates=signal_candidates,
         wait_timeout_resets={
@@ -1759,6 +2815,23 @@ def run_backtest(
     candles_m15 = aggregate_candles(candles_m5, 15)
     candles_h1 = aggregate_candles(candles_m5, 60)
     atr_values = atr(candles_m5, config.indicators.atr_period)
+    spread_mode = "REAL_BIDASK" if any(c.bid is not None and c.ask is not None for c in candles_m5) else "ASSUMED_OHLC"
+    assumed_spread_used = float(max(0.0, assumed_spread))
+    spread_bounds = _resolve_dynamic_spread_bounds(
+        config=config,
+        symbol=asset.epic,
+        fallback_spread=assumed_spread_used,
+    )
+    dynamic_assumed_spread: list[float] | None = None
+    if spread_mode == "ASSUMED_OHLC" and spread_bounds is not None:
+        dynamic_assumed_spread = _build_dynamic_assumed_spread_series(
+            candles_m5=candles_m5,
+            atr_values=atr_values,
+            min_spread=spread_bounds[0],
+            max_spread=spread_bounds[1],
+        )
+        if dynamic_assumed_spread:
+            assumed_spread_used = float(sum(dynamic_assumed_spread) / len(dynamic_assumed_spread))
 
     by_time_m15 = {c.timestamp: i for i, c in enumerate(candles_m15)}
     by_time_h1 = {c.timestamp: i for i, c in enumerate(candles_h1)}
@@ -1770,14 +2843,21 @@ def run_backtest(
     pending: _PendingOrder | None = None
     open_pos: _OpenPosition | None = None
     time_in_market_bars = 0
+    count_be_moves = 0
+    count_tp1_hits = 0
 
     daily_trades: dict[str, int] = {}
     daily_pnl: dict[str, float] = {}
+    swap_hour, swap_minute = _parse_swap_time_utc(config.backtest_tuning.overnight_swap_time_utc)
+    long_swap_pct = float(config.backtest_tuning.overnight_swap_long_pct)
+    short_swap_pct = float(config.backtest_tuning.overnight_swap_short_pct)
 
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
         if candle.bid is not None and candle.ask is not None:
             return max(0.0, candle.ask - candle.bid)
+        if dynamic_assumed_spread is not None and index < len(dynamic_assumed_spread):
+            return max(0.0, float(dynamic_assumed_spread[index]))
         return max(0.0, assumed_spread)
 
     def _slippage_for(index: int) -> float:
@@ -1787,6 +2867,25 @@ def run_backtest(
             if atr_val is not None:
                 atr_term = max(0.0, slippage_atr_multiplier * atr_val)
         return max(0.0, slippage_points) + atr_term
+
+    def _cap_size_by_margin(entry_price: float, requested_size: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        margin_requirement_pct = float(config.backtest_tuning.broker_margin_requirement_pct)
+        leverage = float(config.backtest_tuning.broker_leverage)
+        caps: list[float] = []
+        if margin_requirement_pct > 0:
+            caps.append((equity / (margin_requirement_pct / 100.0)) / entry_price)
+        if leverage > 0:
+            caps.append((equity * leverage) / entry_price)
+        if not caps:
+            return max(0.0, requested_size)
+        max_size = max(0.0, min(caps))
+        step = asset.size_step if asset.size_step > 0 else 0.01
+        max_size = math.floor(max_size / step) * step
+        if max_size < asset.min_size:
+            return 0.0
+        return min(max(0.0, requested_size), max_size)
 
     start_idx = max(config.indicators.ema_period_h1 + 10, 250)
     for i in range(start_idx, len(candles_m5)):
@@ -1808,6 +2907,7 @@ def run_backtest(
                 else:
                     base_entry = candle.bid if candle.bid is not None else (candle.close - (_spread_for(i) * 0.5))
                     entry_fill = base_entry - slippage
+                initial_risk = abs(pending.entry - pending.stop)
                 open_pos = _OpenPosition(
                     side=pending.side,
                     entry=entry_fill,
@@ -1815,21 +2915,36 @@ def run_backtest(
                     tp=pending.tp,
                     size=pending.size,
                     opened_at=candle.timestamp,
+                    initial_stop=pending.stop,
+                    initial_risk=initial_risk,
+                    max_loss_r_cap=float(config.backtest_tuning.max_loss_r_cap),
+                    tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+                    tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+                    be_offset_r=float(config.backtest_tuning.be_offset_r),
+                    be_delay_bars_after_tp1=int(config.backtest_tuning.be_delay_bars_after_tp1),
+                    trailing_after_tp1=bool(config.backtest_tuning.trailing_after_tp1),
+                    trailing_window_bars=int(config.backtest_tuning.trailing_swing_window_bars),
+                    trailing_buffer_r=float(config.backtest_tuning.trailing_buffer_r),
+                    next_swap_ts=_next_rollover_timestamp(
+                        candle.timestamp,
+                        hour=swap_hour,
+                        minute=swap_minute,
+                    ),
+                    reason_open=pending.reason_open,
+                    score=pending.score,
                 )
                 pending = None
 
         if open_pos is not None:
             time_in_market_bars += 1
-            risk_dist = abs(open_pos.entry - open_pos.stop)
-            if risk_dist > 0 and not open_pos.be_moved:
-                one_r = open_pos.entry + risk_dist if open_pos.side == "LONG" else open_pos.entry - risk_dist
-                reached_1r = candle.high >= one_r if open_pos.side == "LONG" else candle.low <= one_r
-                if reached_1r:
-                    half = open_pos.size * 0.5
-                    open_pos.be_moved = True
-                    open_pos.stop = open_pos.entry
-                    open_pos.size = open_pos.size - half
-                    open_pos.realized_partial += half * risk_dist
+            _apply_overnight_swap_if_due(
+                position=open_pos,
+                candle_ts=candle.timestamp,
+                swap_hour=swap_hour,
+                swap_minute=swap_minute,
+                long_swap_pct=long_swap_pct,
+                short_swap_pct=short_swap_pct,
+            )
 
             should_close, exit_price, reason = _calc_exit(
                 open_pos,
@@ -1857,8 +2972,12 @@ def run_backtest(
                         exit_price=exit_price,
                         size=open_pos.size,
                         pnl=total_pnl,
+                        fees=open_pos.swap_total,
                         r_multiple=r_mult,
                         reason=reason,
+                        score=open_pos.score,
+                        reason_open=open_pos.reason_open,
+                        reason_close=reason,
                     )
                 )
                 open_pos = None
@@ -1895,26 +3014,82 @@ def run_backtest(
         )
         if decision.signal is None:
             continue
+        signal = decision.signal
+        risk_dist = abs(float(signal.entry_price) - float(signal.stop_price))
+        if risk_dist <= 0:
+            continue
+
+        expected_rr_lookback = max(10, int(config.backtest_tuning.expected_rr_lookback_bars))
+        structure_target = _estimate_structure_target(
+            side=signal.side,
+            entry=float(signal.entry_price),
+            candles=candles_m5[max(0, i - expected_rr_lookback + 1) : i + 1],
+            lookback_bars=expected_rr_lookback,
+        )
+        requested_tp = float(signal.take_profit)
+        if structure_target is None:
+            rr_target = requested_tp
+        elif signal.side == "LONG":
+            rr_target = max(requested_tp, float(structure_target))
+        else:
+            rr_target = min(requested_tp, float(structure_target))
+        expected_rr_value = _expected_rr(
+            side=signal.side,
+            entry=float(signal.entry_price),
+            stop=float(signal.stop_price),
+            target=rr_target,
+        )
+        try:
+            expected_rr_value = max(expected_rr_value, float(signal.rr))
+        except (TypeError, ValueError):
+            pass
+        if expected_rr_value < float(config.backtest_tuning.expected_rr_min):
+            continue
+        is_a_plus = bool(getattr(signal, "a_plus", False))
+        if is_a_plus:
+            target_total_r = float(config.backtest_tuning.tp_target_a_plus_r)
+        else:
+            target_total_r = float(config.backtest_tuning.tp_target_min_r)
+        target_min_r = _tp2_r_for_target_total_r(
+            target_total_r=target_total_r,
+            tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+            tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+            mode=str(config.backtest_tuning.tp_profile_mode),
+        )
+        target_max_r = target_min_r
+        tp_source = rr_target
+        normalized_tp, _ = _normalize_tp_by_r(
+            side=signal.side,
+            entry=float(signal.entry_price),
+            stop=float(signal.stop_price),
+            requested_tp=tp_source,
+            min_r=target_min_r,
+            max_r=target_max_r,
+        )
+        signal.take_profit = normalized_tp
 
         size = position_size_from_risk(
             equity=config.risk.equity,
             risk_per_trade=config.risk.risk_per_trade,
-            entry_price=decision.signal.entry_price,
-            stop_price=decision.signal.stop_price,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_price,
             min_size=asset.min_size,
             size_step=asset.size_step,
         )
+        size = _cap_size_by_margin(float(signal.entry_price), float(size))
         if size <= 0:
             continue
 
         pending = _PendingOrder(
-            side=decision.signal.side,
-            entry=decision.signal.entry_price,
-            stop=decision.signal.stop_price,
-            tp=decision.signal.take_profit,
+            side=signal.side,
+            entry=signal.entry_price,
+            stop=signal.stop_price,
+            tp=signal.take_profit,
             size=size,
             expiry_index=i + config.execution.limit_ttl_bars,
             created_at=t,
+            reason_open=",".join(decision.reason_codes) if decision.reason_codes else "SIGNAL",
+            score=None,
         )
         daily_trades[day_key] += 1
 
@@ -1925,6 +3100,9 @@ def run_backtest(
     expectancy = (total_pnl / trade_count) if trade_count else 0.0
     avg_r = (sum(trade.r_multiple for trade in trades) / trade_count) if trade_count else 0.0
     win_rate = (wins / trade_count) if trade_count else 0.0
+    avg_win, avg_loss, payoff_ratio, profit_factor = _trade_quality_metrics(trades)
+    avg_win_r, avg_loss_r, payoff_r = _trade_r_quality_metrics(trades)
+    exit_reason_distribution = _exit_reason_distribution(trades)
 
     return BacktestReport(
         epic=asset.epic,
@@ -1939,6 +3117,18 @@ def run_backtest(
         time_in_market_bars=time_in_market_bars,
         equity_end=config.risk.equity + total_pnl,
         trade_log=trades,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        payoff_ratio=payoff_ratio,
+        profit_factor=profit_factor,
+        avg_win_r=avg_win_r,
+        avg_loss_r=avg_loss_r,
+        payoff_r=payoff_r,
+        count_be_moves=count_be_moves,
+        count_tp1_hits=count_tp1_hits,
+        exit_reason_distribution=exit_reason_distribution,
+        spread_mode=spread_mode,
+        assumed_spread_used=float(assumed_spread_used),
     )
 
 
@@ -2020,31 +3210,10 @@ def run_walk_forward(
     if not reports:
         raise ValueError("No valid walk-forward splits produced")
 
-    total_trades = sum(report.trades for report in reports)
-    total_wins = sum(report.wins for report in reports)
-    total_losses = sum(report.losses for report in reports)
-    total_pnl = sum(report.total_pnl for report in reports)
-    total_time_in_market = sum(report.time_in_market_bars for report in reports)
-    avg_r = (
-        sum(report.avg_r * report.trades for report in reports) / total_trades
-        if total_trades
-        else 0.0
-    )
-    win_rate = (total_wins / total_trades) if total_trades else 0.0
-    expectancy = (total_pnl / total_trades) if total_trades else 0.0
-    aggregate = BacktestReport(
-        epic=asset.epic,
-        trades=total_trades,
-        wins=total_wins,
-        losses=total_losses,
-        win_rate=win_rate,
-        total_pnl=total_pnl,
-        expectancy=expectancy,
-        avg_r=avg_r,
-        max_drawdown=max((report.max_drawdown for report in reports), default=0.0),
-        time_in_market_bars=total_time_in_market,
-        equity_end=config.risk.equity + total_pnl,
-        trade_log=[],
+    aggregate = aggregate_backtest_reports(
+        config=config,
+        asset=asset,
+        reports=reports,
     )
     return WalkForwardReport(epic=asset.epic, splits=reports, aggregate=aggregate)
 
@@ -2095,61 +3264,9 @@ def run_walk_forward_multi_strategy(
     if not reports:
         raise ValueError("No valid walk-forward splits produced")
 
-    total_trades = sum(report.trades for report in reports)
-    total_wins = sum(report.wins for report in reports)
-    total_losses = sum(report.losses for report in reports)
-    total_pnl = sum(report.total_pnl for report in reports)
-    total_time_in_market = sum(report.time_in_market_bars for report in reports)
-    total_candidates = sum(report.signal_candidates for report in reports)
-    decision_counts: Counter[str] = Counter()
-    blockers: Counter[str] = Counter()
-    execution_fail: Counter[str] = Counter()
-    timeout_resets: Counter[str] = Counter()
-    score_bins: Counter[str] = Counter()
-    spread_adjustments: Counter[str] = Counter()
-    spread_modes: set[str] = set()
-    assumed_spread_values: list[float] = []
-    score_values: list[float] = []
-    for report in reports:
-        decision_counts.update(report.decision_counts)
-        blockers.update(report.top_blockers)
-        execution_fail.update(report.execution_fail_breakdown)
-        timeout_resets.update(report.wait_timeout_resets)
-        score_bins.update(report.score_bins)
-        spread_adjustments.update(report.spread_gate_adjustments)
-        spread_modes.add(report.spread_mode)
-        assumed_spread_values.append(float(report.assumed_spread_used))
-        if report.avg_score is not None:
-            score_values.append(float(report.avg_score))
-    avg_r = (
-        sum(report.avg_r * report.trades for report in reports) / total_trades
-        if total_trades
-        else 0.0
-    )
-    win_rate = (total_wins / total_trades) if total_trades else 0.0
-    expectancy = (total_pnl / total_trades) if total_trades else 0.0
-    aggregate = BacktestReport(
-        epic=asset.epic,
-        trades=total_trades,
-        wins=total_wins,
-        losses=total_losses,
-        win_rate=win_rate,
-        total_pnl=total_pnl,
-        expectancy=expectancy,
-        avg_r=avg_r,
-        max_drawdown=max((report.max_drawdown for report in reports), default=0.0),
-        time_in_market_bars=total_time_in_market,
-        equity_end=config.risk.equity + total_pnl,
-        trade_log=[],
-        top_blockers=dict(blockers.most_common(10)),
-        decision_counts=dict(decision_counts),
-        signal_candidates=total_candidates,
-        wait_timeout_resets=dict(timeout_resets),
-        execution_fail_breakdown=dict(execution_fail),
-        avg_score=round(sum(score_values) / len(score_values), 4) if score_values else None,
-        score_bins=dict(score_bins),
-        spread_mode=next(iter(spread_modes)) if len(spread_modes) == 1 else "MIXED",
-        assumed_spread_used=round(sum(assumed_spread_values) / len(assumed_spread_values), 6) if assumed_spread_values else 0.0,
-        spread_gate_adjustments=dict(spread_adjustments),
+    aggregate = aggregate_backtest_reports(
+        config=config,
+        asset=asset,
+        reports=reports,
     )
     return WalkForwardReport(epic=asset.epic, splits=reports, aggregate=aggregate)

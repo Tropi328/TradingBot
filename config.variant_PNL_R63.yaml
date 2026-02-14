@@ -1,0 +1,506 @@
+﻿timezone: Europe/Warsaw
+instrument:
+  epic: XAUUSD
+  currency: USD
+  point_size: 0.01
+  minimal_tick_buffer: 0.05
+  min_size: 0.01
+  size_step: 0.01
+assets:
+- epic: GOLD
+  currency: USD
+  point_size: 0.01
+  minimal_tick_buffer: 0.05
+  min_size: 0.01
+  size_step: 0.01
+  trade_enabled: true
+- epic: BTCUSD
+  currency: USD
+  point_size: 0.1
+  minimal_tick_buffer: 1.0
+  min_size: 0.01
+  size_step: 0.01
+  trade_enabled: true
+- epic: EURUSD
+  currency: USD
+  point_size: 0.0001
+  minimal_tick_buffer: 0.0002
+  min_size: 0.01
+  size_step: 0.01
+  trade_enabled: true
+- epic: US100
+  currency: USD
+  point_size: 0.1
+  minimal_tick_buffer: 0.5
+  min_size: 0.1
+  size_step: 0.1
+  trade_enabled: true
+- epic: US500
+  currency: USD
+  point_size: 0.1
+  minimal_tick_buffer: 0.5
+  min_size: 0.1
+  size_step: 0.1
+  trade_enabled: true
+timeframes:
+  h1: H1
+  m15: M15
+  m5: M5
+indicators:
+  ema_period_h1: 200
+  atr_period: 14
+swings:
+  fractal_left: 2
+  fractal_right: 2
+sweep:
+  lookback_min_hours: 2
+  lookback_max_hours: 8
+  threshold_atr_multiplier: 0.15
+displacement:
+  base_multiplier: 1.3
+  a_plus_multiplier: 1.6
+execution:
+  limit_ttl_bars: 6
+  loop_seconds: 45
+  heartbeat_seconds: 300
+  max_data_stale_seconds: 900
+  quote_refresh_seconds_trade: 30
+  quote_refresh_seconds_observe: 60
+  candle_close_grace_seconds: 3
+  candle_retry_seconds: 15
+  sync_pending_seconds: 30
+  sync_positions_seconds: 30
+  history_bars:
+    h1: 600
+    m15: 500
+    m5: 500
+spread_filter:
+  window: 100
+  max_multiple_of_median: 2.0
+news_gate:
+  block_minutes: 60
+risk:
+  equity: 10000
+  risk_per_trade: 0.5
+  max_trades_per_day: 20
+  daily_stop_pct: 1.0
+  max_positions: 12
+  global_max_positions: 24
+  max_total_risk_pct: 2.0
+  cooldown_loss_streak: 2
+  cooldown_minutes: 60
+  correlation_groups:
+  - name: US_INDICES
+    epics:
+    - US100
+    - US500
+    max_open_positions: 1
+capital:
+  demo_base_url: https://demo-api-capital.backend-capital.com/api/v1
+  rate_limit_rps: 2.0
+  rate_limit_burst: 5
+  request_max_attempts: 6
+  backoff_base_seconds: 0.5
+  backoff_max_seconds: 20.0
+  reconnect_short_retries: 2
+  session_refresh_min_interval_seconds: 5
+calendar:
+  provider: dummy
+  dummy_file: news_data/events.json
+  http_timeout_seconds: 10
+  http_cache_ttl_seconds: 300
+watchlist:
+  epics:
+  - BTCUSD
+  - EURUSD
+  log_quotes: true
+monitoring:
+  dashboard_path: runtime_dashboard.json
+  dashboard_interval_seconds: 30
+  alerts_enabled: true
+  log_decision_reasons: true
+strategy_runtime:
+  allow_neutral_bias: false
+  neutral_bias_risk_multiplier: 0.5
+decision_policy:
+  trade_score_threshold: 58
+  small_score_min: 53
+  small_score_max: 57
+  trade_risk_multiplier: 1.0
+  small_risk_multiplier_default: 1.0
+backtest_tuning:
+  wait_reaction_timeout_bars: 6
+  wait_mitigation_timeout_bars: 10
+  wait_hard_block_bars: 0
+  reaction_timeout_force_enable: true
+  wait_timeout_soft_penalty: 0.8
+  wait_timeout_small_risk_multiplier: 0.4
+  wait_timeout_soft_grace_bars: 3
+  max_loss_r_cap: 0.001
+  tp1_trigger_r: 1.2
+  tp1_fraction: 0.2
+  be_offset_r: 0.05
+  be_delay_bars_after_tp1: 2
+  tp_target_min_r: 1.8
+  tp_target_max_r: 1.8
+  tp_target_a_plus_r: 2.4
+  tp_profile_mode: strict_tp_price
+  trailing_after_tp1: true
+  trailing_swing_window_bars: 10
+  trailing_buffer_r: 0.11
+  expected_rr_min: 1.6
+  expected_rr_lookback_bars: 120
+  segment_soft_gap_minutes: 120
+  segment_hard_gap_minutes: 600
+  penalty_orb_no_retest: -1.0
+  penalty_orb_confirm_low: -0.5
+  penalty_scalp_no_displacement: -2.0
+  penalty_scalp_no_mss: -1.5
+  penalty_scalp_no_fvg: -1.0
+  ohlc_only_spread_soft_penalty: 0.3
+  thresholds_v2_trade: 57.0
+  thresholds_v2_small_min: 52.0
+  thresholds_v2_small_max: 56.0
+  dynamic_spread_ratio_frac: 0.9
+  dynamic_atr_buffer_mult: 1.1
+  dynamic_spread_score_penalty: 0.25
+  dynamic_atr_score_penalty: 0.5
+  dynamic_assumed_spread_enabled: true
+  dynamic_assumed_spread_min_by_symbol:
+    XAUUSD: 0.5
+    GOLD: 0.5
+  dynamic_assumed_spread_max_by_symbol:
+    XAUUSD: 0.8
+    GOLD: 0.8
+  assumed_spread_by_symbol:
+    XAUUSD: 0.65
+    GOLD: 0.65
+  broker_leverage: 20.0
+  broker_margin_requirement_pct: 5.0
+  overnight_swap_time_utc: '23:00'
+  overnight_swap_long_pct: -0.016
+  overnight_swap_short_pct: 0.0076
+orderflow:
+  default_mode: LITE
+  full_symbols:
+  - BTCUSD
+  default_window: 64
+  trigger_bonus_max: 10.0
+  execution_bonus_max: 5.0
+  divergence_penalty_min: 6.0
+  divergence_penalty_max: 10.0
+  small_soft_gate_confidence: 0.75
+  small_soft_gate_chop: 0.75
+strategy_router:
+  symbols:
+  - symbol: GOLD
+    strategy: TREND_PULLBACK_M15
+    params:
+      trend_strength_min: 0.18
+      trigger_displacement_atr: 0.95
+      min_confirm: 1
+      min_confirm_trade: 3
+      min_confirm_small: 2
+      a_plus_trend_strength_min: 0.5
+      a_plus_displacement_atr: 1.45
+      a_plus_spread_ratio_max: 0.12
+      quality_gates:
+        spread_ratio_max: 0.15
+        min_confirm: 1
+        min_confirm_trade: 3
+        min_confirm_small: 2
+        min_atr_m5: 0.16
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.4
+      max_trades_per_day: 8
+    priority: 78
+    cooldown_seconds: 900
+  - symbol: GOLD
+    strategy: ORB_H4_RETEST
+    params:
+      max_retest_minutes: 120
+      retest_tolerance_atr: 0.22
+      min_displacement_atr: 0.85
+      min_confirm: 1
+      min_confirm_trade: 3
+      min_confirm_small: 2
+      a_plus_displacement_atr: 1.35
+      a_plus_breakout_quality_min: 20.0
+      a_plus_spread_ratio_max: 0.12
+      quality_gates:
+        spread_ratio_max: 0.15
+        min_confirm: 1
+        min_confirm_trade: 3
+        min_confirm_small: 2
+        min_atr_m5: 0.16
+      soft_penalties:
+        ORB_NO_RETEST: -3.0
+        ORB_CONFIRMATIONS_LOW: -2.0
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.35
+      max_trades_per_day: 4
+    priority: 72
+    cooldown_seconds: 1200
+  - symbol: XAUUSD
+    strategy: TREND_PULLBACK_M15
+    params:
+      trend_strength_min: 0.18
+      trigger_displacement_atr: 0.95
+      min_confirm: 1
+      min_confirm_trade: 3
+      min_confirm_small: 2
+      a_plus_trend_strength_min: 0.5
+      a_plus_displacement_atr: 1.45
+      a_plus_spread_ratio_max: 0.12
+      quality_gates:
+        spread_ratio_max: 0.15
+        min_confirm: 1
+        min_confirm_trade: 3
+        min_confirm_small: 2
+        min_atr_m5: 0.16
+      soft_penalties:
+        TREND_CONFIRMATIONS_LOW: -3.0
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 1.0
+      max_trades_per_day: 16
+    priority: 78
+    cooldown_seconds: 900
+  - symbol: XAUUSD
+    strategy: ORB_H4_RETEST
+    params:
+      max_retest_minutes: 120
+      retest_tolerance_atr: 0.22
+      min_displacement_atr: 0.85
+      min_confirm: 1
+      min_confirm_trade: 3
+      min_confirm_small: 2
+      a_plus_displacement_atr: 1.35
+      a_plus_breakout_quality_min: 20.0
+      a_plus_spread_ratio_max: 0.12
+      quality_gates:
+        spread_ratio_max: 0.15
+        min_confirm: 1
+        min_confirm_trade: 3
+        min_confirm_small: 2
+        min_atr_m5: 0.16
+      soft_penalties:
+        ORB_NO_RETEST: -3.0
+        ORB_CONFIRMATIONS_LOW: -2.0
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 1.0
+      max_trades_per_day: 10
+    priority: 72
+    cooldown_seconds: 1200
+  - symbol: BTCUSD
+    strategy: SCALP_ICT_PA
+    params:
+      orderflow:
+        mode: FULL
+        window: 96
+      bias_tf: M15
+      bos_tf: M15
+      h1_bos_mode: SCORE
+      h1_no_bos_penalty: 10
+      allow_neutral_bias: true
+      neutral_bias_trade_mode: SMALL
+      neutral_bias_risk_multiplier: 0.4
+      neutral_bias_penalty: 5
+      pd_filter_mode: SCORE
+      pd_fail_penalty: 5
+      candidate_relaxed: true
+      sweep_lookback_min_hours: 1
+      sweep_lookback_max_hours: 8
+      sweep_threshold_multiplier: 0.08
+      displacement_multiplier: 1.0
+      fvg_min_atr: 0.015
+      candidate_ttl_minutes: 75
+      candidate_min_interval_minutes: 20
+      relaxed_tick_buffer_multiplier: 0.35
+      miss_round_minutes: 5
+      quality_gates:
+        spread_ratio_max: 0.18
+        min_confirm: 2
+        min_atr_m5: 8.0
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.4
+      max_trades_per_day: 4
+    priority: 92
+    cooldown_seconds: 1500
+  - symbol: BTCUSD
+    strategy: TREND_PULLBACK_M15
+    params:
+      trend_strength_min: 0.18
+      trigger_displacement_atr: 0.9
+      min_confirm: 2
+      quality_gates:
+        spread_ratio_max: 0.18
+        min_confirm: 2
+        min_atr_m5: 8.0
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.4
+      max_trades_per_day: 3
+    priority: 80
+    cooldown_seconds: 1800
+  - symbol: EURUSD
+    strategy: SCALP_ICT_PA
+    params:
+      quality_gates:
+        spread_ratio_max: 0.1
+        min_confirm: 2
+        min_atr_m5: 8.0e-05
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.45
+      max_trades_per_day: 3
+    priority: 88
+    cooldown_seconds: 1800
+  - symbol: EURUSD
+    strategy: TREND_PULLBACK_M15
+    params:
+      trend_strength_min: 0.22
+      trigger_displacement_atr: 1.0
+      min_confirm: 2
+      quality_gates:
+        spread_ratio_max: 0.1
+        min_confirm: 2
+        min_atr_m5: 8.0e-05
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.45
+      max_trades_per_day: 3
+    priority: 76
+    cooldown_seconds: 2100
+  - symbol: EURUSD
+    strategy: ORB_H4_RETEST
+    params:
+      min_displacement_atr: 0.9
+      min_confirm: 2
+      quality_gates:
+        spread_ratio_max: 0.1
+        min_confirm: 2
+        min_atr_m5: 8.0e-05
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.4
+      max_trades_per_day: 1
+    priority: 70
+    cooldown_seconds: 3600
+  - symbol: US100
+    strategy: INDEX_EXISTING
+    params:
+      schedule:
+        enabled: true
+        timezone: Europe/Warsaw
+        weekdays:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        windows:
+        - 08:00-22:00
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.45
+      max_trades_per_day: 3
+    priority: 98
+    cooldown_seconds: 2400
+  - symbol: US100
+    strategy: ORB_H4_RETEST
+    params:
+      min_displacement_atr: 1.0
+      min_confirm: 2
+      schedule:
+        enabled: true
+        timezone: Europe/Warsaw
+        weekdays:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        windows:
+        - 08:00-22:00
+      quality_gates:
+        spread_ratio_max: 0.2
+        min_confirm: 2
+        min_atr_m5: 4.0
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.4
+      max_trades_per_day: 1
+    priority: 74
+    cooldown_seconds: 3600
+  - symbol: US500
+    strategy: INDEX_EXISTING
+    params:
+      schedule:
+        enabled: true
+        timezone: Europe/Warsaw
+        weekdays:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        windows:
+        - 08:00-22:00
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.45
+      max_trades_per_day: 3
+    priority: 97
+    cooldown_seconds: 2400
+  - symbol: US500
+    strategy: ORB_H4_RETEST
+    params:
+      min_displacement_atr: 1.0
+      min_confirm: 2
+      schedule:
+        enabled: true
+        timezone: Europe/Warsaw
+        weekdays:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        windows:
+        - 08:00-22:00
+      quality_gates:
+        spread_ratio_max: 0.2
+        min_confirm: 2
+        min_atr_m5: 2.5
+    risk:
+      trade_risk_multiplier: 1.0
+      small_risk_multiplier: 0.4
+      max_trades_per_day: 1
+    priority: 73
+    cooldown_seconds: 3600
+scalp:
+  bias_timeframe: M15
+  trigger_timeframe: M5
+  candidate_ttl_minutes: 60
+  trade_score_threshold: 65
+  small_score_min: 60
+  small_score_max: 64
+  small_risk_multiplier: 0.45
+  miss_window_minutes: 60
+  miss_move_atr: 1.0
+  be_after_r: 1.0
+  time_stop_minutes: 120
+portfolio:
+  max_open_positions_total: 12
+  max_per_symbol: 2
+  daily_risk_r: 2.0
+  default_cooldown_seconds: 300
+  max_entries_per_cycle: 2
+
+
+

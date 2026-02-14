@@ -117,8 +117,10 @@ class RiskConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_risk(self) -> "RiskConfig":
-        if self.risk_per_trade > 0.005:
-            raise ValueError("risk_per_trade cannot exceed 0.005 (0.5%)")
+        if self.risk_per_trade <= 0:
+            raise ValueError("risk_per_trade must be > 0")
+        if self.risk_per_trade > 1.0:
+            raise ValueError("risk_per_trade cannot exceed 1.0 (100.0%)")
         if self.max_total_risk_pct <= 0:
             raise ValueError("max_total_risk_pct must be > 0")
         if self.global_max_positions <= 0:
@@ -282,9 +284,29 @@ class DecisionPolicyConfig(BaseModel):
 
 
 class BacktestTuningConfig(BaseModel):
-    wait_reaction_timeout_bars: int = 15
-    wait_mitigation_timeout_bars: int = 30
+    wait_reaction_timeout_bars: int = 8
+    wait_mitigation_timeout_bars: int = 12
+    wait_hard_block_bars: int = 2
     reaction_timeout_force_enable: bool = True
+    wait_timeout_soft_penalty: float = 4.0
+    wait_timeout_small_risk_multiplier: float = 0.4
+    wait_timeout_soft_grace_bars: int = 2
+    max_loss_r_cap: float = 1.0
+    tp1_trigger_r: float = 0.7
+    tp1_fraction: float = 0.35
+    be_offset_r: float = 0.05
+    be_delay_bars_after_tp1: int = 2
+    tp_target_min_r: float = 2.0
+    tp_target_max_r: float = 2.0
+    tp_target_a_plus_r: float = 3.0
+    tp_profile_mode: str = "strict_tp_price"
+    trailing_after_tp1: bool = True
+    trailing_swing_window_bars: int = 8
+    trailing_buffer_r: float = 0.05
+    expected_rr_min: float = 1.15
+    expected_rr_lookback_bars: int = 120
+    segment_soft_gap_minutes: int = 120
+    segment_hard_gap_minutes: int = 600
     penalty_orb_no_retest: float = -4.0
     penalty_orb_confirm_low: float = -3.0
     penalty_scalp_no_displacement: float = -4.0
@@ -298,7 +320,15 @@ class BacktestTuningConfig(BaseModel):
     dynamic_atr_buffer_mult: float = 1.1
     dynamic_spread_score_penalty: float = 2.0
     dynamic_atr_score_penalty: float = 1.0
+    dynamic_assumed_spread_enabled: bool = False
+    dynamic_assumed_spread_min_by_symbol: dict[str, float] = Field(default_factory=dict)
+    dynamic_assumed_spread_max_by_symbol: dict[str, float] = Field(default_factory=dict)
     assumed_spread_by_symbol: dict[str, float] = Field(default_factory=lambda: {"XAUUSD": 0.2})
+    broker_leverage: float = 20.0
+    broker_margin_requirement_pct: float = 5.0
+    overnight_swap_time_utc: str = "23:00"
+    overnight_swap_long_pct: float = -0.016
+    overnight_swap_short_pct: float = 0.0076
 
     @model_validator(mode="after")
     def validate_values(self) -> "BacktestTuningConfig":
@@ -306,6 +336,48 @@ class BacktestTuningConfig(BaseModel):
             raise ValueError("wait_reaction_timeout_bars must be > 0")
         if self.wait_mitigation_timeout_bars <= 0:
             raise ValueError("wait_mitigation_timeout_bars must be > 0")
+        if self.wait_hard_block_bars < 0:
+            raise ValueError("wait_hard_block_bars must be >= 0")
+        if self.wait_hard_block_bars >= self.wait_mitigation_timeout_bars:
+            raise ValueError("wait_hard_block_bars must be < wait_mitigation_timeout_bars")
+        if self.wait_timeout_soft_penalty < 0:
+            raise ValueError("wait_timeout_soft_penalty must be >= 0")
+        if not (0 < self.wait_timeout_small_risk_multiplier <= 1.0):
+            raise ValueError("wait_timeout_small_risk_multiplier must be in (0,1]")
+        if self.wait_timeout_soft_grace_bars < 0:
+            raise ValueError("wait_timeout_soft_grace_bars must be >= 0")
+        if self.max_loss_r_cap <= 0:
+            raise ValueError("max_loss_r_cap must be > 0")
+        if self.tp1_trigger_r <= 0:
+            raise ValueError("tp1_trigger_r must be > 0")
+        if not (0 < self.tp1_fraction < 1):
+            raise ValueError("tp1_fraction must be in (0,1)")
+        if self.be_offset_r < 0:
+            raise ValueError("be_offset_r must be >= 0")
+        if self.be_delay_bars_after_tp1 < 0:
+            raise ValueError("be_delay_bars_after_tp1 must be >= 0")
+        if self.tp_target_min_r <= 0 or self.tp_target_max_r <= 0:
+            raise ValueError("tp_target_min_r and tp_target_max_r must be > 0")
+        if self.tp_target_min_r > self.tp_target_max_r:
+            raise ValueError("tp_target_min_r must be <= tp_target_max_r")
+        if self.tp_target_a_plus_r <= 0:
+            raise ValueError("tp_target_a_plus_r must be > 0")
+        mode = self.tp_profile_mode.strip().lower()
+        if mode not in {"strict_tp_price", "strict_total_rr"}:
+            raise ValueError("tp_profile_mode must be strict_tp_price or strict_total_rr")
+        self.tp_profile_mode = mode
+        if self.trailing_swing_window_bars < 2:
+            raise ValueError("trailing_swing_window_bars must be >= 2")
+        if self.trailing_buffer_r < 0:
+            raise ValueError("trailing_buffer_r must be >= 0")
+        if self.expected_rr_min <= 0:
+            raise ValueError("expected_rr_min must be > 0")
+        if self.expected_rr_lookback_bars <= 0:
+            raise ValueError("expected_rr_lookback_bars must be > 0")
+        if self.segment_soft_gap_minutes <= 0:
+            raise ValueError("segment_soft_gap_minutes must be > 0")
+        if self.segment_hard_gap_minutes < self.segment_soft_gap_minutes:
+            raise ValueError("segment_hard_gap_minutes must be >= segment_soft_gap_minutes")
         if self.ohlc_only_spread_soft_penalty < 0:
             raise ValueError("ohlc_only_spread_soft_penalty must be >= 0")
         if not (0 <= self.thresholds_v2_small_min <= self.thresholds_v2_small_max <= 100):
@@ -316,6 +388,22 @@ class BacktestTuningConfig(BaseModel):
             raise ValueError("dynamic_spread_ratio_frac must be in [0,1]")
         if self.dynamic_atr_buffer_mult <= 0:
             raise ValueError("dynamic_atr_buffer_mult must be > 0")
+        if self.broker_leverage <= 0:
+            raise ValueError("broker_leverage must be > 0")
+        if not (0 < self.broker_margin_requirement_pct <= 100):
+            raise ValueError("broker_margin_requirement_pct must be in (0,100]")
+        time_raw = str(self.overnight_swap_time_utc).strip()
+        parts = time_raw.split(":")
+        if len(parts) != 2:
+            raise ValueError("overnight_swap_time_utc must use HH:MM format")
+        try:
+            hh = int(parts[0])
+            mm = int(parts[1])
+        except ValueError as exc:
+            raise ValueError("overnight_swap_time_utc must use HH:MM format") from exc
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError("overnight_swap_time_utc must be a valid UTC time")
+        self.overnight_swap_time_utc = f"{hh:02d}:{mm:02d}"
         normalized: dict[str, float] = {}
         for key, value in self.assumed_spread_by_symbol.items():
             symbol = str(key).strip().upper()
@@ -326,6 +414,30 @@ class BacktestTuningConfig(BaseModel):
                 raise ValueError("assumed_spread_by_symbol values must be >= 0")
             normalized[symbol] = spread
         self.assumed_spread_by_symbol = normalized
+        min_map: dict[str, float] = {}
+        for key, value in self.dynamic_assumed_spread_min_by_symbol.items():
+            symbol = str(key).strip().upper()
+            if not symbol:
+                continue
+            spread = float(value)
+            if spread < 0:
+                raise ValueError("dynamic_assumed_spread_min_by_symbol values must be >= 0")
+            min_map[symbol] = spread
+        max_map: dict[str, float] = {}
+        for key, value in self.dynamic_assumed_spread_max_by_symbol.items():
+            symbol = str(key).strip().upper()
+            if not symbol:
+                continue
+            spread = float(value)
+            if spread < 0:
+                raise ValueError("dynamic_assumed_spread_max_by_symbol values must be >= 0")
+            max_map[symbol] = spread
+        for symbol, min_val in min_map.items():
+            max_val = max_map.get(symbol)
+            if max_val is not None and max_val < min_val:
+                raise ValueError(f"dynamic_assumed_spread_max_by_symbol[{symbol}] must be >= min")
+        self.dynamic_assumed_spread_min_by_symbol = min_map
+        self.dynamic_assumed_spread_max_by_symbol = max_map
         return self
 
 

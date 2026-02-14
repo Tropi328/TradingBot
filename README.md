@@ -39,6 +39,29 @@ CSV must include columns: `timestamp,open,high,low,close` (M5 candles).
 - Auto loader + optional fetch:
   `python main.py --backtest --backtest-symbols XAUUSD,EURUSD,US100,US500,BTCUSD --backtest-start 2023-01-01 --backtest-end 2023-12-31 --backtest-autofetch`
 
+## Backtest reports
+Detailed report artifacts are generated automatically in backtest mode (unless disabled).
+
+- Enable/disable: `--report` / `--no-report`
+- Base output directory: `--report-dir reports/backtest`
+- Formats: `--report-formats json,csv,png,html`
+- Auto-open HTML after run: `--report-open`
+
+Each report run is saved in its own timestamped folder:
+`reports/backtest/{symbol}_{tf}_{start}_{end}_{variant}_{YYYYmmdd-HHMMSS}/`
+
+Artifacts:
+- `report.json` (full meta + metrics + extra)
+- `summary.json` (headline metrics)
+- `trades.csv`
+- `equity.csv`
+- `charts/equity_curve.png`
+- `charts/drawdown.png`
+- `charts/pnl_per_trade.png`
+- `charts/pnl_hist.png`
+- optional `charts/pnl_by_month.png`
+- optional `report.html`
+
 ## Key .env fields
 ```env
 CAPITAL_BASE_URL=https://demo-api-capital.backend-capital.com/api/v1
@@ -187,4 +210,3 @@ Current unit tests cover:
 ## Notes
 - Epic names differ by account. For Gold on many DEMO accounts use `GOLD` (not `XAUUSD`).
 - If API returns accountId errors, verify DEMO account is active and `CAPITAL_ACCOUNT_ID` matches that account.
-

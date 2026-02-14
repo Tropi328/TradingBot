@@ -30,6 +30,7 @@ LOGGER = logging.getLogger(__name__)
 class _MissProbe:
     probe_id: str
     miss_key: str
+    semantic_key: str
     symbol: str
     direction: str
     start_price: float
@@ -49,6 +50,7 @@ class _ScalpState:
     missed_hits: int = 0
     probes: list[_MissProbe] = field(default_factory=list)
     recent_probe_keys: set[str] = field(default_factory=set)
+    recent_probe_semantic_keys: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -73,6 +75,14 @@ class _SymbolProfile:
     candidate_min_interval_minutes: int
     relaxed_tick_buffer_multiplier: float
     miss_round_minutes: int
+    displacement_retest_fallback: bool
+    fallback_min_displacement_atr: float
+    fallback_lookback_bars: int
+    fallback_score_penalty: float
+    fallback_force_small: bool
+    fallback_small_risk_multiplier: float
+    fallback_min_displacement_ratio: float
+    fallback_max_trigger_bars: int
 
 
 class ScalpIctPriceActionStrategy(StrategyPlugin):
@@ -206,7 +216,74 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
                 ),
             ),
             miss_round_minutes=max(1, self._as_int(params.get("miss_round_minutes"), 5)),
+            displacement_retest_fallback=self._as_bool(
+                params.get("displacement_retest_fallback"),
+                False,
+            ),
+            fallback_min_displacement_atr=max(
+                0.1,
+                self._as_float(
+                    params.get("fallback_min_displacement_atr"),
+                    max(0.6, displacement_default * 0.9),
+                ),
+            ),
+            fallback_lookback_bars=max(
+                6,
+                self._as_int(params.get("fallback_lookback_bars"), 24),
+            ),
+            fallback_score_penalty=max(
+                0.0,
+                self._as_float(params.get("fallback_score_penalty"), 8.0),
+            ),
+            fallback_force_small=self._as_bool(
+                params.get("fallback_force_small"),
+                True,
+            ),
+            fallback_small_risk_multiplier=min(
+                1.0,
+                max(
+                    0.05,
+                    self._as_float(
+                        params.get("fallback_small_risk_multiplier"),
+                        min(self.config.scalp.small_risk_multiplier, 0.35),
+                    ),
+                ),
+            ),
+            fallback_min_displacement_ratio=max(
+                1.0,
+                self._as_float(params.get("fallback_min_displacement_ratio"), 1.2),
+            ),
+            fallback_max_trigger_bars=max(
+                1,
+                self._as_int(params.get("fallback_max_trigger_bars"), 10),
+            ),
         )
+
+    @staticmethod
+    def _fallback_anchor_index(
+        candles_m5: list,
+        *,
+        side: str,
+        atr_m5: float,
+        min_disp_atr: float,
+        lookback_bars: int,
+    ) -> int | None:
+        if len(candles_m5) < 6 or atr_m5 <= 0:
+            return None
+        end = len(candles_m5) - 2
+        start = max(1, end - max(6, lookback_bars) + 1)
+        threshold = max(1e-9, float(min_disp_atr) * float(atr_m5))
+        for idx in range(end, start - 1, -1):
+            candle = candles_m5[idx]
+            body = real_body(candle)
+            if body < threshold:
+                continue
+            if side == "LONG" and candle.close <= candle.open:
+                continue
+            if side == "SHORT" and candle.close >= candle.open:
+                continue
+            return idx
+        return None
 
     @staticmethod
     def _candles_for_tf(data: StrategyDataBundle, timeframe: str) -> list:
@@ -288,6 +365,7 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
     def preprocess(self, symbol: str, data: StrategyDataBundle) -> None:
         state = self._state(symbol)
         now = data.now
+        log_missed = not bool(data.extra.get("suppress_missed_opportunity_logs", False))
         while state.queue and state.queue[0].expires_at <= now:
             state.queue.popleft()
 
@@ -302,6 +380,7 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
 
         active: list[_MissProbe] = []
         active_keys: set[str] = set()
+        active_semantic_keys: set[str] = set()
         for probe in state.probes:
             if latest_close is not None and latest_high is not None and latest_low is not None:
                 hit = (
@@ -314,30 +393,34 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
                 if hit:
                     state.missed_hits += 1
                     state.missed_total += 1
+                    if log_missed:
+                        LOGGER.info(
+                            "MissedOpportunity symbol=%s probe=%s hit=1 direction=%s start=%.5f target=%.5f",
+                            probe.symbol,
+                            probe.probe_id,
+                            probe.direction,
+                            probe.start_price,
+                            probe.target_price,
+                        )
+                    continue
+            if now >= probe.expires_at:
+                state.missed_total += 1
+                if log_missed:
                     LOGGER.info(
-                        "MissedOpportunity symbol=%s probe=%s hit=1 direction=%s start=%.5f target=%.5f",
+                        "MissedOpportunity symbol=%s probe=%s hit=0 direction=%s start=%.5f target=%.5f",
                         probe.symbol,
                         probe.probe_id,
                         probe.direction,
                         probe.start_price,
                         probe.target_price,
                     )
-                    continue
-            if now >= probe.expires_at:
-                state.missed_total += 1
-                LOGGER.info(
-                    "MissedOpportunity symbol=%s probe=%s hit=0 direction=%s start=%.5f target=%.5f",
-                    probe.symbol,
-                    probe.probe_id,
-                    probe.direction,
-                    probe.start_price,
-                    probe.target_price,
-                )
                 continue
             active.append(probe)
             active_keys.add(probe.miss_key)
+            active_semantic_keys.add(probe.semantic_key)
         state.probes = active
         state.recent_probe_keys = active_keys
+        state.recent_probe_semantic_keys = active_semantic_keys
 
     def compute_bias(self, symbol: str, data: StrategyDataBundle) -> BiasState:
         state = self._state(symbol)
@@ -436,9 +519,61 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
                 fractal_right=self.config.swings.fractal_right,
             )
             if sweep is None:
-                side_diagnostics.append(
-                    f"{side}:NO_SWEEP(min_h={profile.sweep_min_hours},max_h={profile.sweep_max_hours},thr={profile.sweep_threshold_multiplier:.3f})"
+                if not profile.displacement_retest_fallback:
+                    side_diagnostics.append(
+                        f"{side}:NO_SWEEP(min_h={profile.sweep_min_hours},max_h={profile.sweep_max_hours},thr={profile.sweep_threshold_multiplier:.3f})"
+                    )
+                    continue
+
+                anchor_idx = self._fallback_anchor_index(
+                    m5,
+                    side=side,
+                    atr_m5=atr_m5,
+                    min_disp_atr=profile.fallback_min_displacement_atr,
+                    lookback_bars=profile.fallback_lookback_bars,
                 )
+                if anchor_idx is None:
+                    side_diagnostics.append(
+                        f"{side}:NO_SWEEP_NO_FALLBACK(anchor_disp_atr>={profile.fallback_min_displacement_atr:.2f},lookback={profile.fallback_lookback_bars})"
+                    )
+                    continue
+
+                anchor_candle = m5[anchor_idx]
+                anchor_ts = anchor_candle.timestamp.replace(second=0, microsecond=0).isoformat()
+                setup_id = f"{symbol}:{side}:FB:{anchor_ts}:{anchor_idx}"
+                if any(item.metadata.get("setup_id") == setup_id for item in state.queue):
+                    side_diagnostics.append(f"{side}:DUP_FALLBACK")
+                    continue
+
+                anchor_window = m5[max(0, anchor_idx - 2) : anchor_idx + 1]
+                if side == "LONG":
+                    level = min(float(c.low) for c in anchor_window)
+                else:
+                    level = max(float(c.high) for c in anchor_window)
+                candidate = SetupCandidate(
+                    candidate_id=f"SCALP-{symbol}-{uuid.uuid4().hex[:10]}",
+                    symbol=symbol,
+                    strategy_name=self.name,
+                    side=side,
+                    created_at=data.now,
+                    expires_at=data.now + timedelta(minutes=profile.candidate_ttl_minutes),
+                    source_timeframe=self.config.scalp.trigger_timeframe,
+                    setup_type="DISPLACEMENT_RETEST",
+                    origin_strategy=self.name,
+                    setup_id=setup_id,
+                    metadata={
+                        "setup_id": setup_id,
+                        "setup_origin": "DISPLACEMENT_RETEST",
+                        "fallback_anchor_index": anchor_idx,
+                        "sweep_level": level,
+                        "sweep_magnitude": real_body(anchor_candle),
+                        "sweep_time": anchor_candle.timestamp.isoformat(),
+                        "atr_m5": atr_m5,
+                    },
+                )
+                state.queue.append(candidate)
+                created_any = True
+                side_diagnostics.append(f"{side}:FALLBACK_OK(anchor={anchor_idx})")
                 continue
             sweep_ts = sweep.sweep_time.replace(second=0, microsecond=0).isoformat()
             setup_id = f"{symbol}:{side}:{sweep_ts}:{sweep.reference_swing_index}"
@@ -540,6 +675,8 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
                 snapshot={"symbol": symbol, "atr_m5": atr_m5},
                 metadata={"setup_state": "WAIT_REACTION"},
             )
+        setup_origin = str(candidate.metadata.get("setup_origin", candidate.setup_type)).upper()
+        is_fallback_setup = setup_origin == "DISPLACEMENT_RETEST"
 
         mss = detect_mss(
             m5,
@@ -557,6 +694,9 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             body = real_body(m5[mss.candle_index])
             displacement_ratio = body / max(displacement_threshold, 1e-9)
             displacement_ok = body > displacement_threshold
+
+        if is_fallback_setup and mss is not None and displacement_ratio < profile.fallback_min_displacement_ratio:
+            displacement_ok = False
 
         # Search from sweep origin instead of MSS-only window to avoid missing valid FVG
         # that forms between sweep and later MSS confirmation.
@@ -598,6 +738,9 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
         penalties: dict[str, float] = {}
         hard_reasons: list[str] = []
 
+        if is_fallback_setup:
+            penalties["SCALP_FALLBACK_SETUP"] = profile.fallback_score_penalty
+
         h1_bos_state = str(bias.metadata.get("h1_bos_state", "NONE")).upper()
         if profile.h1_bos_mode == "BLOCK" and h1_bos_state == "NONE":
             hard_reasons.append("H1_NO_BOS")
@@ -637,8 +780,19 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
 
         if not mss_ok:
             hard_reasons.append("SCALP_NO_MSS")
+        elif is_fallback_setup:
+            anchor_idx_raw = candidate.metadata.get("fallback_anchor_index")
+            try:
+                anchor_idx = int(anchor_idx_raw) if anchor_idx_raw is not None else None
+            except (TypeError, ValueError):
+                anchor_idx = None
+            if anchor_idx is not None and (mss.candle_index - anchor_idx) > profile.fallback_max_trigger_bars:
+                hard_reasons.append("SCALP_FALLBACK_TRIGGER_LATE")
         if not displacement_ok:
-            hard_reasons.append("SCALP_NO_DISPLACEMENT")
+            if is_fallback_setup and mss_ok:
+                hard_reasons.append("SCALP_FALLBACK_DISPLACEMENT_WEAK")
+            else:
+                hard_reasons.append("SCALP_NO_DISPLACEMENT")
         if not fvg_ok:
             hard_reasons.append("SCALP_NO_FVG")
         if data.news_blocked:
@@ -660,6 +814,15 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             risk_multiplier_override = profile.neutral_bias_risk_multiplier
         elif action == DecisionAction.SMALL:
             risk_multiplier_override = self.config.scalp.small_risk_multiplier
+
+        fallback_forced_small = False
+        if is_fallback_setup and action in {DecisionAction.TRADE, DecisionAction.SMALL} and profile.fallback_force_small:
+            fallback_forced_small = action == DecisionAction.TRADE
+            action = DecisionAction.SMALL
+            if risk_multiplier_override is None:
+                risk_multiplier_override = profile.fallback_small_risk_multiplier
+            else:
+                risk_multiplier_override = min(float(risk_multiplier_override), profile.fallback_small_risk_multiplier)
 
         reasons_blocking: list[str] = list(dict.fromkeys(hard_reasons))
         if action == DecisionAction.OBSERVE and not reasons_blocking:
@@ -705,6 +868,8 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             "trigger_confirmations": trigger_confirmations,
             "execution_penalty": 0.0 if spread_ok_soft else 2.0,
             "setup_state": setup_state,
+            "setup_origin": setup_origin,
+            "fallback_setup": is_fallback_setup,
             "sweep_index": sweep_idx,
             "fvg_search_start_index": fvg_start_index,
             "fvg_detected": fvg is not None,
@@ -715,6 +880,8 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             signal_meta["score_penalties"] = penalties
         if risk_multiplier_override is not None:
             signal_meta["risk_multiplier_override"] = risk_multiplier_override
+        if fallback_forced_small:
+            signal_meta["fallback_forced_small"] = True
         if bias.metadata.get("h1_pd_eq") is not None:
             signal_meta["h1_pd_eq"] = bias.metadata.get("h1_pd_eq")
             signal_meta["h1_pd_low"] = bias.metadata.get("h1_pd_low")
@@ -772,7 +939,11 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
 
         entry = float(fvg_mid)
         atr_value = float(atr_m5)
+        is_fallback_setup = str(evaluation.metadata.get("setup_origin", "")).upper() == "DISPLACEMENT_RETEST"
         rr = 3.0 if (evaluation.score_total or 0.0) >= 85.0 else 2.0
+        if is_fallback_setup:
+            # Fallback setup is quality-compromised by design: keep conservative target profile.
+            rr = 2.0
         if side == "LONG":
             stop = float(sweep_level) - (0.2 * atr_value)
             risk_distance = entry - stop
@@ -789,6 +960,8 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
         reason_codes = [self.name, f"SCORE_{int(evaluation.score_total or 0)}"]
         if evaluation.action == DecisionAction.SMALL:
             reason_codes.append("SCALP_SMALL")
+        if is_fallback_setup:
+            reason_codes.append("SCALP_FALLBACK")
 
         risk_multiplier = evaluation.metadata.get("risk_multiplier_override")
         if risk_multiplier is None:
@@ -839,17 +1012,20 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
         rounded_start = self._round_timestamp(start_ts, profile.miss_round_minutes)
         miss_key = f"{symbol}:{self.name}:{setup_id}:{direction}:{rounded_start.isoformat()}"
         state = self._state(symbol)
-        if miss_key in state.recent_probe_keys:
-            return
 
         move = self.config.scalp.miss_move_atr * atr_value
         target = start_price + move if direction == "LONG" else start_price - move
+        semantic_key = f"{symbol}:{self.name}:{direction}:{rounded_start.isoformat()}"
+        if miss_key in state.recent_probe_keys or semantic_key in state.recent_probe_semantic_keys:
+            return
         created_at = data.now
         state.recent_probe_keys.add(miss_key)
+        state.recent_probe_semantic_keys.add(semantic_key)
         state.probes.append(
             _MissProbe(
                 probe_id=f"MISS-{uuid.uuid4().hex[:8]}",
                 miss_key=miss_key,
+                semantic_key=semantic_key,
                 symbol=symbol,
                 direction=direction,
                 start_price=start_price,
