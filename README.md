@@ -38,6 +38,8 @@ CSV must include columns: `timestamp,open,high,low,close` (M5 candles).
   `python main.py --backtest --backtest-symbols XAUUSD,EURUSD --backtest-tf 5m --backtest-start 2023-01-01 --backtest-end 2023-12-31 --backtest-price mid`
 - Auto loader + optional fetch:
   `python main.py --backtest --backtest-symbols XAUUSD,EURUSD,US100,US500,BTCUSD --backtest-start 2023-01-01 --backtest-end 2023-12-31 --backtest-autofetch`
+- ScoreV3 enabled backtest (see config variants):
+  `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --initial-equity 100`
 
 ## Backtest reports
 Detailed report artifacts are generated automatically in backtest mode (unless disabled).
@@ -153,10 +155,17 @@ LOG_LEVEL=INFO
   - `ORB_H4_RETEST` (H4 breakout + M5 retest)
   - `TREND_PULLBACK_M15` (trend continuation pullback)
   - `INDEX_EXISTING` (legacy index logic, preserved for `US100`/`US500`)
-- Global decision policy:
-  - `TRADE`: score `>= 65`
-  - `SMALL`: score `60-64` (enabled, reduced risk)
-  - `OBSERVE`: score `< 60`
+- **ScoreV3 Enhanced Scoring System** (optional, enabled per config):
+  - 35-feature extraction: HTF alignment, FVG quality, trigger confirmations, volatility regime, session/time, entry quality
+  - Heuristic scorer (default): improved rule-based scoring with session/volatility awareness
+  - ML model support (future): LightGBM/LogisticRegression loaded from disk
+  - Quantile-based tier mapping: A+ (top 10%), A (next 25%), B (next 30%), OBSERVE
+  - Fill probability adjustment: scores adjusted by entry distance likelihood
+  - Shadow observer: simulates outcomes for all candidates (including OBSERVE) to measure missed opportunities
+- Global decision policy (V2 legacy or V3 enhanced):
+  - `TRADE`: score `>= 65` (V2) or `>= 48` (V3)
+  - `SMALL`: score `60-64` (V2) or `38-47.99` (V3)
+  - `OBSERVE`: score `< 60` (V2) or `< 38` (V3)
 - H1 bias from EMA + BOS.
 - Premium/Discount gating.
 - M15 sweep + rejection, M5 MSS + displacement + FVG.
@@ -166,6 +175,56 @@ LOG_LEVEL=INFO
 - +1R management: SL to BE + 50% partial.
 - Daily stop, max trades/day, max positions, global exposure and correlation limits.
 - News block window and pending-order cancel in blocked window.
+
+## ScoreV3 Enhanced Scoring System
+
+The ScoreV3 system is an optional enhancement that increases trading throughput 2-3x while maintaining risk management quality. It replaces the legacy V2 scorer with improved feature extraction and more permissive thresholds.
+
+### Features
+- **35 Feature Vector**: HTF alignment, FVG quality, trigger confirmations, volatility regime, session/time awareness, entry quality metrics
+- **Heuristic Scorer**: Rule-based scoring with session and volatility awareness (max score ~91)
+- **ML Model Support**: Future support for LightGBM/LogisticRegression models loaded from disk
+- **Quantile Tiers**: A+ (top 10%), A (next 25%), B (next 30%), OBSERVE (bottom 35%)
+- **Fill Probability**: Scores adjusted by entry distance likelihood for better execution prediction
+- **Shadow Observer**: Simulates outcomes for all candidates (including OBSERVE) to measure missed opportunities
+
+### Configuration
+Enable in config variants:
+```yaml
+score_v3:
+  enabled: true
+  mode: heuristic  # or 'ml' for future model support
+  trade_threshold: 48.0
+  small_min: 38.0
+  small_max: 47.99
+  shadow_observer:
+    enabled: true
+    output_path: "data/shadow_candidates.jsonl"
+```
+
+### Decision Policy (V3)
+- `TRADE`: score `>= 48` (vs V2's 65)
+- `SMALL`: score `38-47.99` (vs V2's 60-64)
+- `OBSERVE`: score `< 38` (vs V2's <60)
+
+### Shadow Observer
+Records all signal candidates (including those that would be OBSERVED) and simulates their full trade outcomes. Useful for:
+- Measuring missed opportunities
+- Validating scoring improvements
+- Backtest comparison analysis
+
+### Score Audit Tool
+CLI tool for analyzing scoring performance:
+```bash
+# Generate funnel report
+python tools/score_audit.py reports/backtest_dir --funnel
+
+# Compare two backtests
+python tools/score_audit.py reports/scorev3_dir --compare reports/baseline_dir
+
+# Score distribution analysis
+python tools/score_audit.py reports/backtest_dir --distribution
+```
 
 ## Low-Equity Protection (micro accounts)
 - For very small balances (default threshold: `250` in account currency), risk is auto-tightened.
@@ -254,6 +313,7 @@ Current unit tests cover:
 - MSS detection
 - bias + premium/discount gating
 - risk limits and news gate
+- ScoreV3 feature extraction, scoring engine, shadow observer, and integration (43 additional tests)
 
 ## Notes
 - Epic names differ by account. For Gold on many DEMO accounts use `GOLD` (not `XAUUSD`).

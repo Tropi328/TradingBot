@@ -128,6 +128,20 @@ decision_policy:
   small_score_max: 37
   trade_risk_multiplier: 1.0
   small_risk_multiplier_default: 1.0
+score_v3:
+  enabled: true
+  mode: heuristic
+  trade_threshold: 48.0
+  small_min: 38.0
+  small_max: 47.99
+  tier_enabled: true
+  tier_a_plus_pct: 0.10
+  tier_a_pct: 0.25
+  tier_b_pct: 0.30
+  shadow_enabled: true
+  shadow_output_path: reports/shadow_observe.jsonl
+  shadow_simulate_outcomes: true
+  fill_prob_weight: 0.25
 backtest_tuning:
   wait_reaction_timeout_bars: 6
   wait_mitigation_timeout_bars: 10

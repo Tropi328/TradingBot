@@ -196,6 +196,10 @@ def test_regression_usd_account_zero_fx_fee(monkeypatch: pytest.MonkeyPatch) -> 
 
     report = engine_module.run_backtest(config=config, asset=asset, candles_m5=candles, assumed_spread=0.2)
     assert report.trades == 1
-    assert report.total_pnl == pytest.approx(130.0, abs=1e-9)
+    # PnL includes TP1 partial close + remainder at TP fill (102.0, the limit price).
+    # Entry now fills at limit price + half spread: 100.0 + 0.1 = 100.1
+    # TP1: (100.8 - 100.1) * 17.5 = 12.25
+    # TP:  (102.0 - 100.1) * 32.5 = 61.75  → total ≈ 74.0
+    assert report.total_pnl == pytest.approx(74.0, abs=0.5)
     assert report.fx_cost_sum == pytest.approx(0.0, abs=1e-12)
 

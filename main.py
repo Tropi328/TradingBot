@@ -43,6 +43,7 @@ from bot.data.market_data import MarketDataService
 from bot.execution.orders import OrderExecutor
 from bot.execution.position_manager import PositionManager
 from bot.execution.feasibility import estimate_required_margin, validate_order
+from bot.execution.order_validation import compute_risk_cash_plan, price_to_points
 from bot.monitoring.alerts import AlertConfig, AlertDispatcher
 from bot.monitoring.dashboard import DashboardWriter
 from bot.news.calendar_provider import CalendarProvider, Event, build_calendar_provider
@@ -3153,10 +3154,21 @@ def run_multi_strategy_loop(
                     continue
 
                 risk_distance = abs(float(intent.signal.entry_price) - float(intent.signal.stop_price))
-                raw_size = ((config.risk.equity * effective_risk_per_trade) / risk_distance) if risk_distance > 0 else 0.0
+                risk_cash_plan = compute_risk_cash_plan(
+                    risk=config.risk,
+                    equity=config.risk.equity,
+                    effective_risk_per_trade=effective_risk_per_trade,
+                )
+                raw_size = (float(risk_cash_plan.target_risk_cash) / risk_distance) if risk_distance > 0 else 0.0
                 spread_now = intent.state.quote[2] if intent.state.quote is not None else None
+                spread_points_now = (
+                    price_to_points(float(spread_now), point_size=float(intent.state.asset.point_size))
+                    if spread_now is not None
+                    else None
+                )
                 open_margin = _estimated_open_margin(positions=open_all_now, config=config)
                 free_margin = max(0.0, float(config.risk.equity) - float(open_margin))
+                spread_limit_points = config.backtest_tuning.spread_limit_points
                 feasibility = validate_order(
                     raw_size=raw_size,
                     entry_price=float(intent.signal.entry_price),
@@ -3164,17 +3176,18 @@ def run_multi_strategy_loop(
                     take_profit=float(intent.signal.take_profit),
                     min_size=float(intent.state.asset.min_size),
                     size_step=float(intent.state.asset.size_step),
-                    max_risk_cash=float(config.risk.equity) * float(effective_risk_per_trade),
+                    max_risk_cash=float(risk_cash_plan.max_risk_cash),
                     equity=float(config.risk.equity),
                     open_positions_count=len(open_asset_now),
                     max_positions=int(config.risk.max_positions),
-                    spread=(float(spread_now) if spread_now is not None else None),
-                    spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+                    spread=(float(spread_points_now) if spread_points_now is not None else None),
+                    spread_limit=(float(spread_limit_points) if spread_limit_points is not None else None),
                     min_stop_distance=float(intent.state.asset.minimal_tick_buffer),
                     free_margin=free_margin,
                     margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
                     max_leverage=float(config.backtest_tuning.broker_leverage),
                     margin_safety_factor=1.0,
+                    allow_min_size_override_if_within_risk=bool(config.risk.allow_min_size_override_if_within_risk),
                     cooldown_blocked=bool(cooldown is not None and now < cooldown),
                     news_blocked=bool(news_blocked),
                 )
@@ -3839,9 +3852,20 @@ def run() -> None:
                                         final_decision = "NO_SIGNAL"
                                         continue
                                     risk_distance = abs(float(decision.signal.entry_price) - float(decision.signal.stop_price))
-                                    raw_size = ((config.risk.equity * effective_risk_per_trade) / risk_distance) if risk_distance > 0 else 0.0
+                                    risk_cash_plan = compute_risk_cash_plan(
+                                        risk=config.risk,
+                                        equity=config.risk.equity,
+                                        effective_risk_per_trade=effective_risk_per_trade,
+                                    )
+                                    raw_size = (float(risk_cash_plan.target_risk_cash) / risk_distance) if risk_distance > 0 else 0.0
+                                    spread_points_now = (
+                                        price_to_points(float(spread), point_size=float(state.asset.point_size))
+                                        if spread is not None
+                                        else None
+                                    )
                                     open_margin = _estimated_open_margin(positions=open_all, config=config)
                                     free_margin = max(0.0, float(config.risk.equity) - float(open_margin))
+                                    spread_limit_points = config.backtest_tuning.spread_limit_points
                                     feasibility = validate_order(
                                         raw_size=raw_size,
                                         entry_price=float(decision.signal.entry_price),
@@ -3849,17 +3873,18 @@ def run() -> None:
                                         take_profit=float(decision.signal.take_profit),
                                         min_size=float(state.asset.min_size),
                                         size_step=float(state.asset.size_step),
-                                        max_risk_cash=float(config.risk.equity) * float(effective_risk_per_trade),
+                                        max_risk_cash=float(risk_cash_plan.max_risk_cash),
                                         equity=float(config.risk.equity),
                                         open_positions_count=len(open_asset),
                                         max_positions=int(config.risk.max_positions),
-                                        spread=(float(spread) if spread is not None else None),
-                                        spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+                                        spread=(float(spread_points_now) if spread_points_now is not None else None),
+                                        spread_limit=(float(spread_limit_points) if spread_limit_points is not None else None),
                                         min_stop_distance=float(state.asset.minimal_tick_buffer),
                                         free_margin=free_margin,
                                         margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
                                         max_leverage=float(config.backtest_tuning.broker_leverage),
                                         margin_safety_factor=1.0,
+                                        allow_min_size_override_if_within_risk=bool(config.risk.allow_min_size_override_if_within_risk),
                                         cooldown_blocked=bool(cooldown is not None and now < cooldown),
                                         news_blocked=bool(news_blocked),
                                     )

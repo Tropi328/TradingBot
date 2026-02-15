@@ -36,14 +36,17 @@ dist/
 runtime_dashboard.json
 *.pid
 *.tmp
+backtest_err.log
+tmp_bt_report.csv
+
+# Backtest/optimization outputs
 reports/
+runs/
+
+# Local market data artifacts
 data/
 bot/data/*.csv
-runs/batch/
-runs/bt_*_summary.json
-runs/opt_*.json
-runs/opt_multi_period_logs/
-tmp_bt_report.csv
+bot/data/local_csv/
 
 # Editor/IDE
 .vscode/

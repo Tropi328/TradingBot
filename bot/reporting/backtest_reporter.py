@@ -23,6 +23,8 @@ _TRADE_FIELD_ORDER = [
     "entry_price",
     "exit_price",
     "pnl",
+    "pnl_gross",
+    "pnl_net",
     "r",
     "fees",
     "spread_cost",
@@ -30,11 +32,14 @@ _TRADE_FIELD_ORDER = [
     "commission_cost",
     "swap_cost",
     "fx_cost",
+    "equity_before",
+    "equity_after",
     "symbol",
     "timeframe",
     "reason_open",
     "reason_close",
     "forced_exit",
+    "margin_capped",
 ]
 _EQUITY_FIELD_ORDER = ["idx", "ts", "equity", "drawdown", "drawdown_pct"]
 _HEADLINE_KEYS = [
@@ -256,25 +261,32 @@ def _normalize_trade(item: Any, meta: BacktestMeta) -> dict[str, Any]:
     side_raw = _extract_value(item, ("side",), "")
     symbol_raw = _extract_value(item, ("symbol", "epic"), meta.symbol)
     timeframe_raw = _extract_value(item, ("timeframe", "tf"), meta.timeframe)
+    pnl_val = _to_float(_extract_value(item, ("pnl",), 0.0))
+    swap_cost_val = _to_float(_extract_value(item, ("swap_cost",), 0.0))
     trade = {
         "entry_ts": _to_iso_timestamp(_extract_value(item, ("entry_ts", "entry_time", "open_time_utc", "open_time"))),
         "exit_ts": _to_iso_timestamp(_extract_value(item, ("exit_ts", "exit_time", "close_time_utc", "close_time"))),
         "side": str(side_raw or "").upper(),
         "entry_price": _to_optional_float(_extract_value(item, ("entry_price",))),
         "exit_price": _to_optional_float(_extract_value(item, ("exit_price",))),
-        "pnl": _to_float(_extract_value(item, ("pnl",), 0.0)),
+        "pnl": pnl_val,
+        "pnl_gross": _to_float(_extract_value(item, ("pnl_gross",), pnl_val)),
+        "pnl_net": _to_float(_extract_value(item, ("pnl_net",), pnl_val)),
         "r": _to_optional_float(_extract_value(item, ("r", "r_multiple"))),
-        "fees": _to_float(_extract_value(item, ("fees",), 0.0)),
+        "fees": _to_float(_extract_value(item, ("fees",), -swap_cost_val)),
         "spread_cost": _to_float(_extract_value(item, ("spread_cost",), 0.0)),
         "slippage_cost": _to_float(_extract_value(item, ("slippage_cost",), 0.0)),
         "commission_cost": _to_float(_extract_value(item, ("commission_cost",), 0.0)),
-        "swap_cost": _to_float(_extract_value(item, ("swap_cost",), 0.0)),
+        "swap_cost": swap_cost_val,
         "fx_cost": _to_float(_extract_value(item, ("fx_cost",), 0.0)),
+        "equity_before": _to_float(_extract_value(item, ("equity_before",), 0.0)),
+        "equity_after": _to_float(_extract_value(item, ("equity_after",), 0.0)),
         "symbol": str(symbol_raw or meta.symbol).upper(),
         "timeframe": str(timeframe_raw or meta.timeframe),
         "reason_open": str(_extract_value(item, ("reason_open",), "") or ""),
         "reason_close": str(_extract_value(item, ("reason_close", "reason"), "") or ""),
         "forced_exit": bool(_extract_value(item, ("forced_exit",), False)),
+        "margin_capped": bool(_extract_value(item, ("margin_capped",), False)),
     }
     return trade
 

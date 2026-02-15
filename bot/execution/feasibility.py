@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from bot.execution.sizing import floor_to_step
+from bot.execution.sizing import ceil_to_step, floor_to_step
 
 
 class RejectReason(str, Enum):
@@ -15,6 +15,7 @@ class RejectReason(str, Enum):
     SL_TOO_CLOSE = "SL_TOO_CLOSE"
     TP_TOO_CLOSE = "TP_TOO_CLOSE"
     SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"
+    EDGE_TOO_SMALL = "EDGE_TOO_SMALL"
     MAX_POSITIONS = "MAX_POSITIONS"
     COOLDOWN = "COOLDOWN"
     SESSION_BLOCK = "SESSION_BLOCK"
@@ -80,6 +81,7 @@ def validate_order(
     margin_requirement_pct: float | None = None,
     max_leverage: float | None = None,
     margin_safety_factor: float = 1.0,
+    allow_min_size_override_if_within_risk: bool = False,
     cooldown_blocked: bool = False,
     session_blocked: bool = False,
     news_blocked: bool = False,
@@ -126,7 +128,22 @@ def validate_order(
     details["rounded_size"] = rounded_size
     details["min_size"] = float(min_size)
     if rounded_size < float(min_size):
-        return _result(ok=False, reason=RejectReason.SIZE_TOO_SMALL, details=details)
+        if allow_min_size_override_if_within_risk:
+            min_size_rounded = ceil_to_step(float(min_size), float(size_step))
+            min_size_rounded = round(max(0.0, min_size_rounded), 8)
+            risk_cash_at_min_size = stop_distance * min_size_rounded
+            details["min_size_override_size"] = min_size_rounded
+            details["risk_cash_at_min_size"] = risk_cash_at_min_size
+            if risk_cash_at_min_size <= float(max_risk_cash) + 1e-12:
+                rounded_size = min_size_rounded
+                details["rounded_size"] = rounded_size
+                details["min_size_override_used"] = True
+            else:
+                details["min_size_override_used"] = False
+                return _result(ok=False, reason=RejectReason.SIZE_TOO_SMALL, details=details)
+        else:
+            details["min_size_override_used"] = False
+            return _result(ok=False, reason=RejectReason.SIZE_TOO_SMALL, details=details)
 
     risk_cash_rounded = stop_distance * rounded_size
     details["risk_cash_rounded"] = risk_cash_rounded
@@ -156,7 +173,34 @@ def validate_order(
     details["free_margin"] = free_margin_eff
     details["margin_safety_factor"] = safety
     if required_margin > (free_margin_eff * safety) + 1e-12:
-        return _result(ok=False, reason=RejectReason.INSUFFICIENT_MARGIN, details=details)
+        # --- margin-aware size cap: shrink position to fit margin ---
+        margin_per_unit = estimate_required_margin(
+            entry_price=entry_price,
+            size=1.0,
+            margin_requirement_pct=margin_requirement_pct,
+            max_leverage=max_leverage,
+        )
+        if margin_per_unit > 0 and free_margin_eff > 0 and safety > 0:
+            max_size_for_margin = (free_margin_eff * safety) / margin_per_unit
+            capped = floor_to_step(max_size_for_margin, float(size_step))
+            capped = round(max(0.0, capped), 8)
+            if capped >= float(min_size):
+                rounded_size = capped
+                details["rounded_size"] = rounded_size
+                details["margin_capped"] = True
+                risk_cash_rounded = stop_distance * rounded_size
+                details["risk_cash_rounded"] = risk_cash_rounded
+                required_margin = estimate_required_margin(
+                    entry_price=entry_price,
+                    size=rounded_size,
+                    margin_requirement_pct=margin_requirement_pct,
+                    max_leverage=max_leverage,
+                )
+                details["required_margin"] = required_margin
+            else:
+                return _result(ok=False, reason=RejectReason.INSUFFICIENT_MARGIN, details=details)
+        else:
+            return _result(ok=False, reason=RejectReason.INSUFFICIENT_MARGIN, details=details)
 
     details["notional"] = max(0.0, float(entry_price) * rounded_size)
     details["equity"] = float(equity)

@@ -1,0 +1,412 @@
+# ============================================================================
+# preset_pnl_safe.yaml  –  "Highest PnL without frying the account"
+# ============================================================================
+# Enables all Task-3 safety modules on top of the production config.
+# Usage:
+#   python main.py --backtest --config configs/variants/preset_pnl_safe.yaml \
+#                  --backtest-symbols XAUUSD --backtest-start 2024-01-01 \
+#                  --backtest-end 2025-02-01
+# ============================================================================
+
+# --- inherit everything from base config (loader merges) ---
+# (These repeat only fields that differ from config.yaml defaults)
+
+timezone: "Europe/Warsaw"
+account_currency: "USD"
+fx_conversion_fee_rate: 0.007
+fx_fee_mode: "all_in_rate"
+fx_rate_source: "static"
+fx_static_rates:
+  USDPLN: 4.0
+  EURPLN: 4.3
+  EURUSD: 1.08
+fx_apply_to: ["pnl", "swap", "commission"]
+reporting_currency: "account"
+
+instrument:
+  epic: "XAUUSD"
+  currency: "USD"
+  instrument_currency: "USD"
+  point_size: 0.01
+  minimal_tick_buffer: 0.05
+  min_size: 0.01
+  size_step: 0.01
+
+assets:
+  - epic: "GOLD"
+    currency: "USD"
+    instrument_currency: "USD"
+    point_size: 0.01
+    minimal_tick_buffer: 0.05
+    min_size: 0.01
+    size_step: 0.01
+    trade_enabled: true
+
+timeframes:
+  h1: "H1"
+  m15: "M15"
+  m5: "M5"
+
+indicators:
+  ema_period_h1: 200
+  atr_period: 14
+
+swings:
+  fractal_left: 2
+  fractal_right: 2
+
+sweep:
+  lookback_min_hours: 2
+  lookback_max_hours: 8
+  threshold_atr_multiplier: 0.15
+
+displacement:
+  base_multiplier: 1.3
+  a_plus_multiplier: 1.6
+
+execution:
+  limit_ttl_bars: 6
+  loop_seconds: 45
+  heartbeat_seconds: 300
+  max_data_stale_seconds: 900
+  quote_refresh_seconds_trade: 30
+  quote_refresh_seconds_observe: 60
+  candle_close_grace_seconds: 3
+  candle_retry_seconds: 15
+  sync_pending_seconds: 30
+  sync_positions_seconds: 30
+  history_bars:
+    h1: 600
+    m15: 500
+    m5: 500
+
+spread_filter:
+  window: 100
+  max_multiple_of_median: 2.0
+
+news_gate:
+  block_minutes: 60
+
+daily_gate:
+  mode: off
+  ema_fast: 20
+  ema_slow: 50
+  thr: 0.001
+  atr_period: 14
+  vol_max: 0.02
+  max_spread: 0.8
+  pre_minutes: 30
+  post_minutes: 30
+  allowed_strategies: []
+
+# ========================================================================
+# RISK  (unchanged from base)
+# ========================================================================
+risk:
+  equity: 10000
+  risk_per_trade: 0.005
+  risk_mode: percent
+  min_risk_cash_per_trade: 0.3
+  max_risk_cash_per_trade: 1.0
+  allow_min_size_override_if_within_risk: false
+  max_trades_per_day: 5
+  daily_stop_pct: 0.025
+  max_positions: 2
+  global_max_positions: 4
+  max_total_risk_pct: 0.02
+  cooldown_loss_streak: 2
+  cooldown_minutes: 60
+  low_equity_mode_enabled: true
+  low_equity_threshold: 250.0
+  low_equity_risk_multiplier: 0.35
+  low_equity_risk_per_trade_cap: 0.02
+  low_equity_max_trades_per_day: 2
+  low_equity_daily_stop_pct: 0.01
+  low_equity_min_size_fallback_enabled: true
+  low_equity_min_size_fallback_max_risk_pct: 0.02
+  correlation_groups:
+    - name: "US_INDICES"
+      epics: ["US100", "US500"]
+      max_open_positions: 1
+
+# ========================================================================
+# PORTFOLIO  –  allow 2 positions per symbol, 4 total
+# ========================================================================
+portfolio:
+  max_open_positions_total: 4
+  max_per_symbol: 2
+  daily_risk_r: 2.0
+  default_cooldown_seconds: 240
+  max_entries_per_cycle: 2
+
+# ========================================================================
+# RISK BUDGET  –  portfolio-level hard caps (ENABLED)
+# ========================================================================
+risk_budget:
+  enabled: true
+  risk_per_trade_pct: 0.005
+  max_open_risk_pct: 0.02
+  daily_loss_limit_pct: 0.025
+  daily_profit_lock_pct: 0.0
+
+# ========================================================================
+# SCORE TIERS  –  A+/A/B/OBSERVE (ENABLED)
+# ========================================================================
+score_tiers:
+  enabled: true
+  A_plus:
+    min_score: 72.0
+    size_mult: 1.0
+    allow_market_after_ttl: true
+  A:
+    min_score: 68.0
+    size_mult: 0.8
+    allow_market_after_ttl: false
+  B:
+    min_score: 62.0
+    size_mult: 0.6
+    allow_market_after_ttl: false
+
+# ========================================================================
+# FVG ENTRY LADDER  (DISABLED for now – module ready, not wired in engine)
+# ========================================================================
+fvg_entry_ladder:
+  enabled: false
+  levels:
+    - name: "mid"
+      fvg_fraction: 0.50
+      size_fraction: 0.70
+    - name: "shallow"
+      fvg_fraction: 0.35
+      size_fraction: 0.30
+  ttl_bars_5m: 8
+  market_fallback:
+    enabled: true
+    only_tiers: ["A_plus"]
+    size_mult: 0.5
+
+# ========================================================================
+# EXITS  –  partial TP at 1R, rest rides to 2R
+# ========================================================================
+exits:
+  base_rr: 2.0
+  partial_tp:
+    enabled: true
+    at_r: 1.0
+    close_fraction: 0.5
+    move_sl_to_be: true
+    be_buffer_r: 0.1
+
+# ========================================================================
+# CORRELATION V2  –  second same-symbol only if first at BE / +0.7R
+# ========================================================================
+correlation_v2:
+  max_positions_per_group: 1
+  allow_second_same_symbol_only_if:
+    first_position_sl_at_be: true
+    or_profit_r_greater_equal: 0.7
+
+# ========================================================================
+# BACKTEST TUNING (same as base, copied for completeness)
+# ========================================================================
+backtest_tuning:
+  wait_reaction_timeout_bars: 6
+  wait_mitigation_timeout_bars: 10
+  wait_hard_block_bars: 0
+  reaction_timeout_force_enable: true
+  wait_timeout_soft_penalty: 2.0
+  wait_timeout_small_risk_multiplier: 0.4
+  wait_timeout_soft_grace_bars: 3
+  max_loss_r_cap: 1.0
+  tp1_trigger_r: 1.2
+  tp1_fraction: 0.35
+  be_offset_r: 0.05
+  be_delay_bars_after_tp1: 2
+  tp_target_min_r: 2.0
+  tp_target_max_r: 2.0
+  tp_target_a_plus_r: 3.0
+  tp_profile_mode: "strict_tp_price"
+  trailing_after_tp1: true
+  trailing_swing_window_bars: 10
+  trailing_buffer_r: 0.08
+  expected_rr_min: 2.0
+  expected_rr_lookback_bars: 120
+  segment_soft_gap_minutes: 120
+  segment_hard_gap_minutes: 600
+  penalty_orb_no_retest: -2.5
+  penalty_orb_confirm_low: -1.5
+  penalty_scalp_no_displacement: -4.0
+  penalty_scalp_no_mss: -3.0
+  penalty_scalp_no_fvg: -2.0
+  ohlc_only_spread_soft_penalty: 3.0
+  thresholds_v2_trade: 62.0
+  thresholds_v2_small_min: 58.0
+  thresholds_v2_small_max: 61.0
+  dynamic_spread_ratio_frac: 0.9
+  dynamic_atr_buffer_mult: 1.1
+  dynamic_spread_score_penalty: 2.0
+  dynamic_atr_score_penalty: 1.0
+  dynamic_assumed_spread_enabled: true
+  dynamic_assumed_spread_min_by_symbol:
+    XAUUSD: 0.5
+    GOLD: 0.5
+  dynamic_assumed_spread_max_by_symbol:
+    XAUUSD: 0.8
+    GOLD: 0.8
+  assumed_spread_by_symbol:
+    XAUUSD: 0.65
+    GOLD: 0.65
+  broker_leverage: 20.0
+  broker_margin_requirement_pct: 5.0
+  overnight_swap_time_utc: "23:00"
+  overnight_swap_long_pct: -0.016
+  overnight_swap_short_pct: 0.0076
+  spread_limit_points: 6.0
+  no_overnight: true
+  rollover_block_minutes_before: 30
+  rollover_block_minutes_after: 30
+  force_close_before_rollover_minutes: 15
+  min_edge_to_cost_ratio: 4.0
+  fx_conversion_pct: 0.0
+
+decision_policy:
+  trade_score_threshold: 65
+  small_score_min: 60
+  small_score_max: 64
+  trade_risk_multiplier: 1.0
+  small_risk_multiplier_default: 0.45
+
+scalp:
+  bias_timeframe: "M15"
+  trigger_timeframe: "M5"
+  candidate_ttl_minutes: 60
+  trade_score_threshold: 65
+  small_score_min: 60
+  small_score_max: 64
+  small_risk_multiplier: 0.45
+  miss_window_minutes: 60
+  miss_move_atr: 1.0
+  be_after_r: 1.0
+  time_stop_minutes: 120
+
+capital:
+  demo_base_url: "https://demo-api-capital.backend-capital.com/api/v1"
+  rate_limit_rps: 2.0
+  rate_limit_burst: 5
+  request_max_attempts: 6
+  backoff_base_seconds: 0.5
+  backoff_max_seconds: 20.0
+  reconnect_short_retries: 2
+  session_refresh_min_interval_seconds: 5
+
+calendar:
+  provider: "dummy"
+  dummy_file: "news_data/events.json"
+  http_timeout_seconds: 10
+  http_cache_ttl_seconds: 300
+
+strategy_runtime:
+  allow_neutral_bias: false
+  neutral_bias_risk_multiplier: 0.5
+
+strategy_router:
+  symbols:
+    - symbol: "XAUUSD"
+      strategy: "TREND_PULLBACK_M15"
+      params:
+        trend_strength_min: 0.16
+        trigger_displacement_atr: 0.9
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_trend_strength_min: 0.42
+        a_plus_displacement_atr: 1.35
+        a_plus_spread_ratio_max: 0.12
+        quality_gates:
+          spread_ratio_max: 0.15
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
+          min_atr_m5: 0.15
+        soft_penalties:
+          TREND_CONFIRMATIONS_LOW: -2.0
+      risk:
+        trade_risk_multiplier: 1.0
+        small_risk_multiplier: 0.45
+        max_trades_per_day: 5
+      priority: 78
+      cooldown_seconds: 900
+    - symbol: "XAUUSD"
+      strategy: "ORB_H4_RETEST"
+      params:
+        max_retest_minutes: 120
+        retest_tolerance_atr: 0.22
+        min_displacement_atr: 0.8
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_displacement_atr: 1.25
+        a_plus_breakout_quality_min: 18.0
+        a_plus_spread_ratio_max: 0.12
+        quality_gates:
+          spread_ratio_max: 0.15
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
+          min_atr_m5: 0.15
+        soft_penalties:
+          ORB_NO_RETEST: -2.5
+          ORB_CONFIRMATIONS_LOW: -1.5
+      risk:
+        trade_risk_multiplier: 1.0
+        small_risk_multiplier: 0.4
+        max_trades_per_day: 2
+      priority: 72
+      cooldown_seconds: 1200
+    - symbol: "GOLD"
+      strategy: "TREND_PULLBACK_M15"
+      params:
+        trend_strength_min: 0.16
+        trigger_displacement_atr: 0.9
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_trend_strength_min: 0.42
+        a_plus_displacement_atr: 1.35
+        a_plus_spread_ratio_max: 0.12
+        quality_gates:
+          spread_ratio_max: 0.15
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
+          min_atr_m5: 0.15
+      risk:
+        trade_risk_multiplier: 1.0
+        small_risk_multiplier: 0.45
+        max_trades_per_day: 5
+      priority: 78
+      cooldown_seconds: 900
+    - symbol: "GOLD"
+      strategy: "ORB_H4_RETEST"
+      params:
+        max_retest_minutes: 120
+        retest_tolerance_atr: 0.22
+        min_displacement_atr: 0.8
+        min_confirm: 1
+        min_confirm_trade: 2
+        min_confirm_small: 1
+        a_plus_displacement_atr: 1.25
+        a_plus_breakout_quality_min: 18.0
+        a_plus_spread_ratio_max: 0.12
+        quality_gates:
+          spread_ratio_max: 0.15
+          min_confirm: 1
+          min_confirm_trade: 2
+          min_confirm_small: 1
+          min_atr_m5: 0.15
+      risk:
+        trade_risk_multiplier: 1.0
+        small_risk_multiplier: 0.4
+        max_trades_per_day: 2
+      priority: 72
+      cooldown_seconds: 1200

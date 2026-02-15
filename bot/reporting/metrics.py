@@ -56,6 +56,8 @@ def compute_drawdown_series(equity: Sequence[Mapping[str, Any]]) -> list[dict[st
 
 def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     pnl_values = [_as_float(trade.get("pnl")) for trade in trades]
+    pnl_gross_values = [_as_float(trade.get("pnl_gross", trade.get("pnl"))) for trade in trades]
+    pnl_net_values = [_as_float(trade.get("pnl_net", trade.get("pnl"))) for trade in trades]
     spread_cost_sum = sum(_as_float(trade.get("spread_cost")) for trade in trades)
     slippage_cost_sum = sum(_as_float(trade.get("slippage_cost")) for trade in trades)
     commission_cost_sum = sum(_as_float(trade.get("commission_cost")) for trade in trades)
@@ -81,6 +83,36 @@ def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mappin
     max_consecutive_wins = _max_consecutive(pnl_values, positive=True)
     max_consecutive_losses = _max_consecutive(pnl_values, positive=False)
 
+    # --- gross / net totals -----------------------------------------------
+    total_pnl_gross = sum(pnl_gross_values) if pnl_gross_values else 0.0
+    total_pnl_net = sum(pnl_net_values) if pnl_net_values else 0.0
+
+    # --- net wins / losses ------------------------------------------------
+    wins_net = sum(1 for pnl in pnl_net_values if pnl > 0)
+    losses_net = sum(1 for pnl in pnl_net_values if pnl < 0)
+    gross_profit_net = sum(pnl for pnl in pnl_net_values if pnl > 0)
+    gross_loss_net = sum(pnl for pnl in pnl_net_values if pnl < 0)
+    profit_factor_net = (gross_profit_net / abs(gross_loss_net)) if gross_loss_net < 0 else 0.0
+
+    # --- trade frequency --------------------------------------------------
+    entry_timestamps = []
+    for trade in trades:
+        raw = trade.get("entry_ts") or trade.get("entry_time")
+        if raw is not None:
+            entry_timestamps.append(str(raw))
+    if len(entry_timestamps) >= 2:
+        from datetime import datetime
+        sorted_ts = sorted(entry_timestamps)
+        first = _parse_timestamp(sorted_ts[0])
+        last = _parse_timestamp(sorted_ts[-1])
+        if first and last:
+            span_days = max(1.0, (last - first).total_seconds() / 86400.0)
+            trades_per_day = trades_count / span_days
+        else:
+            trades_per_day = 0.0
+    else:
+        trades_per_day = 0.0
+
     equity_series = compute_drawdown_series(equity)
     if equity_series:
         equity_start = _as_float(equity_series[0].get("equity"))
@@ -99,6 +131,8 @@ def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mappin
         "losses": losses,
         "win_rate_pct": ((wins / trades_count) * 100.0) if trades_count else 0.0,
         "total_pnl": sum(pnl_values),
+        "total_pnl_gross": total_pnl_gross,
+        "total_pnl_net": total_pnl_net,
         "gross_profit": gross_profit,
         "gross_loss": gross_loss,
         "avg_pnl": avg_pnl,
@@ -107,6 +141,9 @@ def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mappin
         "avg_loss": avg_loss,
         "payoff_ratio": payoff_ratio,
         "profit_factor": profit_factor,
+        "profit_factor_net": profit_factor_net,
+        "wins_net": wins_net,
+        "losses_net": losses_net,
         "spread_cost_sum": spread_cost_sum,
         "slippage_cost_sum": slippage_cost_sum,
         "commission_cost_sum": commission_cost_sum,
@@ -116,8 +153,23 @@ def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mappin
         "largest_loss": min(pnl_values, default=0.0),
         "max_consecutive_wins": max_consecutive_wins,
         "max_consecutive_losses": max_consecutive_losses,
+        "trades_per_day": round(trades_per_day, 4),
         "equity_start": equity_start,
         "equity_end": equity_end,
         "max_drawdown": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
     }
+
+
+def _parse_timestamp(raw: str):
+    """Best-effort ISO timestamp parse."""
+    from datetime import datetime, timezone
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None

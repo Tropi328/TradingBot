@@ -109,6 +109,10 @@ daily_gate:
 risk:
   equity: 10000
   risk_per_trade: 0.005
+  risk_mode: percent
+  min_risk_cash_per_trade: 0.3
+  max_risk_cash_per_trade: 1.0
+  allow_min_size_override_if_within_risk: false
   max_trades_per_day: 3
   daily_stop_pct: 0.015
   max_positions: 1
@@ -213,6 +217,12 @@ backtest_tuning:
   overnight_swap_time_utc: "23:00"
   overnight_swap_long_pct: -0.016
   overnight_swap_short_pct: 0.0076
+  spread_limit_points: 6.0
+  no_overnight: true
+  rollover_block_minutes_before: 30
+  rollover_block_minutes_after: 30
+  force_close_before_rollover_minutes: 15
+  min_edge_to_cost_ratio: 4.0
   fx_conversion_pct: 0.0
 orderflow:
   default_mode: "LITE"

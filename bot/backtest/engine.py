@@ -14,6 +14,13 @@ from bot.config import AppConfig, AssetConfig
 from bot.data.candles import Candle
 from bot.execution.feasibility import RejectReason, validate_order
 from bot.execution.fx import FxConverter
+from bot.execution.order_validation import (
+    compute_risk_cash_plan,
+    expected_move_too_small,
+    in_rollover_entry_block_window,
+    minutes_to_next_rollover,
+    price_to_points,
+)
 from bot.gating.daily_gate import DailyGateProvider
 from bot.strategy.candidate_queue import CandidateQueue
 from bot.strategy.contracts import (
@@ -27,6 +34,11 @@ from bot.strategy.contracts import (
 )
 from bot.strategy.indicators import atr
 from bot.strategy.index_existing import IndexExistingStrategy
+from bot.strategy.risk_budget import PortfolioRiskBudget
+from bot.strategy.score_tiers import resolve_tier_from_config
+from bot.strategy.score_v3 import ScoreV3Config, ScoreV3Engine, apply_score_v3
+from bot.strategy.shadow_observer import ShadowCandidate, ShadowObserver, classify_session, simulate_shadow_outcome
+from bot.reporting.decision_funnel import DecisionFunnel
 from bot.strategy.orb_h4_retest import OrbH4RetestStrategy
 from bot.strategy.orderflow import CompositeOrderflowProvider, OrderflowSnapshot
 from bot.strategy.ranker import rank_score
@@ -63,6 +75,11 @@ class BacktestTrade:
     commission_cost: float = 0.0
     swap_cost: float = 0.0
     fx_cost: float = 0.0
+    pnl_gross: float = 0.0
+    pnl_net: float = 0.0
+    equity_before: float = 0.0
+    equity_after: float = 0.0
+    margin_capped: bool = False
 
 
 @dataclass(slots=True)
@@ -118,12 +135,22 @@ class BacktestReport:
     swap_cost_sum: float = 0.0
     fx_cost_sum: float = 0.0
     total_pnl_net: float = 0.0
+    total_pnl_gross: float = 0.0
     expectancy_net: float = 0.0
     profit_factor_net: float = 0.0
     max_drawdown_net: float = 0.0
     account_currency: str = "USD"
     instrument_currency: str = "USD"
     fx_conversion_fee_rate_used: float = 0.0
+    avg_spread_points: float = 0.0
+    median_spread_points: float = 0.0
+    p90_spread_points: float = 0.0
+    forced_closes_count: int = 0
+    min_size_overrides_count: int = 0
+    margin_capped_count: int = 0
+    decision_funnel: dict[str, Any] = field(default_factory=dict)
+    score_v3_summary: dict[str, Any] = field(default_factory=dict)
+    shadow_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -177,12 +204,22 @@ class BacktestReport:
             "swap_cost_sum": self.swap_cost_sum,
             "fx_cost_sum": self.fx_cost_sum,
             "total_pnl_net": self.total_pnl_net or self.total_pnl,
+            "total_pnl_gross": self.total_pnl_gross or self.total_pnl,
             "expectancy_net": self.expectancy_net or self.expectancy,
             "profit_factor_net": self.profit_factor_net or self.profit_factor,
             "max_drawdown_net": self.max_drawdown_net or self.max_drawdown,
             "account_currency": self.account_currency,
             "instrument_currency": self.instrument_currency,
             "fx_conversion_fee_rate_used": self.fx_conversion_fee_rate_used,
+            "avg_spread_points": self.avg_spread_points,
+            "median_spread_points": self.median_spread_points,
+            "p90_spread_points": self.p90_spread_points,
+            "forced_closes_count": self.forced_closes_count,
+            "min_size_overrides_count": self.min_size_overrides_count,
+            "margin_capped_count": self.margin_capped_count,
+            "decision_funnel": self.decision_funnel,
+            "score_v3_summary": self.score_v3_summary,
+            "shadow_summary": self.shadow_summary,
         }
 
 
@@ -212,6 +249,7 @@ class _PendingOrder:
     reason_open: str = "SIGNAL"
     score: float | None = None
     gate_bias: str | None = None
+    margin_capped: bool = False
 
 
 @dataclass(slots=True)
@@ -224,6 +262,7 @@ class _OpenPosition:
     opened_at: datetime
     initial_stop: float
     initial_risk: float
+    initial_size: float = 0.0
     max_loss_r_cap: float = 1.0
     tp1_trigger_r: float = 0.5
     tp1_fraction: float = 0.5
@@ -247,6 +286,8 @@ class _OpenPosition:
     reason_open: str = "SIGNAL"
     score: float | None = None
     gate_bias: str | None = None
+    margin_capped: bool = False
+    _skip_first_bar: bool = True
 
 
 @dataclass(slots=True)
@@ -390,6 +431,73 @@ def aggregate_candles(candles: list[Candle], timeframe_minutes: int) -> list[Can
     return result
 
 
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    qq = min(1.0, max(0.0, float(q)))
+    pos = qq * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    w = pos - lo
+    return ordered[lo] + ((ordered[hi] - ordered[lo]) * w)
+
+
+def _spread_point_stats(values: list[float]) -> tuple[float, float, float]:
+    if not values:
+        return 0.0, 0.0, 0.0
+    vals = [float(v) for v in values]
+    avg = sum(vals) / len(vals)
+    med = _quantile(vals, 0.5)
+    p90 = _quantile(vals, 0.9)
+    return avg, med, p90
+
+
+def _compute_trade_pnl_fields(
+    *,
+    total_pnl: float,
+    swap_total: float,
+    swap_cost_total: float,
+    spread_cost: float,
+    slippage_cost: float,
+    commission_cost: float,
+    fx_cost: float,
+) -> tuple[float, float, float, float]:
+    """Return (pnl_gross, pnl_net, fees, pnl_for_equity).
+
+    Definitions
+    -----------
+    pnl_gross : price-movement P&L *without* swap
+                (swap is removed from ``total_pnl`` which contains it
+                via ``realized_partial``).
+    fees      : == ``-swap_cost``.  By convention the broker "fee" on a
+                CFD position IS the overnight swap.  ``swap_cost_total``
+                is stored as a positive number for costs, so
+                ``fees = -swap_cost_total`` = ``swap_total`` (the actual
+                cash-flow, negative when you pay).
+    pnl_net   : ``pnl_gross + fees``
+                = ``pnl_gross - swap_cost``
+                = ``total_pnl - commission_cost``
+                (spread / slippage / fx are already embedded in
+                ``total_pnl`` through bid/ask pricing and FX conversion).
+    pnl_for_equity : the amount to add to equity.  Currently equals
+                ``total_pnl`` (keeping backward-compatible equity
+                tracking).
+
+    IMPORTANT – ``fees == -swap_cost``: never subtract BOTH ``fees``
+    and ``swap_cost`` from the same base – that would double-count.
+    """
+    pnl_gross = total_pnl - swap_total
+    fees = -swap_cost_total  # fees == -swap_cost
+    pnl_net = pnl_gross + fees  # = total_pnl - commission_cost (commission≈0)
+    pnl_for_equity = total_pnl  # backward compat: equity tracks via total_pnl
+    return pnl_gross, pnl_net, fees, pnl_for_equity
+
+
 def _calc_exit(
     position: _OpenPosition,
     candle: Candle,
@@ -403,6 +511,13 @@ def _calc_exit(
     else:
         stop_hit = candle.high >= position.stop
         tp_hit = candle.low <= position.tp
+    # Defensive: if TP is on the wrong side of actual entry (adverse fill),
+    # the TP exit would be a loss — invalidate it.
+    if tp_hit:
+        if position.side == "LONG" and position.tp <= position.entry:
+            tp_hit = False
+        elif position.side == "SHORT" and position.tp >= position.entry:
+            tp_hit = False
     if not stop_hit and not tp_hit:
         return False, 0.0, ""
     # Conservative fill order when both happen in one bar.
@@ -426,13 +541,42 @@ def _calc_exit(
             fill_price = min(fill_price, max_loss_price)
         return True, fill_price, reason
 
+    # TP is a limit order: fill at the TP price level, not the bar's bid/ask.
+    # Slippage on limit exits is conservative (goes against us).
     if position.side == "LONG":
-        base_tp_fill = candle.bid if candle.bid is not None else (position.tp - (assumed_spread * 0.5))
-        fill_price = base_tp_fill - slippage
+        fill_price = position.tp - slippage
+        # Final safety: slippage must not push TP fill below entry.
+        if fill_price < position.entry:
+            return False, 0.0, ""
     else:
-        base_tp_fill = candle.ask if candle.ask is not None else (position.tp + (assumed_spread * 0.5))
-        fill_price = base_tp_fill + slippage
+        fill_price = position.tp + slippage
+        if fill_price > position.entry:
+            return False, 0.0, ""
     return True, fill_price, reason
+
+
+def _trade_r_multiple(
+    *,
+    total_pnl: float,
+    position: _OpenPosition,
+    fx_converter: FxConverter | None,
+    instrument_currency: str,
+    account_currency: str,
+    fx_apply_to: set[str] | None,
+) -> float:
+    """Compute R-multiple using the trade's own initial risk (entry-stop × size)."""
+    r_denom_instr = float(position.initial_risk) * float(position.initial_size)
+    if r_denom_instr <= 0:
+        return 0.0
+    r_denom, _ = _convert_cash_to_account(
+        amount=r_denom_instr,
+        category="pnl",
+        fx_converter=fx_converter,
+        instrument_currency=instrument_currency,
+        account_currency=account_currency,
+        fx_apply_to=fx_apply_to,
+    )
+    return (total_pnl / r_denom) if r_denom > 0 else 0.0
 
 
 def _default_observe_evaluation(*, symbol: str, reason: str) -> StrategyEvaluation:
@@ -2009,6 +2153,10 @@ def aggregate_backtest_reports(
     commission_cost_sum = 0.0
     swap_cost_sum = 0.0
     fx_cost_sum = 0.0
+    spread_points_samples: list[float] = []
+    forced_closes_count = 0
+    min_size_overrides_count = 0
+    margin_capped_count = 0
     account_currencies: Counter[str] = Counter()
     instrument_currencies: Counter[str] = Counter()
     fx_fee_rate_values: list[float] = []
@@ -2043,6 +2191,11 @@ def aggregate_backtest_reports(
         commission_cost_sum += float(getattr(report, "commission_cost_sum", 0.0) or 0.0)
         swap_cost_sum += float(getattr(report, "swap_cost_sum", 0.0) or 0.0)
         fx_cost_sum += float(getattr(report, "fx_cost_sum", 0.0) or 0.0)
+        avg_spread_pts = float(getattr(report, "avg_spread_points", 0.0) or 0.0)
+        spread_points_samples.extend([avg_spread_pts] * max(1, int(getattr(report, "trades", 0) or 0)))
+        forced_closes_count += int(getattr(report, "forced_closes_count", 0) or 0)
+        min_size_overrides_count += int(getattr(report, "min_size_overrides_count", 0) or 0)
+        margin_capped_count += int(getattr(report, "margin_capped_count", 0) or 0)
         account_currencies.update([str(getattr(report, "account_currency", config.account_currency)).upper()])
         instrument_currencies.update([str(getattr(report, "instrument_currency", asset.instrument_currency or asset.currency)).upper()])
         fx_fee_rate_values.append(float(getattr(report, "fx_conversion_fee_rate_used", config.fx_conversion_fee_rate)))
@@ -2102,7 +2255,8 @@ def aggregate_backtest_reports(
         commission_cost_sum=commission_cost_sum,
         swap_cost_sum=swap_cost_sum,
         fx_cost_sum=fx_cost_sum,
-        total_pnl_net=total_pnl,
+        total_pnl_net=sum(float(t.pnl_net) for t in all_trades) if all_trades else total_pnl,
+        total_pnl_gross=sum(float(t.pnl_gross) for t in all_trades) if all_trades else total_pnl,
         expectancy_net=expectancy,
         profit_factor_net=profit_factor,
         max_drawdown_net=max_drawdown,
@@ -2113,6 +2267,12 @@ def aggregate_backtest_reports(
         fx_conversion_fee_rate_used=(
             round(sum(fx_fee_rate_values) / len(fx_fee_rate_values), 8) if fx_fee_rate_values else float(config.fx_conversion_fee_rate)
         ),
+        avg_spread_points=_spread_point_stats(spread_points_samples)[0],
+        median_spread_points=_spread_point_stats(spread_points_samples)[1],
+        p90_spread_points=_spread_point_stats(spread_points_samples)[2],
+        forced_closes_count=forced_closes_count,
+        min_size_overrides_count=min_size_overrides_count,
+        margin_capped_count=margin_capped_count,
     )
 
 
@@ -2279,6 +2439,37 @@ def run_backtest_multi_strategy(
     rejected_by_reason: Counter[str] = Counter()
     orders_submitted = 0
     trades_filled = 0
+    spread_points_series: list[float] = []
+    forced_closes_count = 0
+    min_size_overrides_count = 0
+    margin_capped_count = 0
+
+    # ── ScoreV3 engine + shadow observer ──
+    score_v3_engine: ScoreV3Engine | None = None
+    shadow_observer: ShadowObserver | None = None
+    score_v3_bins: Counter[str] = Counter()
+    if config.score_v3.enabled:
+        _v3cfg = config.score_v3
+        v3_dc = ScoreV3Config(
+            enabled=True,
+            mode=str(_v3cfg.mode),
+            model_path=str(_v3cfg.model_path),
+            trade_threshold=float(_v3cfg.trade_threshold),
+            small_min=float(_v3cfg.small_min),
+            small_max=float(_v3cfg.small_max),
+            tier_enabled=bool(_v3cfg.tier_enabled),
+            tier_a_plus_pct=float(_v3cfg.tier_a_plus_pct),
+            tier_a_pct=float(_v3cfg.tier_a_pct),
+            tier_b_pct=float(_v3cfg.tier_b_pct),
+            shadow_enabled=bool(_v3cfg.shadow_enabled),
+            shadow_output_path=str(_v3cfg.shadow_output_path),
+            shadow_simulate_outcomes=bool(_v3cfg.shadow_simulate_outcomes),
+            fill_prob_weight=float(_v3cfg.fill_prob_weight),
+        )
+        score_v3_engine = ScoreV3Engine(v3_dc)
+        if v3_dc.shadow_enabled:
+            _shadow_path = Path(v3_dc.shadow_output_path)
+            shadow_observer = ShadowObserver(_shadow_path)
 
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
@@ -2295,6 +2486,9 @@ def run_backtest_multi_strategy(
             if atr_val is not None:
                 atr_term = max(0.0, slippage_atr_multiplier * atr_val)
         return max(0.0, slippage_points) + atr_term
+
+    def _spread_points_for(spread_price: float) -> float:
+        return max(0.0, price_to_points(float(spread_price), point_size=float(asset.point_size)))
 
     def _cap_size_by_margin(entry_price: float, requested_size: float) -> float:
         if entry_price <= 0:
@@ -2329,6 +2523,8 @@ def run_backtest_multi_strategy(
             slice_m5_live.append(_live_placeholder_from(candle, 5))
         spread_now = _spread_for(i)
         slippage_now = _slippage_for(i)
+        spread_points_now = _spread_points_for(spread_now)
+        spread_points_series.append(spread_points_now)
         spread_history_window.append(spread_now)
         spread_history = list(spread_history_window)
         day_key = candle.timestamp.date().isoformat()
@@ -2395,14 +2591,23 @@ def run_backtest_multi_strategy(
             pending = None
 
         if pending is not None:
+            if bool(config.backtest_tuning.no_overnight) and in_rollover_entry_block_window(
+                ts=candle.timestamp,
+                swap_hour=swap_hour,
+                swap_minute=swap_minute,
+                cfg=config.backtest_tuning,
+            ):
+                pending = None
+        if pending is not None:
             touched = pending.entry >= candle.low and pending.entry <= candle.high
             if touched:
                 slippage = slippage_now
+                # Limit order fill: use the limit price + half spread, not bar close/ask.
                 if pending.side == "LONG":
-                    base_entry = candle.ask if candle.ask is not None else (candle.close + (spread_now * 0.5))
+                    base_entry = pending.entry + (spread_now * 0.5)
                     entry_fill = base_entry + slippage
                 else:
-                    base_entry = candle.bid if candle.bid is not None else (candle.close - (spread_now * 0.5))
+                    base_entry = pending.entry - (spread_now * 0.5)
                     entry_fill = base_entry - slippage
                 initial_risk = abs(pending.entry - pending.stop)
                 entry_spread_cost = max(0.0, float(spread_now)) * 0.5 * float(pending.size)
@@ -2416,6 +2621,7 @@ def run_backtest_multi_strategy(
                     opened_at=candle.timestamp,
                     initial_stop=pending.stop,
                     initial_risk=initial_risk,
+                    initial_size=pending.size,
                     max_loss_r_cap=float(config.backtest_tuning.max_loss_r_cap),
                     tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
                     tp1_fraction=float(config.backtest_tuning.tp1_fraction),
@@ -2435,12 +2641,102 @@ def run_backtest_multi_strategy(
                     reason_open=pending.reason_open,
                     score=pending.score,
                     gate_bias=pending.gate_bias,
+                    margin_capped=pending.margin_capped,
                 )
                 trades_filled += 1
                 pending = None
 
         if open_pos is not None:
+            # Guard: skip management + exit on the bar the position was filled.
+            # Processing starts on the next bar to avoid same-bar entry+exit artifacts.
+            if open_pos._skip_first_bar:
+                open_pos._skip_first_bar = False
+                continue
             time_in_market_bars += 1
+            if bool(config.backtest_tuning.no_overnight):
+                mins_to_roll = minutes_to_next_rollover(
+                    candle.timestamp,
+                    hour=swap_hour,
+                    minute=swap_minute,
+                )
+                force_close_before = int(config.backtest_tuning.force_close_before_rollover_minutes)
+                if 0 <= mins_to_roll <= float(force_close_before):
+                    close_size = float(open_pos.size)
+                    open_pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
+                    open_pos.slippage_cost_total += abs(float(slippage_now)) * close_size
+                    if open_pos.side == "LONG":
+                        forced_exit_price = candle.bid if candle.bid is not None else (candle.close - (spread_now * 0.5))
+                        remaining_pnl_instr = (forced_exit_price - open_pos.entry) * close_size
+                    else:
+                        forced_exit_price = candle.ask if candle.ask is not None else (candle.close + (spread_now * 0.5))
+                        remaining_pnl_instr = (open_pos.entry - forced_exit_price) * close_size
+                    remaining_pnl, close_fx_cost = _convert_cash_to_account(
+                        amount=remaining_pnl_instr,
+                        category="pnl",
+                        fx_converter=fx_converter,
+                        instrument_currency=instrument_currency,
+                        account_currency=account_currency,
+                        fx_apply_to=fx_apply_to,
+                    )
+                    open_pos.fx_conversion_total += close_fx_cost
+                    open_pos.fx_cost_total += close_fx_cost
+                    total_pnl = open_pos.realized_partial + remaining_pnl
+                    _pnl_g, _pnl_n, _fees, _pnl_eq = _compute_trade_pnl_fields(
+                        total_pnl=total_pnl,
+                        swap_total=open_pos.swap_total,
+                        swap_cost_total=open_pos.swap_cost_total,
+                        spread_cost=open_pos.spread_cost_total,
+                        slippage_cost=open_pos.slippage_cost_total,
+                        commission_cost=open_pos.commission_total,
+                        fx_cost=open_pos.fx_cost_total,
+                    )
+                    _eq_before = equity
+                    equity += _pnl_eq
+                    daily_pnl[day_key] += _pnl_eq
+                    r_mult = _trade_r_multiple(
+                        total_pnl=total_pnl,
+                        position=open_pos,
+                        fx_converter=fx_converter,
+                        instrument_currency=instrument_currency,
+                        account_currency=account_currency,
+                        fx_apply_to=fx_apply_to,
+                    )
+                    trades.append(
+                        BacktestTrade(
+                            epic=asset.epic,
+                            side=open_pos.side,
+                            entry_time=open_pos.opened_at,
+                            exit_time=candle.timestamp,
+                            entry_price=open_pos.entry,
+                            exit_price=forced_exit_price,
+                            size=open_pos.size,
+                            pnl=total_pnl,
+                            fees=_fees,
+                            r_multiple=r_mult,
+                            reason="FORCED_ROLLOVER",
+                            forced_exit=True,
+                            score=open_pos.score,
+                            reason_open=open_pos.reason_open,
+                            reason_close="FORCED_ROLLOVER",
+                            gate_bias=open_pos.gate_bias,
+                            spread_cost=open_pos.spread_cost_total,
+                            slippage_cost=open_pos.slippage_cost_total,
+                            commission_cost=open_pos.commission_total,
+                            swap_cost=open_pos.swap_cost_total,
+                            fx_cost=open_pos.fx_cost_total,
+                            pnl_gross=_pnl_g,
+                            pnl_net=_pnl_n,
+                            equity_before=_eq_before,
+                            equity_after=equity,
+                            margin_capped=open_pos.margin_capped,
+                        )
+                    )
+                    forced_closes_count += 1
+                    open_pos = None
+                    peak_equity = max(peak_equity, equity)
+                    drawdown = peak_equity - equity
+                    max_drawdown = max(max_drawdown, drawdown)
+                    continue
             _apply_overnight_swap_if_due(
                 position=open_pos,
                 candle_ts=candle.timestamp,
@@ -2495,11 +2791,26 @@ def run_backtest_multi_strategy(
                 open_pos.fx_conversion_total += close_fx_cost
                 open_pos.fx_cost_total += close_fx_cost
                 total_pnl = open_pos.realized_partial + remaining_pnl
-                equity += total_pnl
-                daily_pnl[day_key] += total_pnl
-                r_denom = risk_engine.per_trade_risk_amount(equity=equity)
-                r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
-                fees_total = open_pos.swap_total + open_pos.fx_conversion_total
+                _pnl_g, _pnl_n, _fees, _pnl_eq = _compute_trade_pnl_fields(
+                    total_pnl=total_pnl,
+                    swap_total=open_pos.swap_total,
+                    swap_cost_total=open_pos.swap_cost_total,
+                    spread_cost=open_pos.spread_cost_total,
+                    slippage_cost=open_pos.slippage_cost_total,
+                    commission_cost=open_pos.commission_total,
+                    fx_cost=open_pos.fx_cost_total,
+                )
+                _eq_before = equity
+                equity += _pnl_eq
+                daily_pnl[day_key] += _pnl_eq
+                r_mult = _trade_r_multiple(
+                    total_pnl=total_pnl,
+                    position=open_pos,
+                    fx_converter=fx_converter,
+                    instrument_currency=instrument_currency,
+                    account_currency=account_currency,
+                    fx_apply_to=fx_apply_to,
+                )
                 trades.append(
                     BacktestTrade(
                         epic=asset.epic,
@@ -2510,7 +2821,7 @@ def run_backtest_multi_strategy(
                         exit_price=exit_price,
                         size=open_pos.size,
                         pnl=total_pnl,
-                        fees=fees_total,
+                        fees=_fees,
                         r_multiple=r_mult,
                         reason=reason,
                         score=open_pos.score,
@@ -2522,6 +2833,11 @@ def run_backtest_multi_strategy(
                         commission_cost=open_pos.commission_total,
                         swap_cost=open_pos.swap_cost_total,
                         fx_cost=open_pos.fx_cost_total,
+                        pnl_gross=_pnl_g,
+                        pnl_net=_pnl_n,
+                        equity_before=_eq_before,
+                        equity_after=equity,
+                        margin_capped=open_pos.margin_capped,
                     )
                 )
                 open_pos = None
@@ -2538,6 +2854,17 @@ def run_backtest_multi_strategy(
             continue
         if risk_engine.should_turn_off_for_day(daily_pnl[day_key], equity=equity):
             blockers["RISK_DAILY_STOP"] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+
+        if bool(config.backtest_tuning.no_overnight) and in_rollover_entry_block_window(
+            ts=candle.timestamp,
+            swap_hour=swap_hour,
+            swap_minute=swap_minute,
+            cfg=config.backtest_tuning,
+        ):
+            rejected_by_reason[RejectReason.SESSION_BLOCK.value] += 1
+            blockers[RejectReason.SESSION_BLOCK.value] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
 
@@ -2788,24 +3115,41 @@ def run_backtest_multi_strategy(
                 setup_side=candidate.side if candidate is not None else None,
                 orderflow_settings=orderflow_settings,
             )
-            trade_thr, small_min, small_max, dynamic_reasons = _adjust_thresholds_dynamic(
-                trade_threshold=trade_thr_base,
-                small_min=small_min_base,
-                small_max=small_max_base,
-                route_params=route.params,
-                evaluation=evaluation,
-                config=config,
-                enabled=variant_cfg.dynamic_threshold_bump,
-            )
-            if dynamic_reasons:
-                evaluation.metadata["dynamic_threshold_reasons"] = dynamic_reasons
-            _ = _normalize_action_for_score(
-                evaluation=evaluation,
-                config=config,
-                trade_threshold=trade_thr,
-                small_min=small_min,
-                small_max=small_max,
-            )
+            if score_v3_engine is not None:
+                # ScoreV3 replaces V2 threshold normalization
+                # Only pass last 500 ATR values (avoid O(n) copy per bar)
+                _atr_hist_slice = atr_values[max(0, i - 499) : i + 1] if atr_values else None
+                evaluation = apply_score_v3(
+                    score_v3_engine,
+                    evaluation,
+                    bias,
+                    candle=candle,
+                    atr_m5=evaluation.metadata.get("atr_m5"),
+                    atr_history=_atr_hist_slice,
+                    spread=spread_now,
+                    assumed_spread=float(assumed_spread_used),
+                )
+                if score_v3_engine.score_history_size % 2000 == 0 and score_v3_engine.score_history_size > 0:
+                    score_v3_engine.update_quantile_boundaries()
+            else:
+                trade_thr, small_min, small_max, dynamic_reasons = _adjust_thresholds_dynamic(
+                    trade_threshold=trade_thr_base,
+                    small_min=small_min_base,
+                    small_max=small_max_base,
+                    route_params=route.params,
+                    evaluation=evaluation,
+                    config=config,
+                    enabled=variant_cfg.dynamic_threshold_bump,
+                )
+                if dynamic_reasons:
+                    evaluation.metadata["dynamic_threshold_reasons"] = dynamic_reasons
+                _ = _normalize_action_for_score(
+                    evaluation=evaluation,
+                    config=config,
+                    trade_threshold=trade_thr,
+                    small_min=small_min,
+                    small_max=small_max,
+                )
             if candidate is None or bars_since_segment_start < feature_warmup_bars:
                 missing_features = []
                 evaluation.metadata["is_ready"] = True
@@ -2901,6 +3245,55 @@ def run_backtest_multi_strategy(
                 score_bins["small_bin"] += 1
             else:
                 score_bins["observe_bin"] += 1
+
+        # ── ScoreV3 bins + shadow candidate recording ──
+        if score_v3_engine is not None and best_outcome.evaluation.score_total is not None:
+            _v3_score = float(best_outcome.evaluation.metadata.get("score_v3", best_outcome.evaluation.score_total))
+            _v3_thr = score_v3_engine.config.trade_threshold
+            _v3_smin = score_v3_engine.config.small_min
+            _v3_smax = score_v3_engine.config.small_max
+            if _v3_score >= _v3_thr:
+                score_v3_bins["trade_bin"] += 1
+            elif _v3_smin <= _v3_score <= _v3_smax:
+                score_v3_bins["small_bin"] += 1
+            else:
+                score_v3_bins["observe_bin"] += 1
+
+        if shadow_observer is not None and best_outcome.evaluation.score_total is not None:
+            _eval = best_outcome.evaluation
+            # Only record non-TRADE candidates (TRADE outcomes get real tracking)
+            _shadow_action = str(_eval.action.value) if _eval.action else "OBSERVE"
+            if _shadow_action != "TRADE":
+                _meta = _eval.metadata if isinstance(_eval.metadata, dict) else {}
+                _layers = _eval.score_layers or {}
+                _penalties_map = _eval.penalties or {}
+                _sc = ShadowCandidate(
+                    timestamp=candle.timestamp.isoformat(),
+                    symbol=asset.epic,
+                    side=str(_meta.get("side", "")),
+                    action=_shadow_action,
+                    tier=str(_meta.get("tier", "NONE")),
+                    score_v2=float(_meta.get("score_v2", _eval.score_total or 0)),
+                    score_v3=float(_meta.get("score_v3")) if _meta.get("score_v3") is not None else None,
+                    h1_bias_direction=str(best_outcome.bias.direction) if best_outcome.bias else "NEUTRAL",
+                    trigger_confirmations=int(_meta.get("trigger_confirmations", 0)),
+                    atr_m5=float(_meta.get("atr_m5", 0)),
+                    spread=float(spread_now),
+                    hour_utc=candle.timestamp.hour,
+                    day_of_week=candle.timestamp.weekday(),
+                    session=classify_session(candle.timestamp.hour),
+                    entry_price=float(_meta.get("entry_price", _meta.get("fvg_mid", candle.close))),
+                    stop_price=float(_meta.get("stop_price", _meta.get("sweep_level", candle.close))),
+                    tp_price=float(_meta.get("tp_price", candle.close)),
+                    edge_score=float(_layers.get("edge", 0)),
+                    trigger_score=float(_layers.get("trigger", 0)),
+                    execution_score=float(_layers.get("execution", 0)),
+                    penalty_total=float(sum(_penalties_map.values())) if _penalties_map else 0,
+                    gate_reasons=list(best_outcome.reason_codes or []),
+                    raw_score_breakdown=dict(_eval.score_breakdown) if _eval.score_breakdown else {},
+                    raw_penalties=dict(_penalties_map),
+                )
+                shadow_observer.record(_sc)
 
         meta = best_outcome.evaluation.metadata if isinstance(best_outcome.evaluation.metadata, dict) else {}
         if bool(meta.get("spread_gate_soft_penalty_applied")):
@@ -3035,6 +3428,29 @@ def run_backtest_multi_strategy(
         order_request.take_profit = normalized_tp
         best_outcome.evaluation.metadata["target_r_normalized"] = round(normalized_r, 4)
 
+        spread_limit_points = config.backtest_tuning.spread_limit_points
+        if spread_limit_points is not None and spread_points_now > float(spread_limit_points):
+            rejected_by_reason[RejectReason.SPREAD_TOO_WIDE.value] += 1
+            blockers[RejectReason.SPREAD_TOO_WIDE.value] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+
+        expected_move_points = abs(
+            price_to_points(
+                float(order_request.take_profit) - float(order_request.entry_price),
+                point_size=float(asset.point_size),
+            )
+        )
+        if expected_move_too_small(
+            expected_move_points=expected_move_points,
+            spread_points=spread_points_now,
+            min_edge_to_cost_ratio=float(config.backtest_tuning.min_edge_to_cost_ratio),
+        ):
+            rejected_by_reason[RejectReason.EDGE_TOO_SMALL.value] += 1
+            blockers[RejectReason.EDGE_TOO_SMALL.value] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+
         signal_candidates += 1
         risk_multiplier = _risk_multiplier_for(
             evaluation=best_outcome.evaluation,
@@ -3050,8 +3466,13 @@ def run_backtest_multi_strategy(
             blockers["M5_INVALID_RISK_DISTANCE"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
-        max_risk_cash = float(equity) * float(effective_risk_per_trade)
-        raw_size = max_risk_cash / risk_distance if risk_distance > 0 else 0.0
+        risk_cash_plan = compute_risk_cash_plan(
+            risk=config.risk,
+            equity=equity,
+            effective_risk_per_trade=effective_risk_per_trade,
+        )
+        max_risk_cash = float(risk_cash_plan.max_risk_cash)
+        raw_size = float(risk_cash_plan.target_risk_cash) / risk_distance if risk_distance > 0 else 0.0
         feasibility = validate_order(
             raw_size=raw_size,
             entry_price=float(order_request.entry_price),
@@ -3063,13 +3484,14 @@ def run_backtest_multi_strategy(
             equity=float(equity),
             open_positions_count=0,
             max_positions=int(config.risk.max_positions),
-            spread=float(spread_now),
-            spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+            spread=float(spread_points_now),
+            spread_limit=(float(spread_limit_points) if spread_limit_points is not None else None),
             min_stop_distance=float(asset.minimal_tick_buffer),
             free_margin=float(equity),
             margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
             max_leverage=float(config.backtest_tuning.broker_leverage),
             margin_safety_factor=1.0,
+            allow_min_size_override_if_within_risk=bool(config.risk.allow_min_size_override_if_within_risk),
         )
         if not feasibility.ok:
             reject = feasibility.reason.value if feasibility.reason is not None else "UNKNOWN_REJECT"
@@ -3078,6 +3500,10 @@ def run_backtest_multi_strategy(
             decision_counts["NO_SIGNAL"] += 1
             continue
         size = float(feasibility.details.get("rounded_size", 0.0))
+        if bool(feasibility.details.get("min_size_override_used", False)):
+            min_size_overrides_count += 1
+        if bool(feasibility.details.get("margin_capped", False)):
+            margin_capped_count += 1
         if size <= 0:
             blockers["SIZE_MARGIN_LIMIT"] += 1
             blockers["SIZE_INVALID"] += 1
@@ -3097,6 +3523,7 @@ def run_backtest_multi_strategy(
             reason_open=",".join(best_outcome.reason_codes) if best_outcome.reason_codes else "SIGNAL",
             score=best_outcome.evaluation.score_total,
             gate_bias=(str(gate_result.bias).upper() if gate_result is not None else None),
+            margin_capped=bool(feasibility.details.get("margin_capped", False)),
         )
         orders_submitted += 1
         daily_trades[day_key] += 1
@@ -3147,10 +3574,25 @@ def run_backtest_multi_strategy(
         open_pos.fx_conversion_total += close_fx_cost
         open_pos.fx_cost_total += close_fx_cost
         total_pnl = open_pos.realized_partial + remaining_pnl
-        equity += total_pnl
-        r_denom = risk_engine.per_trade_risk_amount(equity=equity)
-        r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
-        fees_total = open_pos.swap_total + open_pos.fx_conversion_total
+        _pnl_g, _pnl_n, _fees, _pnl_eq = _compute_trade_pnl_fields(
+            total_pnl=total_pnl,
+            swap_total=open_pos.swap_total,
+            swap_cost_total=open_pos.swap_cost_total,
+            spread_cost=open_pos.spread_cost_total,
+            slippage_cost=open_pos.slippage_cost_total,
+            commission_cost=open_pos.commission_total,
+            fx_cost=open_pos.fx_cost_total,
+        )
+        _eq_before = equity
+        equity += _pnl_eq
+        r_mult = _trade_r_multiple(
+            total_pnl=total_pnl,
+            position=open_pos,
+            fx_converter=fx_converter,
+            instrument_currency=instrument_currency,
+            account_currency=account_currency,
+            fx_apply_to=fx_apply_to,
+        )
         trades.append(
             BacktestTrade(
                 epic=asset.epic,
@@ -3161,7 +3603,7 @@ def run_backtest_multi_strategy(
                 exit_price=exit_price,
                 size=close_size,
                 pnl=total_pnl,
-                fees=fees_total,
+                fees=_fees,
                 r_multiple=r_mult,
                 reason="FORCED_CHUNK_END",
                 forced_exit=True,
@@ -3174,6 +3616,11 @@ def run_backtest_multi_strategy(
                 commission_cost=open_pos.commission_total,
                 swap_cost=open_pos.swap_cost_total,
                 fx_cost=open_pos.fx_cost_total,
+                pnl_gross=_pnl_g,
+                pnl_net=_pnl_n,
+                equity_before=_eq_before,
+                equity_after=equity,
+                margin_capped=open_pos.margin_capped,
             )
         )
         peak_equity = max(peak_equity, equity)
@@ -3196,6 +3643,30 @@ def run_backtest_multi_strategy(
     commission_cost_sum = sum(float(trade.commission_cost) for trade in trades)
     swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
     fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
+    avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
+    avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
+
+    # ── ScoreV3 / shadow observer finalization ──
+    _score_v3_summary: dict[str, Any] = {}
+    if score_v3_engine is not None:
+        score_v3_engine.update_quantile_boundaries()
+        _score_v3_summary = {
+            "enabled": True,
+            "mode": score_v3_engine.config.mode,
+            "trade_threshold": score_v3_engine.config.trade_threshold,
+            "small_min": score_v3_engine.config.small_min,
+            "small_max": score_v3_engine.config.small_max,
+            "score_v3_bins": dict(score_v3_bins),
+            "quantile_boundaries": score_v3_engine.quantile_boundaries,
+            "total_scored": score_v3_engine.score_history_size,
+        }
+    _shadow_summary: dict[str, Any] = {}
+    if shadow_observer is not None:
+        shadow_observer.flush()
+        shadow_observer.close()
+        _shadow_summary = shadow_observer.summary()
+        _shadow_out = Path(config.score_v3.shadow_output_path).with_suffix(".summary.json")
+        shadow_observer.save_summary(_shadow_out)
 
     return BacktestReport(
         epic=asset.epic,
@@ -3252,13 +3723,22 @@ def run_backtest_multi_strategy(
         commission_cost_sum=commission_cost_sum,
         swap_cost_sum=swap_cost_sum,
         fx_cost_sum=fx_cost_sum,
-        total_pnl_net=total_pnl,
+        total_pnl_net=sum(float(t.pnl_net) for t in trades) if trades else total_pnl,
+        total_pnl_gross=sum(float(t.pnl_gross) for t in trades) if trades else total_pnl,
         expectancy_net=expectancy,
         profit_factor_net=profit_factor,
         max_drawdown_net=max_drawdown,
         account_currency=account_currency,
         instrument_currency=instrument_currency,
         fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
+        avg_spread_points=avg_spread_points,
+        median_spread_points=median_spread_points,
+        p90_spread_points=p90_spread_points,
+        forced_closes_count=forced_closes_count,
+        min_size_overrides_count=min_size_overrides_count,
+        margin_capped_count=margin_capped_count,
+        score_v3_summary=_score_v3_summary,
+        shadow_summary=_shadow_summary,
     )
 
 
@@ -3302,8 +3782,8 @@ def run_backtest(
     peak_equity = equity
     max_drawdown = 0.0
     trades: list[BacktestTrade] = []
-    pending: _PendingOrder | None = None
-    open_pos: _OpenPosition | None = None
+    pending_orders: list[_PendingOrder] = []
+    open_positions: list[_OpenPosition] = []
     time_in_market_bars = 0
     count_be_moves = 0
     count_tp1_hits = 0
@@ -3332,6 +3812,19 @@ def run_backtest(
     rejected_by_reason: Counter[str] = Counter()
     orders_submitted = 0
     trades_filled = 0
+    spread_points_series: list[float] = []
+    forced_closes_count = 0
+    min_size_overrides_count = 0
+    margin_capped_count = 0
+    max_local_positions = max(1, config.portfolio.max_per_symbol)
+    risk_budget_inst = PortfolioRiskBudget(
+        enabled=config.risk_budget.enabled,
+        risk_per_trade_pct=config.risk_budget.risk_per_trade_pct,
+        max_open_risk_pct=config.risk_budget.max_open_risk_pct,
+        daily_loss_limit_pct=config.risk_budget.daily_loss_limit_pct,
+        daily_profit_lock_pct=config.risk_budget.daily_profit_lock_pct,
+    )
+    funnel = DecisionFunnel()
     m15_ptr = -1
     h1_ptr = -1
 
@@ -3350,6 +3843,9 @@ def run_backtest(
             if atr_val is not None:
                 atr_term = max(0.0, slippage_atr_multiplier * atr_val)
         return max(0.0, slippage_points) + atr_term
+
+    def _spread_points_for(spread_price: float) -> float:
+        return max(0.0, price_to_points(float(spread_price), point_size=float(asset.point_size)))
 
     def _cap_size_by_margin(entry_price: float, requested_size: float) -> float:
         if entry_price <= 0:
@@ -3380,6 +3876,8 @@ def run_backtest(
         candle = candles_m5[i]
         spread_now = _spread_for(i)
         slippage_now = _slippage_for(i)
+        spread_points_now = _spread_points_for(spread_now)
+        spread_points_series.append(spread_points_now)
         spread_history_window.append(spread_now)
         spread_history = list(spread_history_window)
         slice_m5.append(candle)
@@ -3400,58 +3898,167 @@ def run_backtest(
                 seen_day_bias[gate_day] = gate_bias
                 daily_gate_bias_days[gate_bias] += 1
 
-        if pending is not None and i > pending.expiry_index:
-            pending = None
+        # ---- process pending orders ----
+        _pend_remove: list[int] = []
+        for _qi, _pend in enumerate(pending_orders):
+            if i > _pend.expiry_index:
+                funnel.orders_expired_ttl += 1
+                _pend_remove.append(_qi)
+                continue
+            if bool(config.backtest_tuning.no_overnight) and in_rollover_entry_block_window(
+                ts=candle.timestamp,
+                swap_hour=swap_hour,
+                swap_minute=swap_minute,
+                cfg=config.backtest_tuning,
+            ):
+                _pend_remove.append(_qi)
+                continue
+            touched = _pend.entry >= candle.low and _pend.entry <= candle.high
+            if not touched:
+                continue
+            slippage = slippage_now
+            # Limit order fill: use the limit price + half spread, not bar close/ask.
+            if _pend.side == "LONG":
+                base_entry = _pend.entry + (spread_now * 0.5)
+                entry_fill = base_entry + slippage
+            else:
+                base_entry = _pend.entry - (spread_now * 0.5)
+                entry_fill = base_entry - slippage
+            initial_risk = abs(_pend.entry - _pend.stop)
+            entry_spread_cost = max(0.0, float(spread_now)) * 0.5 * float(_pend.size)
+            entry_slippage_cost = abs(float(slippage)) * float(_pend.size)
+            open_positions.append(_OpenPosition(
+                side=_pend.side,
+                entry=entry_fill,
+                stop=_pend.stop,
+                tp=_pend.tp,
+                size=_pend.size,
+                opened_at=candle.timestamp,
+                initial_stop=_pend.stop,
+                initial_risk=initial_risk,
+                initial_size=_pend.size,
+                max_loss_r_cap=float(config.backtest_tuning.max_loss_r_cap),
+                tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
+                tp1_fraction=float(config.backtest_tuning.tp1_fraction),
+                be_offset_r=float(config.backtest_tuning.be_offset_r),
+                be_delay_bars_after_tp1=int(config.backtest_tuning.be_delay_bars_after_tp1),
+                trailing_after_tp1=bool(config.backtest_tuning.trailing_after_tp1),
+                trailing_window_bars=int(config.backtest_tuning.trailing_swing_window_bars),
+                trailing_buffer_r=float(config.backtest_tuning.trailing_buffer_r),
+                next_swap_ts=_next_rollover_timestamp(
+                    candle.timestamp,
+                    hour=swap_hour,
+                    minute=swap_minute,
+                ),
+                realized_partial=0.0,
+                spread_cost_total=entry_spread_cost,
+                slippage_cost_total=entry_slippage_cost,
+                reason_open=_pend.reason_open,
+                score=_pend.score,
+                gate_bias=_pend.gate_bias,
+                margin_capped=_pend.margin_capped,
+            ))
+            trades_filled += 1
+            funnel.filled_orders += 1
+            funnel.trades_opened += 1
+            _pend_remove.append(_qi)
+        for _ri in reversed(_pend_remove):
+            pending_orders.pop(_ri)
 
-        if pending is not None:
-            touched = pending.entry >= candle.low and pending.entry <= candle.high
-            if touched:
-                slippage = slippage_now
-                if pending.side == "LONG":
-                    base_entry = candle.ask if candle.ask is not None else (candle.close + (spread_now * 0.5))
-                    entry_fill = base_entry + slippage
-                else:
-                    base_entry = candle.bid if candle.bid is not None else (candle.close - (spread_now * 0.5))
-                    entry_fill = base_entry - slippage
-                initial_risk = abs(pending.entry - pending.stop)
-                entry_spread_cost = max(0.0, float(spread_now)) * 0.5 * float(pending.size)
-                entry_slippage_cost = abs(float(slippage)) * float(pending.size)
-                open_pos = _OpenPosition(
-                    side=pending.side,
-                    entry=entry_fill,
-                    stop=pending.stop,
-                    tp=pending.tp,
-                    size=pending.size,
-                    opened_at=candle.timestamp,
-                    initial_stop=pending.stop,
-                    initial_risk=initial_risk,
-                    max_loss_r_cap=float(config.backtest_tuning.max_loss_r_cap),
-                    tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
-                    tp1_fraction=float(config.backtest_tuning.tp1_fraction),
-                    be_offset_r=float(config.backtest_tuning.be_offset_r),
-                    be_delay_bars_after_tp1=int(config.backtest_tuning.be_delay_bars_after_tp1),
-                    trailing_after_tp1=bool(config.backtest_tuning.trailing_after_tp1),
-                    trailing_window_bars=int(config.backtest_tuning.trailing_swing_window_bars),
-                    trailing_buffer_r=float(config.backtest_tuning.trailing_buffer_r),
-                    next_swap_ts=_next_rollover_timestamp(
-                        candle.timestamp,
-                        hour=swap_hour,
-                        minute=swap_minute,
-                    ),
-                    realized_partial=0.0,
-                    spread_cost_total=entry_spread_cost,
-                    slippage_cost_total=entry_slippage_cost,
-                    reason_open=pending.reason_open,
-                    score=pending.score,
-                    gate_bias=pending.gate_bias,
-                )
-                trades_filled += 1
-                pending = None
-
-        if open_pos is not None:
+        # ---- process open positions ----
+        _pos_remove: list[int] = []
+        for _pi, _pos in enumerate(open_positions):
+            # Guard: skip management + exit on the bar the position was filled.
+            if _pos._skip_first_bar:
+                _pos._skip_first_bar = False
+                continue
             time_in_market_bars += 1
+            if bool(config.backtest_tuning.no_overnight):
+                mins_to_roll = minutes_to_next_rollover(
+                    candle.timestamp,
+                    hour=swap_hour,
+                    minute=swap_minute,
+                )
+                force_close_before = int(config.backtest_tuning.force_close_before_rollover_minutes)
+                if 0 <= mins_to_roll <= float(force_close_before):
+                    close_size = float(_pos.size)
+                    _pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
+                    _pos.slippage_cost_total += abs(float(slippage_now)) * close_size
+                    if _pos.side == "LONG":
+                        forced_exit_price = candle.bid if candle.bid is not None else (candle.close - (spread_now * 0.5))
+                        remaining_pnl_instr = (forced_exit_price - _pos.entry) * close_size
+                    else:
+                        forced_exit_price = candle.ask if candle.ask is not None else (candle.close + (spread_now * 0.5))
+                        remaining_pnl_instr = (_pos.entry - forced_exit_price) * close_size
+                    remaining_pnl, close_fx_cost = _convert_cash_to_account(
+                        amount=remaining_pnl_instr,
+                        category="pnl",
+                        fx_converter=fx_converter,
+                        instrument_currency=instrument_currency,
+                        account_currency=account_currency,
+                        fx_apply_to=fx_apply_to,
+                    )
+                    _pos.fx_conversion_total += close_fx_cost
+                    _pos.fx_cost_total += close_fx_cost
+                    total_pnl = _pos.realized_partial + remaining_pnl
+                    _pnl_g, _pnl_n, _fees, _pnl_eq = _compute_trade_pnl_fields(
+                        total_pnl=total_pnl,
+                        swap_total=_pos.swap_total,
+                        swap_cost_total=_pos.swap_cost_total,
+                        spread_cost=_pos.spread_cost_total,
+                        slippage_cost=_pos.slippage_cost_total,
+                        commission_cost=_pos.commission_total,
+                        fx_cost=_pos.fx_cost_total,
+                    )
+                    _eq_before = equity
+                    equity += _pnl_eq
+                    daily_pnl[day_key] += _pnl_eq
+                    if risk_budget_inst.enabled:
+                        risk_budget_inst.record_trade_pnl(_pnl_eq)
+                    r_mult = _trade_r_multiple(
+                        total_pnl=total_pnl,
+                        position=_pos,
+                        fx_converter=fx_converter,
+                        instrument_currency=instrument_currency,
+                        account_currency=account_currency,
+                        fx_apply_to=fx_apply_to,
+                    )
+                    trades.append(
+                        BacktestTrade(
+                            epic=asset.epic,
+                            side=_pos.side,
+                            entry_time=_pos.opened_at,
+                            exit_time=candle.timestamp,
+                            entry_price=_pos.entry,
+                            exit_price=forced_exit_price,
+                            size=_pos.size,
+                            pnl=total_pnl,
+                            fees=_fees,
+                            r_multiple=r_mult,
+                            reason="FORCED_ROLLOVER",
+                            forced_exit=True,
+                            score=_pos.score,
+                            reason_open=_pos.reason_open,
+                            reason_close="FORCED_ROLLOVER",
+                            gate_bias=_pos.gate_bias,
+                            spread_cost=_pos.spread_cost_total,
+                            slippage_cost=_pos.slippage_cost_total,
+                            commission_cost=_pos.commission_total,
+                            swap_cost=_pos.swap_cost_total,
+                            fx_cost=_pos.fx_cost_total,
+                            pnl_gross=_pnl_g,
+                            pnl_net=_pnl_n,
+                            equity_before=_eq_before,
+                            equity_after=equity,
+                            margin_capped=_pos.margin_capped,
+                        )
+                    )
+                    forced_closes_count += 1
+                    funnel.trades_closed += 1
+                    _pos_remove.append(_pi)
+                    continue
             _apply_overnight_swap_if_due(
-                position=open_pos,
+                position=_pos,
                 candle_ts=candle.timestamp,
                 swap_hour=swap_hour,
                 swap_minute=swap_minute,
@@ -3463,20 +4070,39 @@ def run_backtest(
                 fx_apply_to=fx_apply_to,
             )
 
+            # TP1 / BE / trailing management — MUST run BEFORE _calc_exit
+            # so that stop is updated (BE / trailing) before the exit check.
+            _tp1_hit, _be_moved = _manage_open_position(
+                position=_pos,
+                candle=candle,
+                candles_m5=candles_m5,
+                index=i,
+                spread=spread_now,
+                slippage=slippage_now,
+                fx_converter=fx_converter,
+                instrument_currency=instrument_currency,
+                account_currency=account_currency,
+                fx_apply_to=fx_apply_to,
+            )
+            if _tp1_hit:
+                count_tp1_hits += 1
+            if _be_moved:
+                count_be_moves += 1
+
             should_close, exit_price, reason = _calc_exit(
-                open_pos,
+                _pos,
                 candle,
                 assumed_spread=spread_now,
                 slippage=slippage_now,
             )
             if should_close:
-                close_size = float(open_pos.size)
-                open_pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
-                open_pos.slippage_cost_total += abs(float(slippage_now)) * close_size
-                if open_pos.side == "LONG":
-                    remaining_pnl_instr = (exit_price - open_pos.entry) * close_size
+                close_size = float(_pos.size)
+                _pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
+                _pos.slippage_cost_total += abs(float(slippage_now)) * close_size
+                if _pos.side == "LONG":
+                    remaining_pnl_instr = (exit_price - _pos.entry) * close_size
                 else:
-                    remaining_pnl_instr = (open_pos.entry - exit_price) * close_size
+                    remaining_pnl_instr = (_pos.entry - exit_price) * close_size
                 remaining_pnl, close_fx_cost = _convert_cash_to_account(
                     amount=remaining_pnl_instr,
                     category="pnl",
@@ -3485,49 +4111,107 @@ def run_backtest(
                     account_currency=account_currency,
                     fx_apply_to=fx_apply_to,
                 )
-                open_pos.fx_conversion_total += close_fx_cost
-                open_pos.fx_cost_total += close_fx_cost
-                total_pnl = open_pos.realized_partial + remaining_pnl
-                equity += total_pnl
-                daily_pnl[day_key] += total_pnl
-                r_denom = risk_engine.per_trade_risk_amount(equity=equity)
-                r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
-                fees_total = open_pos.swap_total + open_pos.fx_conversion_total
+                _pos.fx_conversion_total += close_fx_cost
+                _pos.fx_cost_total += close_fx_cost
+                total_pnl = _pos.realized_partial + remaining_pnl
+                _pnl_g, _pnl_n, _fees, _pnl_eq = _compute_trade_pnl_fields(
+                    total_pnl=total_pnl,
+                    swap_total=_pos.swap_total,
+                    swap_cost_total=_pos.swap_cost_total,
+                    spread_cost=_pos.spread_cost_total,
+                    slippage_cost=_pos.slippage_cost_total,
+                    commission_cost=_pos.commission_total,
+                    fx_cost=_pos.fx_cost_total,
+                )
+                _eq_before = equity
+                equity += _pnl_eq
+                daily_pnl[day_key] += _pnl_eq
+                if risk_budget_inst.enabled:
+                    risk_budget_inst.record_trade_pnl(_pnl_eq)
+                r_mult = _trade_r_multiple(
+                    total_pnl=total_pnl,
+                    position=_pos,
+                    fx_converter=fx_converter,
+                    instrument_currency=instrument_currency,
+                    account_currency=account_currency,
+                    fx_apply_to=fx_apply_to,
+                )
                 trades.append(
                     BacktestTrade(
                         epic=asset.epic,
-                        side=open_pos.side,
-                        entry_time=open_pos.opened_at,
+                        side=_pos.side,
+                        entry_time=_pos.opened_at,
                         exit_time=candle.timestamp,
-                        entry_price=open_pos.entry,
+                        entry_price=_pos.entry,
                         exit_price=exit_price,
-                        size=open_pos.size,
+                        size=_pos.size,
                         pnl=total_pnl,
-                        fees=fees_total,
+                        fees=_fees,
                         r_multiple=r_mult,
                         reason=reason,
-                        score=open_pos.score,
-                        reason_open=open_pos.reason_open,
+                        score=_pos.score,
+                        reason_open=_pos.reason_open,
                         reason_close=reason,
-                        gate_bias=open_pos.gate_bias,
-                        spread_cost=open_pos.spread_cost_total,
-                        slippage_cost=open_pos.slippage_cost_total,
-                        commission_cost=open_pos.commission_total,
-                        swap_cost=open_pos.swap_cost_total,
-                        fx_cost=open_pos.fx_cost_total,
+                        gate_bias=_pos.gate_bias,
+                        spread_cost=_pos.spread_cost_total,
+                        slippage_cost=_pos.slippage_cost_total,
+                        commission_cost=_pos.commission_total,
+                        swap_cost=_pos.swap_cost_total,
+                        fx_cost=_pos.fx_cost_total,
+                        pnl_gross=_pnl_g,
+                        pnl_net=_pnl_n,
+                        equity_before=_eq_before,
+                        equity_after=equity,
+                        margin_capped=_pos.margin_capped,
                     )
                 )
-                open_pos = None
-                peak_equity = max(peak_equity, equity)
-                drawdown = peak_equity - equity
-                max_drawdown = max(max_drawdown, drawdown)
+                funnel.trades_closed += 1
+                _pos_remove.append(_pi)
+                continue
+        for _ri in reversed(_pos_remove):
+            open_positions.pop(_ri)
+        peak_equity = max(peak_equity, equity)
+        drawdown = peak_equity - equity
+        max_drawdown = max(max_drawdown, drawdown)
+        funnel.sample_concurrent(len(open_positions))
 
-        if open_pos is not None or pending is not None:
+        # ---- check entry slots ----
+        _n_active = len(open_positions) + len(pending_orders)
+        if _n_active >= max_local_positions:
+            continue
+        # second-position rule: only allow 2nd pos if first is at BE or >= 0.7R
+        if open_positions:
+            _first = open_positions[0]
+            _first_at_be = _first.be_moved
+            _first_r = 0.0
+            if _first.initial_risk > 0:
+                if _first.side == "LONG":
+                    _first_r = (candle.close - _first.entry) / _first.initial_risk
+                else:
+                    _first_r = (_first.entry - candle.close) / _first.initial_risk
+            _second_ok = _first_at_be or _first_r >= config.correlation_v2.allow_second_same_symbol_only_if.or_profit_r_greater_equal
+            if not _second_ok:
+                funnel.record_block("SECOND_POS_RULE_BLOCKED")
+                continue
+
+        risk_budget_inst.reset_day(day_key)
+        if risk_budget_inst.is_killed:
+            funnel.record_block("KILL_SWITCH_DAILY_LOSS")
             continue
 
         if daily_trades[day_key] >= risk_engine.effective_max_trades_per_day(equity=equity):
+            funnel.record_block("RISK_MAX_TRADES_DAY")
             continue
         if risk_engine.should_turn_off_for_day(daily_pnl[day_key], equity=equity):
+            funnel.record_block("RISK_DAILY_STOP")
+            continue
+        if bool(config.backtest_tuning.no_overnight) and in_rollover_entry_block_window(
+            ts=candle.timestamp,
+            swap_hour=swap_hour,
+            swap_minute=swap_minute,
+            cfg=config.backtest_tuning,
+        ):
+            rejected_by_reason[RejectReason.SESSION_BLOCK.value] += 1
             continue
 
         t = candle.timestamp
@@ -3620,12 +4304,58 @@ def run_backtest(
         )
         signal.take_profit = normalized_tp
 
+        spread_limit_points = config.backtest_tuning.spread_limit_points
+        if spread_limit_points is not None and spread_points_now > float(spread_limit_points):
+            rejected_by_reason[RejectReason.SPREAD_TOO_WIDE.value] += 1
+            continue
+
+        expected_move_points = abs(
+            price_to_points(
+                float(signal.take_profit) - float(signal.entry_price),
+                point_size=float(asset.point_size),
+            )
+        )
+        if expected_move_too_small(
+            expected_move_points=expected_move_points,
+            spread_points=spread_points_now,
+            min_edge_to_cost_ratio=float(config.backtest_tuning.min_edge_to_cost_ratio),
+        ):
+            rejected_by_reason[RejectReason.EDGE_TOO_SMALL.value] += 1
+            continue
+
+        funnel.signal_candidates += 1
+        # ---- tier-based size scaling ----
+        _signal_score = float(getattr(signal, 'score', 0) or 0)
+        _tier = resolve_tier_from_config(_signal_score, config.score_tiers)
+        if _tier.name == "OBSERVE" and config.score_tiers.enabled:
+            funnel.record_block("TIER_OBSERVE")
+            continue
+        _tier_mult = max(0.01, _tier.size_mult)
         effective_risk_per_trade = risk_engine.effective_risk_per_trade(
-            risk_multiplier=1.0,
+            risk_multiplier=_tier_mult,
             equity=equity,
         )
-        max_risk_cash = float(equity) * float(effective_risk_per_trade)
-        raw_size = max_risk_cash / risk_dist if risk_dist > 0 else 0.0
+        risk_cash_plan = compute_risk_cash_plan(
+            risk=config.risk,
+            equity=equity,
+            effective_risk_per_trade=effective_risk_per_trade,
+        )
+        max_risk_cash = float(risk_cash_plan.max_risk_cash)
+        raw_size = float(risk_cash_plan.target_risk_cash) / risk_dist if risk_dist > 0 else 0.0
+        # ---- risk budget gate ----
+        _open_risk = sum(abs(p.entry - p.initial_stop) * p.size for p in open_positions)
+        _new_risk = risk_dist * raw_size
+        _budget_check = risk_budget_inst.check_can_open(
+            equity=equity,
+            new_trade_risk=_new_risk,
+            open_positions_risk=_open_risk,
+        )
+        if not _budget_check.allowed:
+            for _br in _budget_check.reasons:
+                funnel.record_block(_br)
+            funnel.blocked_by_risk_budget += 1
+            continue
+        funnel.proposals_created += 1
         feasibility = validate_order(
             raw_size=raw_size,
             entry_price=float(signal.entry_price),
@@ -3635,26 +4365,31 @@ def run_backtest(
             size_step=float(asset.size_step),
             max_risk_cash=max_risk_cash,
             equity=float(equity),
-            open_positions_count=0,
-            max_positions=int(config.risk.max_positions),
-            spread=float(spread_now),
-            spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+            open_positions_count=len(open_positions),
+            max_positions=max_local_positions,
+            spread=float(spread_points_now),
+            spread_limit=(float(spread_limit_points) if spread_limit_points is not None else None),
             min_stop_distance=float(asset.minimal_tick_buffer),
             free_margin=float(equity),
             margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
             max_leverage=float(config.backtest_tuning.broker_leverage),
             margin_safety_factor=1.0,
+            allow_min_size_override_if_within_risk=bool(config.risk.allow_min_size_override_if_within_risk),
         )
         if not feasibility.ok:
             reject = feasibility.reason.value if feasibility.reason is not None else "UNKNOWN_REJECT"
             rejected_by_reason[reject] += 1
             continue
         size = float(feasibility.details.get("rounded_size", 0.0))
+        if bool(feasibility.details.get("min_size_override_used", False)):
+            min_size_overrides_count += 1
+        if bool(feasibility.details.get("margin_capped", False)):
+            margin_capped_count += 1
         if size <= 0:
             rejected_by_reason[RejectReason.SIZE_TOO_SMALL.value] += 1
             continue
 
-        pending = _PendingOrder(
+        pending_orders.append(_PendingOrder(
             side=signal.side,
             entry=signal.entry_price,
             stop=signal.stop_price,
@@ -3663,10 +4398,12 @@ def run_backtest(
             expiry_index=i + config.execution.limit_ttl_bars,
             created_at=t,
             reason_open=",".join(decision.reason_codes) if decision.reason_codes else "SIGNAL",
-            score=None,
+            score=_signal_score if _signal_score else None,
             gate_bias=(str(gate_result.bias).upper() if gate_result is not None else None),
-        )
+            margin_capped=bool(feasibility.details.get("margin_capped", False)),
+        ))
         orders_submitted += 1
+        funnel.orders_placed += 1
         daily_trades[day_key] += 1
 
     wins = sum(1 for trade in trades if trade.pnl > 0)
@@ -3684,6 +4421,7 @@ def run_backtest(
     commission_cost_sum = sum(float(trade.commission_cost) for trade in trades)
     swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
     fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
+    avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
 
     return BacktestReport(
         epic=asset.epic,
@@ -3725,13 +4463,27 @@ def run_backtest(
         commission_cost_sum=commission_cost_sum,
         swap_cost_sum=swap_cost_sum,
         fx_cost_sum=fx_cost_sum,
-        total_pnl_net=total_pnl,
+        total_pnl_net=sum(float(t.pnl_net) for t in trades) if trades else total_pnl,
+        total_pnl_gross=sum(float(t.pnl_gross) for t in trades) if trades else total_pnl,
         expectancy_net=expectancy,
         profit_factor_net=profit_factor,
         max_drawdown_net=max_drawdown,
         account_currency=account_currency,
         instrument_currency=instrument_currency,
         fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
+        avg_spread_points=avg_spread_points,
+        median_spread_points=median_spread_points,
+        p90_spread_points=p90_spread_points,
+        forced_closes_count=forced_closes_count,
+        min_size_overrides_count=min_size_overrides_count,
+        margin_capped_count=margin_capped_count,
+        decision_funnel=funnel.to_dict(
+            total_pnl=total_pnl,
+            expectancy=expectancy,
+            max_drawdown=max_drawdown,
+            avg_r=avg_r,
+            win_rate=win_rate,
+        ),
     )
 
 

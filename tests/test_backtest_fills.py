@@ -46,7 +46,7 @@ def _no_signal() -> StrategyDecision:
     )
 
 
-def test_fill_rules_use_ask_for_long_entry_and_bid_for_long_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fill_rules_long_entry_at_limit_price_and_tp_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     candles = _base_candles()
     entry_idx = 701
     exit_idx = 702
@@ -114,11 +114,13 @@ def test_fill_rules_use_ask_for_long_entry_and_bid_for_long_exit(monkeypatch: py
     assert report.trades == 1
     trade = report.trade_log[0]
     assert trade.side == "LONG"
-    assert trade.entry_price == pytest.approx(100.2, rel=0.0, abs=1e-9)
-    assert trade.exit_price == pytest.approx(102.8, rel=0.0, abs=1e-9)
+    # Entry: limit price (100.0) + half spread (0.1) = 100.1
+    assert trade.entry_price == pytest.approx(100.1, rel=0.0, abs=1e-9)
+    # TP exit fills at position.tp (limit order), not candle.bid
+    assert trade.exit_price == pytest.approx(102.0, rel=0.0, abs=1e-9)
 
 
-def test_fill_rules_use_bid_for_short_entry_and_ask_for_short_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fill_rules_short_entry_at_limit_price_and_tp_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     candles = _base_candles()
     entry_idx = 701
     exit_idx = 702
@@ -184,5 +186,7 @@ def test_fill_rules_use_bid_for_short_entry_and_ask_for_short_exit(monkeypatch: 
     assert report.trades == 1
     trade = report.trade_log[0]
     assert trade.side == "SHORT"
-    assert trade.entry_price == pytest.approx(100.0, rel=0.0, abs=1e-9)
-    assert trade.exit_price == pytest.approx(97.4, rel=0.0, abs=1e-9)
+    # Entry: limit price (100.0) - half spread (0.1) = 99.9
+    assert trade.entry_price == pytest.approx(99.9, rel=0.0, abs=1e-9)
+    # TP exit fills at position.tp (limit order), not candle.ask
+    assert trade.exit_price == pytest.approx(98.0, rel=0.0, abs=1e-9)

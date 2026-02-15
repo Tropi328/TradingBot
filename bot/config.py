@@ -86,6 +86,13 @@ class SpreadFilterConfig(BaseModel):
     max_multiple_of_median: float = 2.0
 
 
+class SpreadGuardGateConfig(BaseModel):
+    enabled: bool = False
+    spread_cost_max: float = 0.0
+    percentile_limit: float = 0.0
+    window: int = 100
+
+
 class NewsGateConfig(BaseModel):
     block_minutes: int = 60
 
@@ -157,6 +164,13 @@ class CorrelationGroupConfig(BaseModel):
 class RiskConfig(BaseModel):
     equity: float = 10000
     risk_per_trade: float = 0.005
+    risk_mode: str = "percent"
+    sizing_mode: str = "risk_pct_equity"
+    fixed_qty: float = 0.0
+    fixed_notional: float = 0.0
+    min_risk_cash_per_trade: float = 0.0
+    max_risk_cash_per_trade: float | None = None
+    allow_min_size_override_if_within_risk: bool = False
     max_trades_per_day: int = 3
     daily_stop_pct: float = 0.015
     max_positions: int = 1
@@ -188,6 +202,19 @@ class RiskConfig(BaseModel):
             raise ValueError("risk_per_trade must be > 0")
         if self.risk_per_trade > 1.0:
             raise ValueError("risk_per_trade cannot exceed 1.0 (100.0%)")
+        mode = str(self.risk_mode or "percent").strip().lower()
+        if mode not in {"percent", "cash"}:
+            raise ValueError("risk_mode must be one of: percent, cash")
+        self.risk_mode = mode
+        if float(self.min_risk_cash_per_trade) < 0:
+            raise ValueError("min_risk_cash_per_trade must be >= 0")
+        if self.max_risk_cash_per_trade is not None and float(self.max_risk_cash_per_trade) <= 0:
+            raise ValueError("max_risk_cash_per_trade must be > 0 when provided")
+        if (
+            self.max_risk_cash_per_trade is not None
+            and float(self.min_risk_cash_per_trade) > float(self.max_risk_cash_per_trade)
+        ):
+            raise ValueError("min_risk_cash_per_trade cannot exceed max_risk_cash_per_trade")
         if self.max_total_risk_pct <= 0:
             raise ValueError("max_total_risk_pct must be > 0")
         if self.global_max_positions <= 0:
@@ -342,6 +369,109 @@ class PortfolioSupervisorConfig(BaseModel):
         return self
 
 
+# ---------------------------------------------------------------------------
+# Risk-budget (master safety layer)
+# ---------------------------------------------------------------------------
+class RiskBudgetConfig(BaseModel):
+    enabled: bool = False
+    risk_per_trade_pct: float = 0.0035
+    max_open_risk_pct: float = 0.02
+    daily_loss_limit_pct: float = 0.025
+    daily_profit_lock_pct: float = 0.0
+
+    @model_validator(mode="after")
+    def validate_values(self) -> "RiskBudgetConfig":
+        if not (0 < self.risk_per_trade_pct <= 0.05):
+            raise ValueError("risk_per_trade_pct must be in (0, 0.05]")
+        if not (0 < self.max_open_risk_pct <= 0.10):
+            raise ValueError("max_open_risk_pct must be in (0, 0.10]")
+        if not (0 < self.daily_loss_limit_pct <= 0.10):
+            raise ValueError("daily_loss_limit_pct must be in (0, 0.10]")
+        if self.daily_profit_lock_pct < 0:
+            raise ValueError("daily_profit_lock_pct must be >= 0")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Score tiers
+# ---------------------------------------------------------------------------
+class ScoreTierEntry(BaseModel):
+    min_score: float = 62.0
+    size_mult: float = 1.0
+    allow_market_after_ttl: bool = False
+
+
+class ScoreTiersConfig(BaseModel):
+    enabled: bool = False
+    A_plus: ScoreTierEntry = Field(
+        default_factory=lambda: ScoreTierEntry(min_score=72.0, size_mult=1.0, allow_market_after_ttl=True)
+    )
+    A: ScoreTierEntry = Field(
+        default_factory=lambda: ScoreTierEntry(min_score=68.0, size_mult=0.8)
+    )
+    B: ScoreTierEntry = Field(
+        default_factory=lambda: ScoreTierEntry(min_score=62.0, size_mult=0.6)
+    )
+
+
+# ---------------------------------------------------------------------------
+# FVG entry ladder
+# ---------------------------------------------------------------------------
+class LadderLevelConfig(BaseModel):
+    name: str = "mid"
+    fvg_fraction: float = 0.50
+    size_fraction: float = 0.70
+
+
+class MarketFallbackConfig(BaseModel):
+    enabled: bool = True
+    only_tiers: list[str] = Field(default_factory=lambda: ["A_plus"])
+    size_mult: float = 0.5
+
+
+class FvgEntryLadderConfig(BaseModel):
+    enabled: bool = False
+    levels: list[LadderLevelConfig] = Field(
+        default_factory=lambda: [
+            LadderLevelConfig(name="mid", fvg_fraction=0.50, size_fraction=0.70),
+            LadderLevelConfig(name="shallow", fvg_fraction=0.35, size_fraction=0.30),
+        ]
+    )
+    ttl_bars_5m: int = 8
+    market_fallback: MarketFallbackConfig = Field(default_factory=MarketFallbackConfig)
+
+
+# ---------------------------------------------------------------------------
+# Exits (partial TP)
+# ---------------------------------------------------------------------------
+class PartialTpConfig(BaseModel):
+    enabled: bool = True
+    at_r: float = 1.0
+    close_fraction: float = 0.5
+    move_sl_to_be: bool = True
+    be_buffer_r: float = 0.1
+
+
+class ExitsConfig(BaseModel):
+    base_rr: float = 2.0
+    partial_tp: PartialTpConfig = Field(default_factory=PartialTpConfig)
+
+
+# ---------------------------------------------------------------------------
+# Second-position correlation rule
+# ---------------------------------------------------------------------------
+class SecondPositionRuleConfig(BaseModel):
+    first_position_sl_at_be: bool = True
+    or_profit_r_greater_equal: float = 0.7
+
+
+class CorrelationV2Config(BaseModel):
+    max_positions_per_group: int = 1
+    allow_second_same_symbol_only_if: SecondPositionRuleConfig = Field(
+        default_factory=SecondPositionRuleConfig
+    )
+
+
 class DecisionPolicyConfig(BaseModel):
     trade_score_threshold: float = 65.0
     small_score_min: float = 60.0
@@ -360,6 +490,24 @@ class DecisionPolicyConfig(BaseModel):
         if not (0 < self.small_risk_multiplier_default <= 1.0):
             raise ValueError("small_risk_multiplier_default must be in (0,1]")
         return self
+
+
+class ScoreV3ConfigModel(BaseModel):
+    """Configuration for ScoreV3 scoring system."""
+    enabled: bool = False
+    mode: str = "heuristic"            # "heuristic" or "ml"
+    model_path: str = ""
+    trade_threshold: float = 55.0
+    small_min: float = 45.0
+    small_max: float = 54.99
+    tier_enabled: bool = True
+    tier_a_plus_pct: float = 0.10
+    tier_a_pct: float = 0.25
+    tier_b_pct: float = 0.30
+    shadow_enabled: bool = True
+    shadow_output_path: str = "reports/shadow_observe.jsonl"
+    shadow_simulate_outcomes: bool = True
+    fill_prob_weight: float = 0.3
 
 
 class BacktestTuningConfig(BaseModel):
@@ -408,6 +556,12 @@ class BacktestTuningConfig(BaseModel):
     overnight_swap_time_utc: str = "23:00"
     overnight_swap_long_pct: float = -0.016
     overnight_swap_short_pct: float = 0.0076
+    spread_limit_points: float | None = None
+    no_overnight: bool = False
+    rollover_block_minutes_before: int = 30
+    rollover_block_minutes_after: int = 30
+    force_close_before_rollover_minutes: int = 15
+    min_edge_to_cost_ratio: float = 4.0
     fx_conversion_pct: float = 0.0
 
     @model_validator(mode="after")
@@ -472,6 +626,16 @@ class BacktestTuningConfig(BaseModel):
             raise ValueError("broker_leverage must be > 0")
         if not (0 < self.broker_margin_requirement_pct <= 100):
             raise ValueError("broker_margin_requirement_pct must be in (0,100]")
+        if self.spread_limit_points is not None and float(self.spread_limit_points) <= 0:
+            raise ValueError("spread_limit_points must be > 0 when provided")
+        if self.rollover_block_minutes_before < 0:
+            raise ValueError("rollover_block_minutes_before must be >= 0")
+        if self.rollover_block_minutes_after < 0:
+            raise ValueError("rollover_block_minutes_after must be >= 0")
+        if self.force_close_before_rollover_minutes < 0:
+            raise ValueError("force_close_before_rollover_minutes must be >= 0")
+        if self.min_edge_to_cost_ratio <= 0:
+            raise ValueError("min_edge_to_cost_ratio must be > 0")
         if not (0 <= self.fx_conversion_pct <= 100):
             raise ValueError("fx_conversion_pct must be in [0,100]")
         time_raw = str(self.overnight_swap_time_utc).strip()
@@ -575,6 +739,7 @@ class AppConfig(BaseModel):
     displacement: DisplacementConfig = Field(default_factory=DisplacementConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     spread_filter: SpreadFilterConfig = Field(default_factory=SpreadFilterConfig)
+    spread_guard: SpreadGuardGateConfig = Field(default_factory=SpreadGuardGateConfig)
     news_gate: NewsGateConfig = Field(default_factory=NewsGateConfig)
     daily_gate: DailyGateConfig = Field(default_factory=DailyGateConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
@@ -589,6 +754,12 @@ class AppConfig(BaseModel):
     decision_policy: DecisionPolicyConfig = Field(default_factory=DecisionPolicyConfig)
     backtest_tuning: BacktestTuningConfig = Field(default_factory=BacktestTuningConfig)
     orderflow: OrderflowConfig = Field(default_factory=OrderflowConfig)
+    risk_budget: RiskBudgetConfig = Field(default_factory=RiskBudgetConfig)
+    score_tiers: ScoreTiersConfig = Field(default_factory=ScoreTiersConfig)
+    score_v3: ScoreV3ConfigModel = Field(default_factory=ScoreV3ConfigModel)
+    fvg_entry_ladder: FvgEntryLadderConfig = Field(default_factory=FvgEntryLadderConfig)
+    exits: ExitsConfig = Field(default_factory=ExitsConfig)
+    correlation_v2: CorrelationV2Config = Field(default_factory=CorrelationV2Config)
 
     @model_validator(mode="after")
     def normalize_assets(self) -> "AppConfig":
