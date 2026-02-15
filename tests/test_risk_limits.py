@@ -181,3 +181,47 @@ def test_cooldown_blocks_new_trade() -> None:
     )
     assert result.allowed is False
     assert "COOLDOWN_ACTIVE" in result.reason_codes
+
+
+def test_low_equity_risk_is_capped() -> None:
+    cfg = RiskConfig(
+        equity=100.0,
+        risk_per_trade=1.0,
+        low_equity_mode_enabled=True,
+        low_equity_threshold=250.0,
+        low_equity_risk_multiplier=0.35,
+        low_equity_risk_per_trade_cap=0.02,
+    )
+    engine = RiskEngine(cfg)
+    effective = engine.effective_risk_per_trade(equity=100.0)
+    assert effective == 0.02
+
+
+def test_position_size_min_size_fallback_for_low_equity() -> None:
+    size = position_size_from_risk(
+        equity=100.0,
+        risk_per_trade=0.0001,  # too small to reach min size directly
+        entry_price=2000.0,
+        stop_price=1995.0,  # risk distance 5.0
+        min_size=0.01,
+        size_step=0.01,
+        allow_min_size_fallback=True,
+        min_size_fallback_max_risk_pct=0.02,
+    )
+    assert size == 0.01
+
+
+def test_low_equity_max_trades_limit_applied() -> None:
+    cfg = RiskConfig(
+        equity=100.0,
+        risk_per_trade=0.01,
+        max_trades_per_day=10,
+        low_equity_mode_enabled=True,
+        low_equity_threshold=250.0,
+        low_equity_max_trades_per_day=2,
+    )
+    engine = RiskEngine(cfg)
+    stats = DailyStats(trading_day="2026-01-01", pnl=0.0, trades_count=2, status="ON")
+    result = engine.can_open_new_trade(stats, open_positions_count=0, equity=100.0)
+    assert result.allowed is False
+    assert "MAX_TRADES_REACHED" in result.reason_codes

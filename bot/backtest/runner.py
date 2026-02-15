@@ -103,6 +103,7 @@ class BacktestRunner:
         return AssetConfig(
             epic=symbol,
             currency=template.currency,
+            instrument_currency=template.instrument_currency,
             point_size=template.point_size,
             minimal_tick_buffer=template.minimal_tick_buffer,
             min_size=template.min_size,

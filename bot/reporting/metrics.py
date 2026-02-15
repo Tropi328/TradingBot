@@ -56,6 +56,11 @@ def compute_drawdown_series(equity: Sequence[Mapping[str, Any]]) -> list[dict[st
 
 def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     pnl_values = [_as_float(trade.get("pnl")) for trade in trades]
+    spread_cost_sum = sum(_as_float(trade.get("spread_cost")) for trade in trades)
+    slippage_cost_sum = sum(_as_float(trade.get("slippage_cost")) for trade in trades)
+    commission_cost_sum = sum(_as_float(trade.get("commission_cost")) for trade in trades)
+    swap_cost_sum = sum(_as_float(trade.get("swap_cost")) for trade in trades)
+    fx_cost_sum = sum(_as_float(trade.get("fx_cost")) for trade in trades)
     trades_count = len(pnl_values)
     wins = sum(1 for pnl in pnl_values if pnl > 0)
     losses = sum(1 for pnl in pnl_values if pnl < 0)
@@ -102,6 +107,11 @@ def compute_metrics(trades: Sequence[Mapping[str, Any]], equity: Sequence[Mappin
         "avg_loss": avg_loss,
         "payoff_ratio": payoff_ratio,
         "profit_factor": profit_factor,
+        "spread_cost_sum": spread_cost_sum,
+        "slippage_cost_sum": slippage_cost_sum,
+        "commission_cost_sum": commission_cost_sum,
+        "swap_cost_sum": swap_cost_sum,
+        "fx_cost_sum": fx_cost_sum,
         "largest_win": max(pnl_values, default=0.0),
         "largest_loss": min(pnl_values, default=0.0),
         "max_consecutive_wins": max_consecutive_wins,

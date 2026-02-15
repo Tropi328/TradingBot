@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 import csv
 import json
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from bot.config import AppConfig, AssetConfig
 from bot.data.candles import Candle
-from bot.execution.sizing import position_size_from_risk
+from bot.execution.feasibility import RejectReason, validate_order
+from bot.execution.fx import FxConverter
+from bot.gating.daily_gate import DailyGateProvider
 from bot.strategy.candidate_queue import CandidateQueue
 from bot.strategy.contracts import (
     BiasState,
@@ -55,6 +57,12 @@ class BacktestTrade:
     forced_exit: bool = False
     reason_open: str = "LIMIT_ENTRY"
     reason_close: str = ""
+    gate_bias: str | None = None
+    spread_cost: float = 0.0
+    slippage_cost: float = 0.0
+    commission_cost: float = 0.0
+    swap_cost: float = 0.0
+    fx_cost: float = 0.0
 
 
 @dataclass(slots=True)
@@ -94,6 +102,28 @@ class BacktestReport:
     spread_mode: str = "REAL_BIDASK"
     assumed_spread_used: float = 0.0
     spread_gate_adjustments: dict[str, int] = field(default_factory=dict)
+    fx_conversion_pct_used: float = 0.0
+    daily_gate_mode: str = "off"
+    daily_gate_bias_bars: dict[str, int] = field(default_factory=dict)
+    daily_gate_bias_days: dict[str, int] = field(default_factory=dict)
+    blocked_by_gate: int = 0
+    blocked_by_gate_reasons: dict[str, int] = field(default_factory=dict)
+    per_bias_trade_metrics: dict[str, dict[str, float]] = field(default_factory=dict)
+    orders_submitted: int = 0
+    trades_filled: int = 0
+    rejected_by_reason: dict[str, int] = field(default_factory=dict)
+    spread_cost_sum: float = 0.0
+    slippage_cost_sum: float = 0.0
+    commission_cost_sum: float = 0.0
+    swap_cost_sum: float = 0.0
+    fx_cost_sum: float = 0.0
+    total_pnl_net: float = 0.0
+    expectancy_net: float = 0.0
+    profit_factor_net: float = 0.0
+    max_drawdown_net: float = 0.0
+    account_currency: str = "USD"
+    instrument_currency: str = "USD"
+    fx_conversion_fee_rate_used: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +161,28 @@ class BacktestReport:
             "spread_mode": self.spread_mode,
             "assumed_spread_used": self.assumed_spread_used,
             "spread_gate_adjustments": self.spread_gate_adjustments,
+            "fx_conversion_pct_used": self.fx_conversion_pct_used,
+            "daily_gate_mode": self.daily_gate_mode,
+            "daily_gate_bias_bars": self.daily_gate_bias_bars,
+            "daily_gate_bias_days": self.daily_gate_bias_days,
+            "blocked_by_gate": self.blocked_by_gate,
+            "blocked_by_gate_reasons": self.blocked_by_gate_reasons,
+            "per_bias_trade_metrics": self.per_bias_trade_metrics,
+            "orders_submitted": self.orders_submitted,
+            "trades_filled": self.trades_filled,
+            "rejected_by_reason": self.rejected_by_reason,
+            "spread_cost_sum": self.spread_cost_sum,
+            "slippage_cost_sum": self.slippage_cost_sum,
+            "commission_cost_sum": self.commission_cost_sum,
+            "swap_cost_sum": self.swap_cost_sum,
+            "fx_cost_sum": self.fx_cost_sum,
+            "total_pnl_net": self.total_pnl_net or self.total_pnl,
+            "expectancy_net": self.expectancy_net or self.expectancy,
+            "profit_factor_net": self.profit_factor_net or self.profit_factor,
+            "max_drawdown_net": self.max_drawdown_net or self.max_drawdown,
+            "account_currency": self.account_currency,
+            "instrument_currency": self.instrument_currency,
+            "fx_conversion_fee_rate_used": self.fx_conversion_fee_rate_used,
         }
 
 
@@ -159,6 +211,7 @@ class _PendingOrder:
     created_at: datetime
     reason_open: str = "SIGNAL"
     score: float | None = None
+    gate_bias: str | None = None
 
 
 @dataclass(slots=True)
@@ -184,9 +237,16 @@ class _OpenPosition:
     tp1_hit_index: int | None = None
     realized_partial: float = 0.0
     swap_total: float = 0.0
+    fx_conversion_total: float = 0.0
+    spread_cost_total: float = 0.0
+    slippage_cost_total: float = 0.0
+    commission_total: float = 0.0
+    swap_cost_total: float = 0.0
+    fx_cost_total: float = 0.0
     next_swap_ts: datetime | None = None
     reason_open: str = "SIGNAL"
     score: float | None = None
+    gate_bias: str | None = None
 
 
 @dataclass(slots=True)
@@ -557,6 +617,27 @@ def _next_rollover_timestamp(ts: datetime, *, hour: int, minute: int) -> datetim
     return rollover
 
 
+def _convert_cash_to_account(
+    *,
+    amount: float,
+    category: str,
+    fx_converter: FxConverter | None,
+    instrument_currency: str,
+    account_currency: str,
+    fx_apply_to: set[str],
+) -> tuple[float, float]:
+    if fx_converter is None or str(instrument_currency).upper() == str(account_currency).upper():
+        return float(amount), 0.0
+    apply_fee = str(category).strip().lower() in fx_apply_to
+    converted = fx_converter.convert(
+        amount=float(amount),
+        from_currency=instrument_currency,
+        to_currency=account_currency,
+        apply_fee=apply_fee,
+    )
+    return float(converted.converted_amount), float(converted.fx_cost)
+
+
 def _apply_overnight_swap_if_due(
     *,
     position: _OpenPosition,
@@ -565,6 +646,10 @@ def _apply_overnight_swap_if_due(
     swap_minute: int,
     long_swap_pct: float,
     short_swap_pct: float,
+    fx_converter: FxConverter | None = None,
+    instrument_currency: str = "USD",
+    account_currency: str = "USD",
+    fx_apply_to: set[str] | None = None,
 ) -> float:
     if position.next_swap_ts is None:
         position.next_swap_ts = _next_rollover_timestamp(candle_ts, hour=swap_hour, minute=swap_minute)
@@ -574,10 +659,22 @@ def _apply_overnight_swap_if_due(
     applied = 0.0
     while ts_utc >= position.next_swap_ts:
         rate_pct = float(long_swap_pct) if position.side == "LONG" else float(short_swap_pct)
-        fee = float(position.entry) * float(position.size) * (rate_pct / 100.0)
-        position.realized_partial += fee
-        position.swap_total += fee
-        applied += fee
+        swap_instr = float(position.entry) * float(position.size) * (rate_pct / 100.0)
+        fx_apply = fx_apply_to or {"pnl", "swap", "commission"}
+        swap_account, swap_fx_cost = _convert_cash_to_account(
+            amount=swap_instr,
+            category="swap",
+            fx_converter=fx_converter,
+            instrument_currency=instrument_currency,
+            account_currency=account_currency,
+            fx_apply_to=fx_apply,
+        )
+        position.realized_partial += swap_account
+        position.swap_total += swap_account
+        position.swap_cost_total += -swap_account
+        position.fx_conversion_total += swap_fx_cost
+        position.fx_cost_total += swap_fx_cost
+        applied += swap_account
         position.next_swap_ts = position.next_swap_ts + timedelta(days=1)
     return applied
 
@@ -1542,19 +1639,21 @@ def _append_live_placeholder(candles: list[Candle], timeframe_minutes: int) -> l
     if not candles:
         return []
     last = candles[-1]
+    return candles + [_live_placeholder_from(last, timeframe_minutes)]
+
+
+def _live_placeholder_from(last: Candle, timeframe_minutes: int) -> Candle:
     live_ts = datetime.fromtimestamp(last.timestamp.timestamp() + (timeframe_minutes * 60), tz=timezone.utc)
-    return candles + [
-        Candle(
-            timestamp=live_ts,
-            open=last.close,
-            high=last.close,
-            low=last.close,
-            close=last.close,
-            bid=last.bid,
-            ask=last.ask,
-            volume=0.0,
-        )
-    ]
+    return Candle(
+        timestamp=live_ts,
+        open=last.close,
+        high=last.close,
+        low=last.close,
+        close=last.close,
+        bid=last.bid,
+        ask=last.ask,
+        volume=0.0,
+    )
 
 
 def _action_priority(action: DecisionAction) -> int:
@@ -1598,6 +1697,33 @@ def _exit_reason_distribution(trades: list[BacktestTrade]) -> dict[str, int]:
         reason = str(trade.reason_close or trade.reason or "UNKNOWN").upper()
         out[reason] += 1
     return dict(out)
+
+
+def _per_bias_trade_metrics(trades: list[BacktestTrade]) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[BacktestTrade]] = {"LONG": [], "SHORT": [], "FLAT": [], "UNKNOWN": []}
+    for trade in trades:
+        key = str(trade.gate_bias or "UNKNOWN").upper()
+        if key not in grouped:
+            key = "UNKNOWN"
+        grouped[key].append(trade)
+
+    out: dict[str, dict[str, float]] = {}
+    for key, bucket in grouped.items():
+        if not bucket:
+            continue
+        count = len(bucket)
+        wins = sum(1 for trade in bucket if float(trade.pnl) > 0)
+        total_pnl = sum(float(trade.pnl) for trade in bucket)
+        out[key] = {
+            "trades": float(count),
+            "wins": float(wins),
+            "losses": float(count - wins),
+            "win_rate": (wins / count) if count else 0.0,
+            "total_pnl": total_pnl,
+            "expectancy": (total_pnl / count) if count else 0.0,
+            "avg_r": (sum(float(trade.r_multiple) for trade in bucket) / count) if count else 0.0,
+        }
+    return out
 
 
 def _estimate_structure_target(
@@ -1692,7 +1818,12 @@ def _manage_open_position(
     candle: Candle,
     candles_m5: list[Candle],
     index: int,
+    spread: float = 0.0,
     slippage: float,
+    fx_converter: FxConverter | None = None,
+    instrument_currency: str = "USD",
+    account_currency: str = "USD",
+    fx_apply_to: set[str] | None = None,
 ) -> tuple[bool, bool]:
     risk_dist = max(0.0, float(position.initial_risk))
     if risk_dist <= 0:
@@ -1713,11 +1844,23 @@ def _manage_open_position(
             close_size = position.size * position.tp1_fraction
             close_size = max(0.0, min(position.size, close_size))
             if close_size > 0:
+                position.spread_cost_total += max(0.0, float(spread)) * 0.5 * close_size
+                position.slippage_cost_total += abs(float(slippage)) * close_size
                 if position.side == "LONG":
-                    partial_pnl = (partial_fill - position.entry) * close_size
+                    partial_pnl_instr = (partial_fill - position.entry) * close_size
                 else:
-                    partial_pnl = (position.entry - partial_fill) * close_size
+                    partial_pnl_instr = (position.entry - partial_fill) * close_size
+                partial_pnl, partial_fx_cost = _convert_cash_to_account(
+                    amount=partial_pnl_instr,
+                    category="pnl",
+                    fx_converter=fx_converter,
+                    instrument_currency=instrument_currency,
+                    account_currency=account_currency,
+                    fx_apply_to=(fx_apply_to or {"pnl", "swap", "commission"}),
+                )
                 position.realized_partial += partial_pnl
+                position.fx_conversion_total += partial_fx_cost
+                position.fx_cost_total += partial_fx_cost
                 position.size -= close_size
                 position.tp1_taken = True
                 position.tp1_hit_index = int(index)
@@ -1764,7 +1907,10 @@ def _gate_counts_from_blockers(blockers: Counter[str]) -> dict[str, int]:
     return {
         key: int(value)
         for key, value in blockers.items()
-        if key.startswith("GATE_") or key.startswith("EXEC_FAIL_") or key.startswith("PIPELINE_NOT_READY")
+        if key.startswith("GATE_")
+        or key.startswith("DAILY_GATE_")
+        or key.startswith("EXEC_FAIL_")
+        or key.startswith("PIPELINE_NOT_READY")
     }
 
 
@@ -1802,6 +1948,10 @@ def aggregate_backtest_reports(
             time_in_market_bars=0,
             equity_end=config.risk.equity,
             trade_log=[],
+            fx_conversion_pct_used=float(config.backtest_tuning.fx_conversion_pct),
+            account_currency=str(config.account_currency).upper(),
+            instrument_currency=str(asset.instrument_currency or asset.currency).upper(),
+            fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
         )
 
     all_trades = sorted(
@@ -1833,35 +1983,69 @@ def aggregate_backtest_reports(
     decision_counts: Counter[str] = Counter()
     blockers: Counter[str] = Counter()
     gate_blocks: Counter[str] = Counter()
+    gate_reason_blocks: Counter[str] = Counter()
     execution_fail: Counter[str] = Counter()
     missing_feature_counts: Counter[str] = Counter()
     timeout_resets: Counter[str] = Counter()
     score_bins: Counter[str] = Counter()
     spread_adjustments: Counter[str] = Counter()
+    gate_bias_bars: Counter[str] = Counter()
+    gate_bias_days: Counter[str] = Counter()
+    gate_modes: Counter[str] = Counter()
     spread_modes: set[str] = set()
     assumed_spread_values: list[float] = []
+    fx_conversion_pct_values: list[float] = []
     score_values: list[float] = []
     signal_candidates = 0
     time_in_market_bars = 0
     count_be_moves = 0
     count_tp1_hits = 0
+    blocked_by_gate = 0
+    orders_submitted = 0
+    trades_filled = 0
+    rejected_by_reason: Counter[str] = Counter()
+    spread_cost_sum = 0.0
+    slippage_cost_sum = 0.0
+    commission_cost_sum = 0.0
+    swap_cost_sum = 0.0
+    fx_cost_sum = 0.0
+    account_currencies: Counter[str] = Counter()
+    instrument_currencies: Counter[str] = Counter()
+    fx_fee_rate_values: list[float] = []
     for report in reports:
         decision_counts.update(report.decision_counts)
         blockers.update(report.top_blockers)
         gate_blocks.update(report.gate_block_counts)
+        gate_reason_blocks.update(report.blocked_by_gate_reasons)
         execution_fail.update(report.execution_fail_breakdown)
         missing_feature_counts.update(report.missing_feature_counts)
         timeout_resets.update(report.wait_timeout_resets)
         score_bins.update(report.score_bins)
         spread_adjustments.update(report.spread_gate_adjustments)
+        gate_bias_bars.update(report.daily_gate_bias_bars)
+        gate_bias_days.update(report.daily_gate_bias_days)
+        gate_modes.update([str(report.daily_gate_mode or "off").lower()])
         spread_modes.add(report.spread_mode)
         assumed_spread_values.append(float(report.assumed_spread_used))
+        fx_conversion_pct_values.append(float(getattr(report, "fx_conversion_pct_used", 0.0)))
         if report.avg_score is not None:
             score_values.append(float(report.avg_score))
         signal_candidates += int(report.signal_candidates)
         time_in_market_bars += int(report.time_in_market_bars)
         count_be_moves += int(report.count_be_moves)
         count_tp1_hits += int(report.count_tp1_hits)
+        blocked_by_gate += int(getattr(report, "blocked_by_gate", 0))
+        orders_submitted += int(getattr(report, "orders_submitted", 0))
+        trades_filled += int(getattr(report, "trades_filled", 0))
+        rejected_by_reason.update(getattr(report, "rejected_by_reason", {}) or {})
+        spread_cost_sum += float(getattr(report, "spread_cost_sum", 0.0) or 0.0)
+        slippage_cost_sum += float(getattr(report, "slippage_cost_sum", 0.0) or 0.0)
+        commission_cost_sum += float(getattr(report, "commission_cost_sum", 0.0) or 0.0)
+        swap_cost_sum += float(getattr(report, "swap_cost_sum", 0.0) or 0.0)
+        fx_cost_sum += float(getattr(report, "fx_cost_sum", 0.0) or 0.0)
+        account_currencies.update([str(getattr(report, "account_currency", config.account_currency)).upper()])
+        instrument_currencies.update([str(getattr(report, "instrument_currency", asset.instrument_currency or asset.currency)).upper()])
+        fx_fee_rate_values.append(float(getattr(report, "fx_conversion_fee_rate_used", config.fx_conversion_fee_rate)))
 
     return BacktestReport(
         epic=asset.epic,
@@ -1903,6 +2087,32 @@ def aggregate_backtest_reports(
         spread_mode=next(iter(spread_modes)) if len(spread_modes) == 1 else "MIXED",
         assumed_spread_used=round(sum(assumed_spread_values) / len(assumed_spread_values), 6) if assumed_spread_values else 0.0,
         spread_gate_adjustments=dict(spread_adjustments),
+        fx_conversion_pct_used=round(sum(fx_conversion_pct_values) / len(fx_conversion_pct_values), 6) if fx_conversion_pct_values else 0.0,
+        daily_gate_mode=gate_modes.most_common(1)[0][0] if gate_modes else "off",
+        daily_gate_bias_bars=dict(gate_bias_bars),
+        daily_gate_bias_days=dict(gate_bias_days),
+        blocked_by_gate=blocked_by_gate,
+        blocked_by_gate_reasons=dict(gate_reason_blocks),
+        per_bias_trade_metrics=_per_bias_trade_metrics(all_trades),
+        orders_submitted=orders_submitted,
+        trades_filled=trades_filled,
+        rejected_by_reason=dict(rejected_by_reason),
+        spread_cost_sum=spread_cost_sum,
+        slippage_cost_sum=slippage_cost_sum,
+        commission_cost_sum=commission_cost_sum,
+        swap_cost_sum=swap_cost_sum,
+        fx_cost_sum=fx_cost_sum,
+        total_pnl_net=total_pnl,
+        expectancy_net=expectancy,
+        profit_factor_net=profit_factor,
+        max_drawdown_net=max_drawdown,
+        account_currency=account_currencies.most_common(1)[0][0] if account_currencies else str(config.account_currency).upper(),
+        instrument_currency=instrument_currencies.most_common(1)[0][0]
+        if instrument_currencies
+        else str(asset.instrument_currency or asset.currency).upper(),
+        fx_conversion_fee_rate_used=(
+            round(sum(fx_fee_rate_values) / len(fx_fee_rate_values), 8) if fx_fee_rate_values else float(config.fx_conversion_fee_rate)
+        ),
     )
 
 
@@ -1941,6 +2151,8 @@ def run_backtest_multi_strategy(
     data_context: dict[str, Any] | None = None,
     trade_start_utc: datetime | None = None,
     flatten_at_chunk_end: bool = False,
+    daily_gate: DailyGateProvider | None = None,
+    daily_gate_prepared: bool = False,
 ) -> BacktestReport:
     variant_cfg = variant or BacktestVariant()
     debug_path = Path(execution_debug_path) if execution_debug_path is not None else None
@@ -1986,6 +2198,9 @@ def run_backtest_multi_strategy(
     orderflow_default_mode = config.orderflow.default_mode
     orderflow_default_window = int(config.orderflow.default_window)
     candidate_queue = CandidateQueue()
+    daily_gate_mode = str(daily_gate.mode).lower() if daily_gate is not None else "off"
+    if daily_gate is not None and daily_gate.enabled and not daily_gate_prepared:
+        daily_gate.refresh_from_candles(candles_m5)
 
     candles_m15 = aggregate_candles(candles_m5, 15)
     candles_h1 = aggregate_candles(candles_m5, 60)
@@ -2030,6 +2245,11 @@ def run_backtest_multi_strategy(
     spread_gate_adjustments: Counter[str] = Counter()
     score_values: list[float] = []
     score_bins: Counter[str] = Counter()
+    daily_gate_bias_bars: Counter[str] = Counter()
+    daily_gate_bias_days: Counter[str] = Counter()
+    seen_day_bias: dict[date, str] = {}
+    blocked_by_gate_reasons: Counter[str] = Counter()
+    blocked_by_gate = 0
     missing_feature_debug_logged = 0
     feature_warmup_bars = max(3, int(config.indicators.atr_period) + 2)
     trade_thr_base, small_min_base, small_max_base = _thresholds_for_variant(config, variant_cfg)
@@ -2045,6 +2265,20 @@ def run_backtest_multi_strategy(
     swap_hour, swap_minute = _parse_swap_time_utc(config.backtest_tuning.overnight_swap_time_utc)
     long_swap_pct = float(config.backtest_tuning.overnight_swap_long_pct)
     short_swap_pct = float(config.backtest_tuning.overnight_swap_short_pct)
+    account_currency = str(config.account_currency).strip().upper()
+    instrument_currency = str(asset.instrument_currency or asset.currency).strip().upper()
+    fx_apply_to = {str(item).strip().lower() for item in config.fx_apply_to}
+    fx_converter: FxConverter | None = None
+    if instrument_currency != account_currency:
+        fx_converter = FxConverter(
+            fee_rate=float(config.fx_conversion_fee_rate),
+            fee_mode=str(config.fx_fee_mode),
+            rate_source=str(config.fx_rate_source),
+            static_rates=config.fx_static_rates,
+        )
+    rejected_by_reason: Counter[str] = Counter()
+    orders_submitted = 0
+    trades_filled = 0
 
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
@@ -2082,11 +2316,37 @@ def run_backtest_multi_strategy(
         return min(max(0.0, requested_size), max_size)
 
     start_idx = max(config.indicators.ema_period_h1 + 10, 250)
+    spread_window = max(1, int(config.spread_filter.window)) + 1
+    spread_history_window: deque[float] = deque(maxlen=spread_window)
+    slice_m5_live = _append_live_placeholder(candles_m5[: start_idx + 1], 5)
+    slice_m15_live: list[Candle] = []
+    slice_h1_live: list[Candle] = []
+
     for i in range(start_idx, len(candles_m5)):
         candle = candles_m5[i]
+        if i > start_idx:
+            slice_m5_live[-1] = candle
+            slice_m5_live.append(_live_placeholder_from(candle, 5))
+        spread_now = _spread_for(i)
+        slippage_now = _slippage_for(i)
+        spread_history_window.append(spread_now)
+        spread_history = list(spread_history_window)
         day_key = candle.timestamp.date().isoformat()
         daily_trades.setdefault(day_key, 0)
         daily_pnl.setdefault(day_key, 0.0)
+        gate_result = None
+        if daily_gate is not None and daily_gate.enabled:
+            gate_result = daily_gate.evaluate(
+                ts=candle.timestamp,
+                symbol=asset.epic,
+                spread=spread_now,
+            )
+            gate_bias = str(gate_result.bias).upper()
+            daily_gate_bias_bars[gate_bias] += 1
+            gate_day = candle.timestamp.astimezone(timezone.utc).date()
+            if gate_day not in seen_day_bias:
+                seen_day_bias[gate_day] = gate_bias
+                daily_gate_bias_days[gate_bias] += 1
 
         if timeouts_enabled and wait_states:
             for key, state in list(wait_states.items()):
@@ -2137,14 +2397,16 @@ def run_backtest_multi_strategy(
         if pending is not None:
             touched = pending.entry >= candle.low and pending.entry <= candle.high
             if touched:
-                slippage = _slippage_for(i)
+                slippage = slippage_now
                 if pending.side == "LONG":
-                    base_entry = candle.ask if candle.ask is not None else (candle.close + (_spread_for(i) * 0.5))
+                    base_entry = candle.ask if candle.ask is not None else (candle.close + (spread_now * 0.5))
                     entry_fill = base_entry + slippage
                 else:
-                    base_entry = candle.bid if candle.bid is not None else (candle.close - (_spread_for(i) * 0.5))
+                    base_entry = candle.bid if candle.bid is not None else (candle.close - (spread_now * 0.5))
                     entry_fill = base_entry - slippage
                 initial_risk = abs(pending.entry - pending.stop)
+                entry_spread_cost = max(0.0, float(spread_now)) * 0.5 * float(pending.size)
+                entry_slippage_cost = abs(float(slippage)) * float(pending.size)
                 open_pos = _OpenPosition(
                     side=pending.side,
                     entry=entry_fill,
@@ -2167,9 +2429,14 @@ def run_backtest_multi_strategy(
                         hour=swap_hour,
                         minute=swap_minute,
                     ),
+                    realized_partial=0.0,
+                    spread_cost_total=entry_spread_cost,
+                    slippage_cost_total=entry_slippage_cost,
                     reason_open=pending.reason_open,
                     score=pending.score,
+                    gate_bias=pending.gate_bias,
                 )
+                trades_filled += 1
                 pending = None
 
         if open_pos is not None:
@@ -2181,13 +2448,22 @@ def run_backtest_multi_strategy(
                 swap_minute=swap_minute,
                 long_swap_pct=long_swap_pct,
                 short_swap_pct=short_swap_pct,
+                fx_converter=fx_converter,
+                instrument_currency=instrument_currency,
+                account_currency=account_currency,
+                fx_apply_to=fx_apply_to,
             )
             tp1_hit, be_moved_now = _manage_open_position(
                 position=open_pos,
                 candle=candle,
                 candles_m5=candles_m5,
                 index=i,
-                slippage=_slippage_for(i),
+                spread=spread_now,
+                slippage=slippage_now,
+                fx_converter=fx_converter,
+                instrument_currency=instrument_currency,
+                account_currency=account_currency,
+                fx_apply_to=fx_apply_to,
             )
             if tp1_hit:
                 count_tp1_hits += 1
@@ -2197,19 +2473,33 @@ def run_backtest_multi_strategy(
             should_close, exit_price, reason = _calc_exit(
                 open_pos,
                 candle,
-                assumed_spread=_spread_for(i),
-                slippage=_slippage_for(i),
+                assumed_spread=spread_now,
+                slippage=slippage_now,
             )
             if should_close:
+                close_size = float(open_pos.size)
+                open_pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
+                open_pos.slippage_cost_total += abs(float(slippage_now)) * close_size
                 if open_pos.side == "LONG":
-                    remaining_pnl = (exit_price - open_pos.entry) * open_pos.size
+                    remaining_pnl_instr = (exit_price - open_pos.entry) * close_size
                 else:
-                    remaining_pnl = (open_pos.entry - exit_price) * open_pos.size
+                    remaining_pnl_instr = (open_pos.entry - exit_price) * close_size
+                remaining_pnl, close_fx_cost = _convert_cash_to_account(
+                    amount=remaining_pnl_instr,
+                    category="pnl",
+                    fx_converter=fx_converter,
+                    instrument_currency=instrument_currency,
+                    account_currency=account_currency,
+                    fx_apply_to=fx_apply_to,
+                )
+                open_pos.fx_conversion_total += close_fx_cost
+                open_pos.fx_cost_total += close_fx_cost
                 total_pnl = open_pos.realized_partial + remaining_pnl
                 equity += total_pnl
                 daily_pnl[day_key] += total_pnl
-                r_denom = risk_engine.per_trade_risk_amount(equity=config.risk.equity)
+                r_denom = risk_engine.per_trade_risk_amount(equity=equity)
                 r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
+                fees_total = open_pos.swap_total + open_pos.fx_conversion_total
                 trades.append(
                     BacktestTrade(
                         epic=asset.epic,
@@ -2220,12 +2510,18 @@ def run_backtest_multi_strategy(
                         exit_price=exit_price,
                         size=open_pos.size,
                         pnl=total_pnl,
-                        fees=open_pos.swap_total,
+                        fees=fees_total,
                         r_multiple=r_mult,
                         reason=reason,
                         score=open_pos.score,
                         reason_open=open_pos.reason_open,
                         reason_close=reason,
+                        gate_bias=open_pos.gate_bias,
+                        spread_cost=open_pos.spread_cost_total,
+                        slippage_cost=open_pos.slippage_cost_total,
+                        commission_cost=open_pos.commission_total,
+                        swap_cost=open_pos.swap_cost_total,
+                        fx_cost=open_pos.fx_cost_total,
                     )
                 )
                 open_pos = None
@@ -2236,16 +2532,18 @@ def run_backtest_multi_strategy(
         if open_pos is not None or pending is not None:
             continue
 
-        if daily_trades[day_key] >= config.risk.max_trades_per_day:
+        if daily_trades[day_key] >= risk_engine.effective_max_trades_per_day(equity=equity):
             blockers["RISK_MAX_TRADES_DAY"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
-        if risk_engine.should_turn_off_for_day(daily_pnl[day_key], equity=config.risk.equity):
+        if risk_engine.should_turn_off_for_day(daily_pnl[day_key], equity=equity):
             blockers["RISK_DAILY_STOP"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
 
         t = candle.timestamp
+        prev_m15_ptr = m15_ptr
+        prev_h1_ptr = h1_ptr
         while (m15_ptr + 1) < len(candles_m15) and candles_m15[m15_ptr + 1].timestamp <= t:
             m15_ptr += 1
         while (h1_ptr + 1) < len(candles_h1) and candles_h1[h1_ptr + 1].timestamp <= t:
@@ -2254,6 +2552,23 @@ def run_backtest_multi_strategy(
             blockers["PIPELINE_WARMUP"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
+
+        if m15_ptr != prev_m15_ptr:
+            if not slice_m15_live:
+                slice_m15_live = _append_live_placeholder(candles_m15[: m15_ptr + 1], 15)
+            else:
+                for idx_m15 in range(prev_m15_ptr + 1, m15_ptr + 1):
+                    latest_m15 = candles_m15[idx_m15]
+                    slice_m15_live[-1] = latest_m15
+                    slice_m15_live.append(_live_placeholder_from(latest_m15, 15))
+        if h1_ptr != prev_h1_ptr:
+            if not slice_h1_live:
+                slice_h1_live = _append_live_placeholder(candles_h1[: h1_ptr + 1], 60)
+            else:
+                for idx_h1 in range(prev_h1_ptr + 1, h1_ptr + 1):
+                    latest_h1 = candles_h1[idx_h1]
+                    slice_h1_live[-1] = latest_h1
+                    slice_h1_live.append(_live_placeholder_from(latest_h1, 60))
 
         m15_closed_ts = candles_m15[m15_ptr].timestamp if m15_ptr >= 0 else None
         h1_closed_ts = candles_h1[h1_ptr].timestamp if h1_ptr >= 0 else None
@@ -2264,14 +2579,17 @@ def run_backtest_multi_strategy(
         if h1_new_close:
             last_h1_closed_ts = h1_closed_ts
 
-        slice_m5 = _append_live_placeholder(candles_m5[: i + 1], 5)
-        slice_m15 = _append_live_placeholder(candles_m15[: m15_ptr + 1], 15)
-        slice_h1 = _append_live_placeholder(candles_h1[: h1_ptr + 1], 60)
-        spread_now = _spread_for(i)
-        spread_history = [_spread_for(idx) for idx in range(max(0, i - config.spread_filter.window), i + 1)]
+        slice_m5 = slice_m5_live
+        slice_m15 = slice_m15_live
+        slice_h1 = slice_h1_live
         quote = None
         if candle.bid is not None and candle.ask is not None:
             quote = (candle.bid, candle.ask, spread_now)
+        gate_required_side: str | None = None
+        if daily_gate is not None and daily_gate.enabled and gate_result is not None:
+            bias_now = str(gate_result.bias).upper()
+            if bias_now in {"LONG", "SHORT", "FLAT"}:
+                gate_required_side = bias_now
 
         routes = router.routes_for(asset.epic)
         best_outcome: StrategyOutcome | None = None
@@ -2328,6 +2646,49 @@ def run_backtest_multi_strategy(
             )
             strategy.preprocess(asset.epic, bundle)
             bias = strategy.compute_bias(asset.epic, bundle)
+            if gate_required_side == "FLAT":
+                gate_reason = "DAILY_GATE_FLAT"
+                gated_eval = _default_observe_evaluation(symbol=asset.epic, reason=gate_reason)
+                gated_outcome = StrategyOutcome(
+                    symbol=asset.epic,
+                    strategy_name=route.strategy,
+                    bias=bias,
+                    candidate=None,
+                    evaluation=gated_eval,
+                    order_request=None,
+                    reason_codes=[gate_reason],
+                    payload={"score_total": gated_eval.score_total, "route_priority": route.priority},
+                )
+                rank = -850.0 + (route.priority * 0.01)
+                if _is_better_outcome(current=gated_outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
+                    best_outcome = gated_outcome
+                    best_route = route
+                    best_rank = rank
+                continue
+            if gate_required_side in {"LONG", "SHORT"}:
+                bias_dir = str(getattr(bias, "direction", "NEUTRAL")).upper()
+                side_mismatch = (gate_required_side == "LONG" and bias_dir == "SHORT") or (
+                    gate_required_side == "SHORT" and bias_dir == "LONG"
+                )
+                if side_mismatch:
+                    gate_reason = "DAILY_GATE_LONG_ONLY" if gate_required_side == "LONG" else "DAILY_GATE_SHORT_ONLY"
+                    gated_eval = _default_observe_evaluation(symbol=asset.epic, reason=gate_reason)
+                    gated_outcome = StrategyOutcome(
+                        symbol=asset.epic,
+                        strategy_name=route.strategy,
+                        bias=bias,
+                        candidate=None,
+                        evaluation=gated_eval,
+                        order_request=None,
+                        reason_codes=[gate_reason],
+                        payload={"score_total": gated_eval.score_total, "route_priority": route.priority},
+                    )
+                    rank = -840.0 + (route.priority * 0.01)
+                    if _is_better_outcome(current=gated_outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
+                        best_outcome = gated_outcome
+                        best_route = route
+                        best_rank = rank
+                    continue
             raw_candidates = strategy.detect_candidates(asset.epic, bundle)
             candidates = candidate_queue.put_many(
                 symbol=asset.epic,
@@ -2584,6 +2945,27 @@ def run_backtest_multi_strategy(
             continue
 
         order_request = best_outcome.order_request
+        if daily_gate is not None and daily_gate.enabled and gate_result is not None:
+            gate_reasons: list[str] = list(gate_result.reasons)
+            gate_bias = str(gate_result.bias).upper()
+            if gate_bias == "FLAT":
+                gate_reasons.append("DAILY_GATE_FLAT")
+            elif gate_bias == "LONG" and str(order_request.side).upper() != "LONG":
+                gate_reasons.append("DAILY_GATE_LONG_ONLY")
+            elif gate_bias == "SHORT" and str(order_request.side).upper() != "SHORT":
+                gate_reasons.append("DAILY_GATE_SHORT_ONLY")
+            if gate_result.allowed_strategies:
+                allowed = {str(item).upper() for item in gate_result.allowed_strategies}
+                if str(best_route.strategy).upper() not in allowed:
+                    gate_reasons.append("DAILY_GATE_STRATEGY_BLOCKED")
+            if gate_reasons:
+                blocked_by_gate += 1
+                for reason in list(dict.fromkeys(gate_reasons)):
+                    blockers[reason] += 1
+                    blocked_by_gate_reasons[reason] += 1
+                decision_counts["NO_SIGNAL"] += 1
+                continue
+
         risk_dist = abs(float(order_request.entry_price) - float(order_request.stop_price))
         if risk_dist <= 0:
             blockers["ORDER_INVALID_RISK"] += 1
@@ -2659,18 +3041,48 @@ def run_backtest_multi_strategy(
             route_risk=best_route.risk,
             config=config,
         )
-        size = position_size_from_risk(
-            equity=config.risk.equity,
-            risk_per_trade=config.risk.risk_per_trade * risk_multiplier,
-            entry_price=order_request.entry_price,
-            stop_price=order_request.stop_price,
-            min_size=asset.min_size,
-            size_step=asset.size_step,
+        effective_risk_per_trade = risk_engine.effective_risk_per_trade(
+            risk_multiplier=risk_multiplier,
+            equity=equity,
         )
-        size = _cap_size_by_margin(float(order_request.entry_price), float(size))
+        risk_distance = abs(float(order_request.entry_price) - float(order_request.stop_price))
+        if risk_distance <= 0:
+            blockers["M5_INVALID_RISK_DISTANCE"] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+        max_risk_cash = float(equity) * float(effective_risk_per_trade)
+        raw_size = max_risk_cash / risk_distance if risk_distance > 0 else 0.0
+        feasibility = validate_order(
+            raw_size=raw_size,
+            entry_price=float(order_request.entry_price),
+            stop_price=float(order_request.stop_price),
+            take_profit=float(order_request.take_profit),
+            min_size=float(asset.min_size),
+            size_step=float(asset.size_step),
+            max_risk_cash=max_risk_cash,
+            equity=float(equity),
+            open_positions_count=0,
+            max_positions=int(config.risk.max_positions),
+            spread=float(spread_now),
+            spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+            min_stop_distance=float(asset.minimal_tick_buffer),
+            free_margin=float(equity),
+            margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
+            max_leverage=float(config.backtest_tuning.broker_leverage),
+            margin_safety_factor=1.0,
+        )
+        if not feasibility.ok:
+            reject = feasibility.reason.value if feasibility.reason is not None else "UNKNOWN_REJECT"
+            rejected_by_reason[reject] += 1
+            blockers[reject] += 1
+            decision_counts["NO_SIGNAL"] += 1
+            continue
+        size = float(feasibility.details.get("rounded_size", 0.0))
         if size <= 0:
             blockers["SIZE_MARGIN_LIMIT"] += 1
             blockers["SIZE_INVALID"] += 1
+            blockers["INSUFFICIENT_EQUITY"] += 1
+            rejected_by_reason[RejectReason.SIZE_TOO_SMALL.value] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
 
@@ -2684,7 +3096,9 @@ def run_backtest_multi_strategy(
             created_at=t,
             reason_open=",".join(best_outcome.reason_codes) if best_outcome.reason_codes else "SIGNAL",
             score=best_outcome.evaluation.score_total,
+            gate_bias=(str(gate_result.bias).upper() if gate_result is not None else None),
         )
+        orders_submitted += 1
         daily_trades[day_key] += 1
         decision_counts[best_outcome.evaluation.action.value] += 1
 
@@ -2713,16 +3127,30 @@ def run_backtest_multi_strategy(
     if flatten_at_chunk_end and open_pos is not None and candles_m5:
         last_candle = candles_m5[-1]
         spread_now = _spread_for(len(candles_m5) - 1)
+        close_size = float(open_pos.size)
+        open_pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
+        open_pos.slippage_cost_total += abs(float(_slippage_for(len(candles_m5) - 1))) * close_size
         if open_pos.side == "LONG":
             exit_price = last_candle.bid if last_candle.bid is not None else (last_candle.close - (spread_now * 0.5))
-            remaining_pnl = (exit_price - open_pos.entry) * open_pos.size
+            remaining_pnl_instr = (exit_price - open_pos.entry) * close_size
         else:
             exit_price = last_candle.ask if last_candle.ask is not None else (last_candle.close + (spread_now * 0.5))
-            remaining_pnl = (open_pos.entry - exit_price) * open_pos.size
+            remaining_pnl_instr = (open_pos.entry - exit_price) * close_size
+        remaining_pnl, close_fx_cost = _convert_cash_to_account(
+            amount=remaining_pnl_instr,
+            category="pnl",
+            fx_converter=fx_converter,
+            instrument_currency=instrument_currency,
+            account_currency=account_currency,
+            fx_apply_to=fx_apply_to,
+        )
+        open_pos.fx_conversion_total += close_fx_cost
+        open_pos.fx_cost_total += close_fx_cost
         total_pnl = open_pos.realized_partial + remaining_pnl
         equity += total_pnl
-        r_denom = risk_engine.per_trade_risk_amount(equity=config.risk.equity)
+        r_denom = risk_engine.per_trade_risk_amount(equity=equity)
         r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
+        fees_total = open_pos.swap_total + open_pos.fx_conversion_total
         trades.append(
             BacktestTrade(
                 epic=asset.epic,
@@ -2731,15 +3159,21 @@ def run_backtest_multi_strategy(
                 exit_time=last_candle.timestamp,
                 entry_price=open_pos.entry,
                 exit_price=exit_price,
-                size=open_pos.size,
+                size=close_size,
                 pnl=total_pnl,
-                fees=open_pos.swap_total,
+                fees=fees_total,
                 r_multiple=r_mult,
                 reason="FORCED_CHUNK_END",
                 forced_exit=True,
                 score=open_pos.score,
                 reason_open=open_pos.reason_open,
                 reason_close="FORCED_CHUNK_END",
+                gate_bias=open_pos.gate_bias,
+                spread_cost=open_pos.spread_cost_total,
+                slippage_cost=open_pos.slippage_cost_total,
+                commission_cost=open_pos.commission_total,
+                swap_cost=open_pos.swap_cost_total,
+                fx_cost=open_pos.fx_cost_total,
             )
         )
         peak_equity = max(peak_equity, equity)
@@ -2757,6 +3191,11 @@ def run_backtest_multi_strategy(
     avg_win, avg_loss, payoff_ratio, profit_factor = _trade_quality_metrics(trades)
     avg_win_r, avg_loss_r, payoff_r = _trade_r_quality_metrics(trades)
     exit_reason_distribution = _exit_reason_distribution(trades)
+    spread_cost_sum = sum(float(trade.spread_cost) for trade in trades)
+    slippage_cost_sum = sum(float(trade.slippage_cost) for trade in trades)
+    commission_cost_sum = sum(float(trade.commission_cost) for trade in trades)
+    swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
+    fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
 
     return BacktestReport(
         epic=asset.epic,
@@ -2798,6 +3237,28 @@ def run_backtest_multi_strategy(
         spread_mode=spread_mode,
         assumed_spread_used=float(assumed_spread_used),
         spread_gate_adjustments=dict(spread_gate_adjustments),
+        fx_conversion_pct_used=float(config.backtest_tuning.fx_conversion_pct),
+        daily_gate_mode=daily_gate_mode,
+        daily_gate_bias_bars=dict(daily_gate_bias_bars),
+        daily_gate_bias_days=dict(daily_gate_bias_days),
+        blocked_by_gate=blocked_by_gate,
+        blocked_by_gate_reasons=dict(blocked_by_gate_reasons),
+        per_bias_trade_metrics=_per_bias_trade_metrics(trades),
+        orders_submitted=orders_submitted,
+        trades_filled=trades_filled,
+        rejected_by_reason=dict(rejected_by_reason),
+        spread_cost_sum=spread_cost_sum,
+        slippage_cost_sum=slippage_cost_sum,
+        commission_cost_sum=commission_cost_sum,
+        swap_cost_sum=swap_cost_sum,
+        fx_cost_sum=fx_cost_sum,
+        total_pnl_net=total_pnl,
+        expectancy_net=expectancy,
+        profit_factor_net=profit_factor,
+        max_drawdown_net=max_drawdown,
+        account_currency=account_currency,
+        instrument_currency=instrument_currency,
+        fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
     )
 
 
@@ -2809,12 +3270,16 @@ def run_backtest(
     assumed_spread: float = 0.2,
     slippage_points: float = 0.0,
     slippage_atr_multiplier: float = 0.0,
+    daily_gate: DailyGateProvider | None = None,
 ) -> BacktestReport:
     strategy_engine = StrategyEngine(config)
     risk_engine = RiskEngine(config.risk)
     candles_m15 = aggregate_candles(candles_m5, 15)
     candles_h1 = aggregate_candles(candles_m5, 60)
     atr_values = atr(candles_m5, config.indicators.atr_period)
+    daily_gate_mode = str(daily_gate.mode).lower() if daily_gate is not None else "off"
+    if daily_gate is not None and daily_gate.enabled:
+        daily_gate.refresh_from_candles(candles_m5)
     spread_mode = "REAL_BIDASK" if any(c.bid is not None and c.ask is not None for c in candles_m5) else "ASSUMED_OHLC"
     assumed_spread_used = float(max(0.0, assumed_spread))
     spread_bounds = _resolve_dynamic_spread_bounds(
@@ -2833,9 +3298,6 @@ def run_backtest(
         if dynamic_assumed_spread:
             assumed_spread_used = float(sum(dynamic_assumed_spread) / len(dynamic_assumed_spread))
 
-    by_time_m15 = {c.timestamp: i for i, c in enumerate(candles_m15)}
-    by_time_h1 = {c.timestamp: i for i, c in enumerate(candles_h1)}
-
     equity = config.risk.equity
     peak_equity = equity
     max_drawdown = 0.0
@@ -2845,12 +3307,33 @@ def run_backtest(
     time_in_market_bars = 0
     count_be_moves = 0
     count_tp1_hits = 0
+    daily_gate_bias_bars: Counter[str] = Counter()
+    daily_gate_bias_days: Counter[str] = Counter()
+    seen_day_bias: dict[date, str] = {}
+    blocked_by_gate_reasons: Counter[str] = Counter()
+    blocked_by_gate = 0
 
     daily_trades: dict[str, int] = {}
     daily_pnl: dict[str, float] = {}
     swap_hour, swap_minute = _parse_swap_time_utc(config.backtest_tuning.overnight_swap_time_utc)
     long_swap_pct = float(config.backtest_tuning.overnight_swap_long_pct)
     short_swap_pct = float(config.backtest_tuning.overnight_swap_short_pct)
+    account_currency = str(config.account_currency).strip().upper()
+    instrument_currency = str(asset.instrument_currency or asset.currency).strip().upper()
+    fx_apply_to = {str(item).strip().lower() for item in config.fx_apply_to}
+    fx_converter: FxConverter | None = None
+    if instrument_currency != account_currency:
+        fx_converter = FxConverter(
+            fee_rate=float(config.fx_conversion_fee_rate),
+            fee_mode=str(config.fx_fee_mode),
+            rate_source=str(config.fx_rate_source),
+            static_rates=config.fx_static_rates,
+        )
+    rejected_by_reason: Counter[str] = Counter()
+    orders_submitted = 0
+    trades_filled = 0
+    m15_ptr = -1
+    h1_ptr = -1
 
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
@@ -2888,11 +3371,34 @@ def run_backtest(
         return min(max(0.0, requested_size), max_size)
 
     start_idx = max(config.indicators.ema_period_h1 + 10, 250)
+    spread_window = max(1, int(config.spread_filter.window)) + 1
+    spread_history_window: deque[float] = deque(maxlen=spread_window)
+    slice_m5: list[Candle] = list(candles_m5[:start_idx])
+    slice_m15: list[Candle] = []
+    slice_h1: list[Candle] = []
     for i in range(start_idx, len(candles_m5)):
         candle = candles_m5[i]
+        spread_now = _spread_for(i)
+        slippage_now = _slippage_for(i)
+        spread_history_window.append(spread_now)
+        spread_history = list(spread_history_window)
+        slice_m5.append(candle)
         day_key = candle.timestamp.date().isoformat()
         daily_trades.setdefault(day_key, 0)
         daily_pnl.setdefault(day_key, 0.0)
+        gate_result = None
+        if daily_gate is not None and daily_gate.enabled:
+            gate_result = daily_gate.evaluate(
+                ts=candle.timestamp,
+                symbol=asset.epic,
+                spread=spread_now,
+            )
+            gate_bias = str(gate_result.bias).upper()
+            daily_gate_bias_bars[gate_bias] += 1
+            gate_day = candle.timestamp.astimezone(timezone.utc).date()
+            if gate_day not in seen_day_bias:
+                seen_day_bias[gate_day] = gate_bias
+                daily_gate_bias_days[gate_bias] += 1
 
         if pending is not None and i > pending.expiry_index:
             pending = None
@@ -2900,14 +3406,16 @@ def run_backtest(
         if pending is not None:
             touched = pending.entry >= candle.low and pending.entry <= candle.high
             if touched:
-                slippage = _slippage_for(i)
+                slippage = slippage_now
                 if pending.side == "LONG":
-                    base_entry = candle.ask if candle.ask is not None else (candle.close + (_spread_for(i) * 0.5))
+                    base_entry = candle.ask if candle.ask is not None else (candle.close + (spread_now * 0.5))
                     entry_fill = base_entry + slippage
                 else:
-                    base_entry = candle.bid if candle.bid is not None else (candle.close - (_spread_for(i) * 0.5))
+                    base_entry = candle.bid if candle.bid is not None else (candle.close - (spread_now * 0.5))
                     entry_fill = base_entry - slippage
                 initial_risk = abs(pending.entry - pending.stop)
+                entry_spread_cost = max(0.0, float(spread_now)) * 0.5 * float(pending.size)
+                entry_slippage_cost = abs(float(slippage)) * float(pending.size)
                 open_pos = _OpenPosition(
                     side=pending.side,
                     entry=entry_fill,
@@ -2930,9 +3438,14 @@ def run_backtest(
                         hour=swap_hour,
                         minute=swap_minute,
                     ),
+                    realized_partial=0.0,
+                    spread_cost_total=entry_spread_cost,
+                    slippage_cost_total=entry_slippage_cost,
                     reason_open=pending.reason_open,
                     score=pending.score,
+                    gate_bias=pending.gate_bias,
                 )
+                trades_filled += 1
                 pending = None
 
         if open_pos is not None:
@@ -2944,24 +3457,42 @@ def run_backtest(
                 swap_minute=swap_minute,
                 long_swap_pct=long_swap_pct,
                 short_swap_pct=short_swap_pct,
+                fx_converter=fx_converter,
+                instrument_currency=instrument_currency,
+                account_currency=account_currency,
+                fx_apply_to=fx_apply_to,
             )
 
             should_close, exit_price, reason = _calc_exit(
                 open_pos,
                 candle,
-                assumed_spread=_spread_for(i),
-                slippage=_slippage_for(i),
+                assumed_spread=spread_now,
+                slippage=slippage_now,
             )
             if should_close:
+                close_size = float(open_pos.size)
+                open_pos.spread_cost_total += max(0.0, float(spread_now)) * 0.5 * close_size
+                open_pos.slippage_cost_total += abs(float(slippage_now)) * close_size
                 if open_pos.side == "LONG":
-                    remaining_pnl = (exit_price - open_pos.entry) * open_pos.size
+                    remaining_pnl_instr = (exit_price - open_pos.entry) * close_size
                 else:
-                    remaining_pnl = (open_pos.entry - exit_price) * open_pos.size
+                    remaining_pnl_instr = (open_pos.entry - exit_price) * close_size
+                remaining_pnl, close_fx_cost = _convert_cash_to_account(
+                    amount=remaining_pnl_instr,
+                    category="pnl",
+                    fx_converter=fx_converter,
+                    instrument_currency=instrument_currency,
+                    account_currency=account_currency,
+                    fx_apply_to=fx_apply_to,
+                )
+                open_pos.fx_conversion_total += close_fx_cost
+                open_pos.fx_cost_total += close_fx_cost
                 total_pnl = open_pos.realized_partial + remaining_pnl
                 equity += total_pnl
                 daily_pnl[day_key] += total_pnl
-                r_denom = risk_engine.per_trade_risk_amount(equity=config.risk.equity)
+                r_denom = risk_engine.per_trade_risk_amount(equity=equity)
                 r_mult = (total_pnl / r_denom) if r_denom > 0 else 0.0
+                fees_total = open_pos.swap_total + open_pos.fx_conversion_total
                 trades.append(
                     BacktestTrade(
                         epic=asset.epic,
@@ -2972,12 +3503,18 @@ def run_backtest(
                         exit_price=exit_price,
                         size=open_pos.size,
                         pnl=total_pnl,
-                        fees=open_pos.swap_total,
+                        fees=fees_total,
                         r_multiple=r_mult,
                         reason=reason,
                         score=open_pos.score,
                         reason_open=open_pos.reason_open,
                         reason_close=reason,
+                        gate_bias=open_pos.gate_bias,
+                        spread_cost=open_pos.spread_cost_total,
+                        slippage_cost=open_pos.slippage_cost_total,
+                        commission_cost=open_pos.commission_total,
+                        swap_cost=open_pos.swap_cost_total,
+                        fx_cost=open_pos.fx_cost_total,
                     )
                 )
                 open_pos = None
@@ -2988,33 +3525,48 @@ def run_backtest(
         if open_pos is not None or pending is not None:
             continue
 
-        if daily_trades[day_key] >= config.risk.max_trades_per_day:
+        if daily_trades[day_key] >= risk_engine.effective_max_trades_per_day(equity=equity):
             continue
-        if risk_engine.should_turn_off_for_day(daily_pnl[day_key], equity=config.risk.equity):
+        if risk_engine.should_turn_off_for_day(daily_pnl[day_key], equity=equity):
             continue
 
         t = candle.timestamp
-        m15_idx = max([idx for ts, idx in by_time_m15.items() if ts <= t], default=-1)
-        h1_idx = max([idx for ts, idx in by_time_h1.items() if ts <= t], default=-1)
-        if m15_idx <= 20 or h1_idx <= 50:
+        while (m15_ptr + 1) < len(candles_m15) and candles_m15[m15_ptr + 1].timestamp <= t:
+            m15_ptr += 1
+            slice_m15.append(candles_m15[m15_ptr])
+        while (h1_ptr + 1) < len(candles_h1) and candles_h1[h1_ptr + 1].timestamp <= t:
+            h1_ptr += 1
+            slice_h1.append(candles_h1[h1_ptr])
+        if m15_ptr <= 20 or h1_ptr <= 50:
             continue
 
-        slice_m5 = candles_m5[: i + 1]
-        slice_m15 = candles_m15[: m15_idx + 1]
-        slice_h1 = candles_h1[: h1_idx + 1]
         decision = strategy_engine.evaluate(
             epic=asset.epic,
             minimal_tick_buffer=asset.minimal_tick_buffer,
             candles_h1=slice_h1,
             candles_m15=slice_m15,
             candles_m5=slice_m5,
-            current_spread=_spread_for(i),
-            spread_history=[_spread_for(idx) for idx in range(max(0, i - config.spread_filter.window), i + 1)],
+            current_spread=spread_now,
+            spread_history=spread_history,
             news_blocked=False,
         )
         if decision.signal is None:
             continue
         signal = decision.signal
+        if daily_gate is not None and daily_gate.enabled and gate_result is not None:
+            gate_reasons: list[str] = list(gate_result.reasons)
+            gate_bias = str(gate_result.bias).upper()
+            if gate_bias == "FLAT":
+                gate_reasons.append("DAILY_GATE_FLAT")
+            elif gate_bias == "LONG" and str(signal.side).upper() != "LONG":
+                gate_reasons.append("DAILY_GATE_LONG_ONLY")
+            elif gate_bias == "SHORT" and str(signal.side).upper() != "SHORT":
+                gate_reasons.append("DAILY_GATE_SHORT_ONLY")
+            if gate_reasons:
+                blocked_by_gate += 1
+                for reason in list(dict.fromkeys(gate_reasons)):
+                    blocked_by_gate_reasons[reason] += 1
+                continue
         risk_dist = abs(float(signal.entry_price) - float(signal.stop_price))
         if risk_dist <= 0:
             continue
@@ -3068,16 +3620,38 @@ def run_backtest(
         )
         signal.take_profit = normalized_tp
 
-        size = position_size_from_risk(
-            equity=config.risk.equity,
-            risk_per_trade=config.risk.risk_per_trade,
-            entry_price=signal.entry_price,
-            stop_price=signal.stop_price,
-            min_size=asset.min_size,
-            size_step=asset.size_step,
+        effective_risk_per_trade = risk_engine.effective_risk_per_trade(
+            risk_multiplier=1.0,
+            equity=equity,
         )
-        size = _cap_size_by_margin(float(signal.entry_price), float(size))
+        max_risk_cash = float(equity) * float(effective_risk_per_trade)
+        raw_size = max_risk_cash / risk_dist if risk_dist > 0 else 0.0
+        feasibility = validate_order(
+            raw_size=raw_size,
+            entry_price=float(signal.entry_price),
+            stop_price=float(signal.stop_price),
+            take_profit=float(signal.take_profit),
+            min_size=float(asset.min_size),
+            size_step=float(asset.size_step),
+            max_risk_cash=max_risk_cash,
+            equity=float(equity),
+            open_positions_count=0,
+            max_positions=int(config.risk.max_positions),
+            spread=float(spread_now),
+            spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+            min_stop_distance=float(asset.minimal_tick_buffer),
+            free_margin=float(equity),
+            margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
+            max_leverage=float(config.backtest_tuning.broker_leverage),
+            margin_safety_factor=1.0,
+        )
+        if not feasibility.ok:
+            reject = feasibility.reason.value if feasibility.reason is not None else "UNKNOWN_REJECT"
+            rejected_by_reason[reject] += 1
+            continue
+        size = float(feasibility.details.get("rounded_size", 0.0))
         if size <= 0:
+            rejected_by_reason[RejectReason.SIZE_TOO_SMALL.value] += 1
             continue
 
         pending = _PendingOrder(
@@ -3090,7 +3664,9 @@ def run_backtest(
             created_at=t,
             reason_open=",".join(decision.reason_codes) if decision.reason_codes else "SIGNAL",
             score=None,
+            gate_bias=(str(gate_result.bias).upper() if gate_result is not None else None),
         )
+        orders_submitted += 1
         daily_trades[day_key] += 1
 
     wins = sum(1 for trade in trades if trade.pnl > 0)
@@ -3103,6 +3679,11 @@ def run_backtest(
     avg_win, avg_loss, payoff_ratio, profit_factor = _trade_quality_metrics(trades)
     avg_win_r, avg_loss_r, payoff_r = _trade_r_quality_metrics(trades)
     exit_reason_distribution = _exit_reason_distribution(trades)
+    spread_cost_sum = sum(float(trade.spread_cost) for trade in trades)
+    slippage_cost_sum = sum(float(trade.slippage_cost) for trade in trades)
+    commission_cost_sum = sum(float(trade.commission_cost) for trade in trades)
+    swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
+    fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
 
     return BacktestReport(
         epic=asset.epic,
@@ -3129,6 +3710,28 @@ def run_backtest(
         exit_reason_distribution=exit_reason_distribution,
         spread_mode=spread_mode,
         assumed_spread_used=float(assumed_spread_used),
+        fx_conversion_pct_used=float(config.backtest_tuning.fx_conversion_pct),
+        daily_gate_mode=daily_gate_mode,
+        daily_gate_bias_bars=dict(daily_gate_bias_bars),
+        daily_gate_bias_days=dict(daily_gate_bias_days),
+        blocked_by_gate=blocked_by_gate,
+        blocked_by_gate_reasons=dict(blocked_by_gate_reasons),
+        per_bias_trade_metrics=_per_bias_trade_metrics(trades),
+        orders_submitted=orders_submitted,
+        trades_filled=trades_filled,
+        rejected_by_reason=dict(rejected_by_reason),
+        spread_cost_sum=spread_cost_sum,
+        slippage_cost_sum=slippage_cost_sum,
+        commission_cost_sum=commission_cost_sum,
+        swap_cost_sum=swap_cost_sum,
+        fx_cost_sum=fx_cost_sum,
+        total_pnl_net=total_pnl,
+        expectancy_net=expectancy,
+        profit_factor_net=profit_factor,
+        max_drawdown_net=max_drawdown,
+        account_currency=account_currency,
+        instrument_currency=instrument_currency,
+        fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
     )
 
 
@@ -3140,6 +3743,7 @@ def run_backtest_from_csv(
     assumed_spread: float = 0.2,
     slippage_points: float = 0.0,
     slippage_atr_multiplier: float = 0.0,
+    daily_gate: DailyGateProvider | None = None,
 ) -> BacktestReport:
     candles = load_candles_csv(csv_path)
     return run_backtest(
@@ -3149,6 +3753,7 @@ def run_backtest_from_csv(
         assumed_spread=assumed_spread,
         slippage_points=slippage_points,
         slippage_atr_multiplier=slippage_atr_multiplier,
+        daily_gate=daily_gate,
     )
 
 
@@ -3161,6 +3766,7 @@ def run_walk_forward_from_csv(
     assumed_spread: float = 0.2,
     slippage_points: float = 0.0,
     slippage_atr_multiplier: float = 0.0,
+    daily_gate: DailyGateProvider | None = None,
 ) -> WalkForwardReport:
     candles = load_candles_csv(csv_path)
     return run_walk_forward(
@@ -3171,6 +3777,7 @@ def run_walk_forward_from_csv(
         assumed_spread=assumed_spread,
         slippage_points=slippage_points,
         slippage_atr_multiplier=slippage_atr_multiplier,
+        daily_gate=daily_gate,
     )
 
 
@@ -3183,6 +3790,7 @@ def run_walk_forward(
     assumed_spread: float = 0.2,
     slippage_points: float = 0.0,
     slippage_atr_multiplier: float = 0.0,
+    daily_gate: DailyGateProvider | None = None,
 ) -> WalkForwardReport:
     if wf_splits < 2:
         wf_splits = 2
@@ -3205,6 +3813,7 @@ def run_walk_forward(
                 assumed_spread=assumed_spread,
                 slippage_points=slippage_points,
                 slippage_atr_multiplier=slippage_atr_multiplier,
+                daily_gate=daily_gate,
             )
         )
     if not reports:
@@ -3232,6 +3841,7 @@ def run_walk_forward_multi_strategy(
     no_price_debug_path: str | Path | None = None,
     reaction_timeout_debug_path: str | Path | None = None,
     data_context: dict[str, Any] | None = None,
+    daily_gate: DailyGateProvider | None = None,
 ) -> WalkForwardReport:
     if wf_splits < 2:
         wf_splits = 2
@@ -3259,6 +3869,7 @@ def run_walk_forward_multi_strategy(
                 no_price_debug_path=no_price_debug_path,
                 reaction_timeout_debug_path=reaction_timeout_debug_path,
                 data_context=data_context,
+                daily_gate=daily_gate,
             )
         )
     if not reports:

@@ -39,6 +39,11 @@ runtime_dashboard.json
 reports/
 data/
 bot/data/*.csv
+runs/batch/
+runs/bt_*_summary.json
+runs/opt_*.json
+runs/opt_multi_period_logs/
+tmp_bt_report.csv
 
 # Editor/IDE
 .vscode/

@@ -1,7 +1,18 @@
 timezone: "Europe/Warsaw"
+account_currency: "USD"
+fx_conversion_fee_rate: 0.007
+fx_fee_mode: "all_in_rate"
+fx_rate_source: "static"
+fx_static_rates:
+  USDPLN: 4.0
+  EURPLN: 4.3
+  EURUSD: 1.08
+fx_apply_to: ["pnl", "swap", "commission"]
+reporting_currency: "account"
 instrument:
   epic: "XAUUSD"
   currency: "USD"
+  instrument_currency: "USD"
   point_size: 0.01
   minimal_tick_buffer: 0.05
   min_size: 0.01
@@ -9,6 +20,7 @@ instrument:
 assets:
   - epic: "GOLD"
     currency: "USD"
+    instrument_currency: "USD"
     point_size: 0.01
     minimal_tick_buffer: 0.05
     min_size: 0.01
@@ -16,6 +28,7 @@ assets:
     trade_enabled: true
   - epic: "BTCUSD"
     currency: "USD"
+    instrument_currency: "USD"
     point_size: 0.1
     minimal_tick_buffer: 1.0
     min_size: 0.01
@@ -23,6 +36,7 @@ assets:
     trade_enabled: true
   - epic: "EURUSD"
     currency: "USD"
+    instrument_currency: "USD"
     point_size: 0.0001
     minimal_tick_buffer: 0.0002
     min_size: 0.01
@@ -30,6 +44,7 @@ assets:
     trade_enabled: true
   - epic: "US100"
     currency: "USD"
+    instrument_currency: "USD"
     point_size: 0.1
     minimal_tick_buffer: 0.5
     min_size: 0.1
@@ -37,6 +52,7 @@ assets:
     trade_enabled: true
   - epic: "US500"
     currency: "USD"
+    instrument_currency: "USD"
     point_size: 0.1
     minimal_tick_buffer: 0.5
     min_size: 0.1
@@ -79,6 +95,17 @@ spread_filter:
   max_multiple_of_median: 2.0
 news_gate:
   block_minutes: 60
+daily_gate:
+  mode: off
+  ema_fast: 20
+  ema_slow: 50
+  thr: 0.001
+  atr_period: 14
+  vol_max: 0.02
+  max_spread: 0.8
+  pre_minutes: 30
+  post_minutes: 30
+  allowed_strategies: []
 risk:
   equity: 10000
   risk_per_trade: 0.005
@@ -89,6 +116,14 @@ risk:
   max_total_risk_pct: 0.015
   cooldown_loss_streak: 2
   cooldown_minutes: 60
+  low_equity_mode_enabled: true
+  low_equity_threshold: 250.0
+  low_equity_risk_multiplier: 0.35
+  low_equity_risk_per_trade_cap: 0.02
+  low_equity_max_trades_per_day: 2
+  low_equity_daily_stop_pct: 0.01
+  low_equity_min_size_fallback_enabled: true
+  low_equity_min_size_fallback_max_risk_pct: 0.02
   correlation_groups:
     - name: "US_INDICES"
       epics: ["US100", "US500"]
@@ -178,6 +213,7 @@ backtest_tuning:
   overnight_swap_time_utc: "23:00"
   overnight_swap_long_pct: -0.016
   overnight_swap_short_pct: 0.0076
+  fx_conversion_pct: 0.0
 orderflow:
   default_mode: "LITE"
   full_symbols: ["BTCUSD"]

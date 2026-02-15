@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
@@ -854,28 +855,56 @@ class AutoDataLoader:
             hard_minutes = soft_minutes
         work = frame.sort_values("ts_utc").drop_duplicates(subset=["ts_utc"]).reset_index(drop=True)
         ts = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
-        diffs = ts.diff().dt.total_seconds().div(60.0)
-
-        breakpoints: list[int] = []
-        gap_rows: list[dict[str, object]] = []
-        soft_only_rows: list[dict[str, object]] = []
-        for idx in range(1, len(work)):
-            gap = diffs.iloc[idx]
-            if pd.isna(gap):
-                continue
-            gap_minutes = float(gap)
-            prev_ts = ts.iloc[idx - 1]
-            curr_ts = ts.iloc[idx]
-            payload = {
-                "prev_ts_utc": prev_ts.isoformat() if pd.notna(prev_ts) else None,
-                "next_ts_utc": curr_ts.isoformat() if pd.notna(curr_ts) else None,
-                "gap_minutes": gap_minutes,
+        if len(work) < 2:
+            return [work] if not work.empty else [], {
+                "gap_threshold_bars": threshold_bars,
+                "gap_threshold_minutes": hard_minutes,
+                "soft_gap_minutes": soft_minutes,
+                "hard_gap_minutes": hard_minutes,
+                "segment_count": 1 if not work.empty else 0,
+                "segment_sizes": [int(len(work))] if not work.empty else [],
+                "gap_count_over_threshold": 0,
+                "gap_count_soft_only": 0,
+                "gaps_over_threshold": [],
+                "gaps_soft_only": [],
             }
-            if gap_minutes > hard_minutes:
-                breakpoints.append(idx)
-                gap_rows.append(payload)
-            elif gap_minutes > soft_minutes:
-                soft_only_rows.append(payload)
+
+        ts_values = ts.to_numpy(dtype="datetime64[ns]")
+        ts_ns = ts_values.view(np.int64)
+        nat_value = np.datetime64("NaT", "ns").view(np.int64)
+        valid = (ts_ns[:-1] != nat_value) & (ts_ns[1:] != nat_value)
+        diffs_minutes = (ts_ns[1:] - ts_ns[:-1]) / 60_000_000_000.0
+        hard_mask = valid & (diffs_minutes > hard_minutes)
+        soft_mask = valid & (diffs_minutes > soft_minutes) & (~hard_mask)
+
+        hard_indices = (np.flatnonzero(hard_mask) + 1).tolist()
+        soft_indices = (np.flatnonzero(soft_mask) + 1).tolist()
+        breakpoints: list[int] = hard_indices
+
+        ts_items = ts.to_list()
+        gap_rows: list[dict[str, object]] = []
+        for idx in hard_indices[:200]:
+            prev_ts = ts_items[idx - 1]
+            curr_ts = ts_items[idx]
+            gap_rows.append(
+                {
+                    "prev_ts_utc": prev_ts.isoformat() if pd.notna(prev_ts) else None,
+                    "next_ts_utc": curr_ts.isoformat() if pd.notna(curr_ts) else None,
+                    "gap_minutes": float(diffs_minutes[idx - 1]),
+                }
+            )
+
+        soft_only_rows: list[dict[str, object]] = []
+        for idx in soft_indices[:200]:
+            prev_ts = ts_items[idx - 1]
+            curr_ts = ts_items[idx]
+            soft_only_rows.append(
+                {
+                    "prev_ts_utc": prev_ts.isoformat() if pd.notna(prev_ts) else None,
+                    "next_ts_utc": curr_ts.isoformat() if pd.notna(curr_ts) else None,
+                    "gap_minutes": float(diffs_minutes[idx - 1]),
+                }
+            )
 
         segments: list[pd.DataFrame] = []
         start_idx = 0
@@ -892,10 +921,10 @@ class AutoDataLoader:
             "hard_gap_minutes": hard_minutes,
             "segment_count": len(segments),
             "segment_sizes": [int(len(segment)) for segment in segments],
-            "gap_count_over_threshold": len(gap_rows),
-            "gap_count_soft_only": len(soft_only_rows),
-            "gaps_over_threshold": gap_rows[:200],
-            "gaps_soft_only": soft_only_rows[:200],
+            "gap_count_over_threshold": int(np.count_nonzero(hard_mask)),
+            "gap_count_soft_only": int(np.count_nonzero(soft_mask)),
+            "gaps_over_threshold": gap_rows,
+            "gaps_soft_only": soft_only_rows,
         }
 
     def _bootstrap_mid_from_csv(self, symbol: str) -> bool:

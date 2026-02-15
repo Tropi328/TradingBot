@@ -62,6 +62,48 @@ Artifacts:
 - optional `charts/pnl_by_month.png`
 - optional `report.html`
 
+## DailyGate (hard gate)
+- CLI mode: `--daily-gate off|trend|trend_vol_news`
+- A/B run (all three modes in one launch): `--daily-gate-ab`
+- Optional grid search for gate params: `--daily-gate-grid-search`
+- Optional runtime overrides:
+  - `--daily-gate-thr`
+  - `--daily-gate-pre-minutes`
+  - `--daily-gate-post-minutes`
+  - `--daily-gate-vol-max`
+  - `--daily-gate-max-spread`
+
+Example A/B on XAUUSD 5m:
+`python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config config.variant_B.yaml --initial-equity 100 --daily-gate-ab`
+
+## Currency conversion fee (all-in rate, 0.7%)
+Backtest/paper now support explicit account currency conversion with Capital.com-style fee embedded in the FX rate.
+
+Config keys:
+```yaml
+account_currency: "PLN"
+fx_conversion_fee_rate: 0.007
+fx_fee_mode: "all_in_rate"
+fx_rate_source: "static"
+fx_static_rates:
+  USDPLN: 4.00
+fx_apply_to: ["pnl", "swap", "commission"]
+reporting_currency: "account"
+```
+
+Per-asset:
+```yaml
+assets:
+  - epic: "XAUUSD"
+    instrument_currency: "USD"
+```
+
+Notes:
+- FX fee is applied only when a conversion is needed (`instrument_currency != account_currency`).
+- The fee is modeled as a less favorable all-in rate, not as % of notional on entry/exit.
+- `fx_cost_sum` in reports is the explicit conversion drag.
+- Backtest trade reports include breakdown fields: `spread_cost`, `slippage_cost`, `commission_cost`, `swap_cost`, `fx_cost`.
+
 ## Key .env fields
 ```env
 CAPITAL_BASE_URL=https://demo-api-capital.backend-capital.com/api/v1
@@ -124,6 +166,12 @@ LOG_LEVEL=INFO
 - +1R management: SL to BE + 50% partial.
 - Daily stop, max trades/day, max positions, global exposure and correlation limits.
 - News block window and pending-order cancel in blocked window.
+
+## Low-Equity Protection (micro accounts)
+- For very small balances (default threshold: `250` in account currency), risk is auto-tightened.
+- Effective risk per trade is reduced and capped (`low_equity_risk_multiplier`, `low_equity_risk_per_trade_cap`).
+- Daily stop and max trades/day are tightened in low-equity mode.
+- Optional min-size fallback can place `min_size` only when its risk is still within a strict cap (`low_equity_min_size_fallback_max_risk_pct`).
 
 ## Portfolio supervisor
 - max open positions total: `2`

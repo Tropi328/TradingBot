@@ -42,11 +42,12 @@ from bot.data.capital_client import CapitalAPIError, CapitalClient
 from bot.data.market_data import MarketDataService
 from bot.execution.orders import OrderExecutor
 from bot.execution.position_manager import PositionManager
-from bot.execution.sizing import position_size_from_risk
+from bot.execution.feasibility import estimate_required_margin, validate_order
 from bot.monitoring.alerts import AlertConfig, AlertDispatcher
 from bot.monitoring.dashboard import DashboardWriter
-from bot.news.calendar_provider import CalendarProvider, build_calendar_provider
+from bot.news.calendar_provider import CalendarProvider, Event, build_calendar_provider
 from bot.news.gate import is_blocked, should_cancel_pending
+from bot.gating.daily_gate import DailyGateProvider
 from bot.reporting.backtest_reporter import BacktestMeta, BacktestReporter, BacktestRun
 from bot.storage.db import get_connection, init_db
 from bot.storage.journal import Journal
@@ -171,6 +172,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backtest-source-priority", default="", help="Comma-separated source priority.")
     parser.add_argument("--backtest-slippage-points", type=float, default=0.0)
     parser.add_argument("--backtest-slippage-atr-multiplier", type=float, default=0.0)
+    parser.add_argument("--daily-gate", choices=["off", "trend", "trend_vol_news"], default=None)
+    parser.add_argument("--daily-gate-thr", type=float, default=None)
+    parser.add_argument("--daily-gate-pre-minutes", type=int, default=None)
+    parser.add_argument("--daily-gate-post-minutes", type=int, default=None)
+    parser.add_argument("--daily-gate-vol-max", type=float, default=None)
+    parser.add_argument("--daily-gate-max-spread", type=float, default=None)
+    parser.add_argument("--daily-gate-ab", action="store_true", help="Run backtest comparison for off/trend/trend_vol_news.")
+    parser.add_argument("--daily-gate-grid-search", action="store_true", help="Run gate parameter grid search (backtest mode).")
+    parser.add_argument("--daily-gate-grid-limit", type=int, default=0, help="Optional limit of tested parameter sets per gate mode.")
     parser.add_argument("--backtest-autofetch", action="store_true")
     parser.add_argument("--backtest-fetch-script", default="fetch_market_data.py")
     parser.add_argument("--backtest-variants", default="W0", help="Comma-separated variants: W0,W1,W2[,W3]")
@@ -200,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", default="runs/batch")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--state-path", default=None)
-    parser.add_argument("--initial-equity", type=float, default=10000.0)
+    parser.add_argument("--initial-equity", type=float, default=None)
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--data-root", default=None, help="Batch mode alias for --backtest-data-root")
 
@@ -230,16 +240,122 @@ def parse_epics_csv(raw: str | None) -> list[str]:
     return out
 
 
+def _apply_cli_overrides(args: argparse.Namespace, config: AppConfig) -> None:
+    if args.initial_equity is not None:
+        config.risk.equity = float(args.initial_equity)
+    if args.daily_gate is not None:
+        config.daily_gate.mode = str(args.daily_gate).strip().lower()
+    if args.daily_gate_thr is not None:
+        config.daily_gate.thr = float(args.daily_gate_thr)
+    if args.daily_gate_pre_minutes is not None:
+        config.daily_gate.pre_minutes = int(args.daily_gate_pre_minutes)
+    if args.daily_gate_post_minutes is not None:
+        config.daily_gate.post_minutes = int(args.daily_gate_post_minutes)
+    if args.daily_gate_vol_max is not None:
+        config.daily_gate.vol_max = float(args.daily_gate_vol_max)
+    if args.daily_gate_max_spread is not None:
+        config.daily_gate.max_spread = float(args.daily_gate_max_spread)
+
+
+def _daily_gate_mode(config: AppConfig) -> str:
+    return str(config.daily_gate.mode).strip().lower()
+
+
+def _build_daily_gate_provider(
+    *,
+    config: AppConfig,
+    mode: str,
+    candles: list | None = None,
+    events: list[Event] | None = None,
+    overrides: dict[str, float | int | None] | None = None,
+) -> DailyGateProvider | None:
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode == "off":
+        return None
+    params = {
+        "thr": float(config.daily_gate.thr),
+        "pre_minutes": int(config.daily_gate.pre_minutes),
+        "post_minutes": int(config.daily_gate.post_minutes),
+        "vol_max": float(config.daily_gate.vol_max),
+        "max_spread": (float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+    }
+    if overrides:
+        params.update(overrides)
+    provider = DailyGateProvider(
+        mode=normalized_mode,
+        ema_fast=int(config.daily_gate.ema_fast),
+        ema_slow=int(config.daily_gate.ema_slow),
+        thr=float(params["thr"]),
+        atr_period=int(config.daily_gate.atr_period),
+        vol_max=float(params["vol_max"]),
+        max_spread=(float(params["max_spread"]) if params["max_spread"] is not None else None),
+        pre_minutes=int(params["pre_minutes"]),
+        post_minutes=int(params["post_minutes"]),
+        rollover_start_utc=config.daily_gate.rollover_start_utc,
+        rollover_end_utc=config.daily_gate.rollover_end_utc,
+        allowed_strategies=config.daily_gate.allowed_strategies,
+        events=events or [],
+    )
+    if candles:
+        provider.refresh_from_candles(candles)
+    return provider
+
+
+def _gate_param_space_for_grid(config: AppConfig) -> list[dict[str, float | int | None]]:
+    base_spread = float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None
+    spread_candidates: list[float | None]
+    if base_spread is None:
+        spread_candidates = [None]
+    else:
+        spread_candidates = [base_spread, base_spread * 1.5]
+    grid: list[dict[str, float | int | None]] = []
+    for thr in [0.0005, 0.0010, 0.0020]:
+        for pre_minutes in [15, 30, 45]:
+            for post_minutes in [15, 30, 45]:
+                for vol_max in [0.015, 0.020, 0.025]:
+                    for max_spread in spread_candidates:
+                        grid.append(
+                            {
+                                "thr": thr,
+                                "pre_minutes": pre_minutes,
+                                "post_minutes": post_minutes,
+                                "vol_max": vol_max,
+                                "max_spread": max_spread,
+                            }
+                        )
+    return grid
+
+
 def _asset_from_template(epic: str, template: AssetConfig, trade_enabled: bool) -> AssetConfig:
     return AssetConfig(
         epic=epic,
         currency=template.currency,
+        instrument_currency=template.instrument_currency,
         point_size=template.point_size,
         minimal_tick_buffer=template.minimal_tick_buffer,
         min_size=template.min_size,
         size_step=template.size_step,
         trade_enabled=trade_enabled,
     )
+
+
+def _estimated_open_margin(*, positions: list, config: AppConfig) -> float:
+    total = 0.0
+    margin_pct = float(config.backtest_tuning.broker_margin_requirement_pct)
+    leverage = float(config.backtest_tuning.broker_leverage)
+    for position in positions:
+        try:
+            entry = float(getattr(position, "entry_price", 0.0))
+            size = float(getattr(position, "size", 0.0))
+        except (TypeError, ValueError):
+            continue
+        total += estimate_required_margin(
+            entry_price=entry,
+            size=size,
+            margin_requirement_pct=margin_pct,
+            max_leverage=leverage,
+        )
+    return total
 
 
 def build_asset_universe(config: AppConfig) -> list[AssetConfig]:
@@ -553,6 +669,23 @@ def _resolve_runtime_path(root: Path, value: str) -> Path:
     return root / path
 
 
+def _resolve_config_path(root: Path, value: str) -> Path:
+    direct = _resolve_runtime_path(root, value)
+    if direct.exists():
+        return direct
+    raw = Path(value)
+    candidates = [
+        root / "configs" / raw,
+        root / "configs" / "variants" / raw,
+        root / "configs" / raw.name,
+        root / "configs" / "variants" / raw.name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return direct
+
+
 def _validate_batch_data_root(data_root: Path) -> None:
     if not data_root.exists():
         raise RuntimeError(
@@ -777,6 +910,39 @@ def _log_variant_comparison(*, variant_payloads: dict[str, dict[str, object]], s
             )
 
 
+def _log_daily_gate_comparison(*, gate_payloads: dict[str, dict[str, object]], symbols: list[str]) -> None:
+    LOGGER.info("Daily gate comparison:")
+    LOGGER.info(
+        "gate_mode | symbol | trades | win_rate | pnl | max_dd | expectancy | avg_r | flat_days | long_days | short_days | blocked_by_gate"
+    )
+    for gate_mode, payload in gate_payloads.items():
+        reports_raw = payload.get("reports")
+        if not isinstance(reports_raw, dict):
+            continue
+        for symbol in symbols:
+            report = reports_raw.get(symbol)
+            if not isinstance(report, dict):
+                continue
+            days = report.get("daily_gate_bias_days", {})
+            if not isinstance(days, dict):
+                days = {}
+            LOGGER.info(
+                "%s | %s | %s | %.4f | %.4f | %.4f | %.4f | %.4f | %s | %s | %s | %s",
+                gate_mode,
+                symbol,
+                report.get("trades", 0),
+                float(report.get("win_rate", 0.0)),
+                float(report.get("total_pnl", 0.0)),
+                float(report.get("max_drawdown", 0.0)),
+                float(report.get("expectancy", 0.0)),
+                float(report.get("avg_r", 0.0)),
+                int(days.get("FLAT", 0)),
+                int(days.get("LONG", 0)),
+                int(days.get("SHORT", 0)),
+                int(report.get("blocked_by_gate", 0)),
+            )
+
+
 def _run_multi_strategy_segmented(
     *,
     config: AppConfig,
@@ -794,6 +960,8 @@ def _run_multi_strategy_segmented(
     data_context: dict[str, object],
     trade_start_utc: datetime | None = None,
     flatten_at_chunk_end: bool = False,
+    daily_gate: DailyGateProvider | None = None,
+    daily_gate_prepared: bool = False,
 ):
     segments, segment_info = loader.split_frame_by_gaps(
         frame,
@@ -862,6 +1030,8 @@ def _run_multi_strategy_segmented(
             data_context=segment_context,
             trade_start_utc=segment_trade_start,
             flatten_at_chunk_end=flatten_at_chunk_end,
+            daily_gate=daily_gate,
+            daily_gate_prepared=daily_gate_prepared,
         )
         reports.append(report)
 
@@ -881,6 +1051,8 @@ def _run_multi_strategy_segmented(
             data_context=data_context,
             trade_start_utc=trade_start_utc,
             flatten_at_chunk_end=flatten_at_chunk_end,
+            daily_gate=daily_gate,
+            daily_gate_prepared=daily_gate_prepared,
         )
         reports = [report]
 
@@ -903,6 +1075,11 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
     report_formats = _parse_report_formats(args.report_formats)
     reporter = BacktestReporter(_resolve_runtime_path(root, str(args.report_dir))) if args.report else None
     generated_report_dirs: list[Path] = []
+    selected_gate_modes = (
+        ["off", "trend", "trend_vol_news"]
+        if args.daily_gate_ab
+        else [_daily_gate_mode(config)]
+    )
 
     def _emit_detailed_report(
         *,
@@ -962,64 +1139,93 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
         epic = (args.backtest_epic or os.getenv("CAPITAL_EPIC") or assets[0].epic).strip().upper()
         selected = next((a for a in assets if a.epic == epic), assets[0])
         csv_path = _resolve_runtime_path(root, str(args.backtest_data))
-        if args.walk_forward:
-            report = run_walk_forward_from_csv(
-                config=config,
-                asset=selected,
-                csv_path=csv_path,
-                wf_splits=args.wf_splits,
-                assumed_spread=args.backtest_spread,
-                slippage_points=args.backtest_slippage_points,
-                slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
-            )
-            LOGGER.info("Walk-forward report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
-            aggregate_report = report.aggregate
-            default_start = str(args.backtest_start or "csv-start")
-            default_end = str(args.backtest_end or "csv-end")
-            start_label, end_label = _trade_time_bounds(
-                list(aggregate_report.trade_log),
-                default_start=default_start,
-                default_end=default_end,
-            )
-            _emit_detailed_report(
-                symbol=selected.epic,
-                timeframe=normalize_timeframe(args.backtest_tf),
-                start_raw=start_label,
-                end_raw=end_label,
-                variant_code=_first_variant_code(args.backtest_variants),
-                mode="walk-forward",
-                trades=list(aggregate_report.trade_log),
-                payload=report.to_dict(),
-                data_root_value=str(csv_path),
-            )
-        else:
-            report = run_backtest_from_csv(
-                config=config,
-                asset=selected,
-                csv_path=csv_path,
-                assumed_spread=args.backtest_spread,
-                slippage_points=args.backtest_slippage_points,
-                slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
-            )
-            LOGGER.info("Backtest report: %s", json.dumps(report.to_dict(), indent=2, ensure_ascii=True))
-            default_start = str(args.backtest_start or "csv-start")
-            default_end = str(args.backtest_end or "csv-end")
-            start_label, end_label = _trade_time_bounds(
-                list(report.trade_log),
-                default_start=default_start,
-                default_end=default_end,
-            )
-            _emit_detailed_report(
-                symbol=selected.epic,
-                timeframe=normalize_timeframe(args.backtest_tf),
-                start_raw=start_label,
-                end_raw=end_label,
-                variant_code=_first_variant_code(args.backtest_variants),
-                mode="backtest",
-                trades=list(report.trade_log),
-                payload=report.to_dict(),
-                data_root_value=str(csv_path),
-            )
+        gate_payloads: dict[str, dict[str, object]] = {}
+        for gate_mode in selected_gate_modes:
+            daily_gate = _build_daily_gate_provider(config=config, mode=gate_mode, events=[])
+            if args.walk_forward:
+                report = run_walk_forward_from_csv(
+                    config=config,
+                    asset=selected,
+                    csv_path=csv_path,
+                    wf_splits=args.wf_splits,
+                    assumed_spread=args.backtest_spread,
+                    slippage_points=args.backtest_slippage_points,
+                    slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+                    daily_gate=daily_gate,
+                )
+                report_dict = report.to_dict()
+                LOGGER.info(
+                    "Walk-forward report (daily_gate=%s): %s",
+                    gate_mode,
+                    json.dumps(report_dict, indent=2, ensure_ascii=True) if args.report else "summary-only (--no-report)",
+                )
+                aggregate_report = report.aggregate
+                default_start = str(args.backtest_start or "csv-start")
+                default_end = str(args.backtest_end or "csv-end")
+                start_label, end_label = _trade_time_bounds(
+                    list(aggregate_report.trade_log),
+                    default_start=default_start,
+                    default_end=default_end,
+                )
+                _emit_detailed_report(
+                    symbol=selected.epic,
+                    timeframe=normalize_timeframe(args.backtest_tf),
+                    start_raw=start_label,
+                    end_raw=end_label,
+                    variant_code=f"{_first_variant_code(args.backtest_variants)}_{gate_mode}",
+                    mode="walk-forward",
+                    trades=list(aggregate_report.trade_log),
+                    payload=report_dict,
+                    data_root_value=str(csv_path),
+                )
+                gate_payloads[gate_mode] = {
+                    "variant": _first_variant_code(args.backtest_variants),
+                    "mode": "walk-forward",
+                    "symbols": [selected.epic],
+                    "reports": {selected.epic: report_dict.get("aggregate", {})},
+                }
+            else:
+                report = run_backtest_from_csv(
+                    config=config,
+                    asset=selected,
+                    csv_path=csv_path,
+                    assumed_spread=args.backtest_spread,
+                    slippage_points=args.backtest_slippage_points,
+                    slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
+                    daily_gate=daily_gate,
+                )
+                report_dict = report.to_dict()
+                LOGGER.info(
+                    "Backtest report (daily_gate=%s): %s",
+                    gate_mode,
+                    json.dumps(report_dict, indent=2, ensure_ascii=True) if args.report else "summary-only (--no-report)",
+                )
+                default_start = str(args.backtest_start or "csv-start")
+                default_end = str(args.backtest_end or "csv-end")
+                start_label, end_label = _trade_time_bounds(
+                    list(report.trade_log),
+                    default_start=default_start,
+                    default_end=default_end,
+                )
+                _emit_detailed_report(
+                    symbol=selected.epic,
+                    timeframe=normalize_timeframe(args.backtest_tf),
+                    start_raw=start_label,
+                    end_raw=end_label,
+                    variant_code=f"{_first_variant_code(args.backtest_variants)}_{gate_mode}",
+                    mode="backtest",
+                    trades=list(report.trade_log),
+                    payload=report_dict,
+                    data_root_value=str(csv_path),
+                )
+                gate_payloads[gate_mode] = {
+                    "variant": _first_variant_code(args.backtest_variants),
+                    "mode": "backtest",
+                    "symbols": [selected.epic],
+                    "reports": {selected.epic: report_dict},
+                }
+        if len(gate_payloads) > 1:
+            _log_daily_gate_comparison(gate_payloads=gate_payloads, symbols=[selected.epic])
         _maybe_open_reports()
         return
 
@@ -1044,70 +1250,142 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
     variants = _parse_backtest_variants(args.backtest_variants)
     if args.walk_forward and len(variants) > 1:
         raise RuntimeError("Walk-forward supports one variant at a time. Use --backtest-variants W0 or W3.")
+    all_modes = list(dict.fromkeys(selected_gate_modes))
+    if args.daily_gate_grid_search:
+        all_modes = ["off", "trend", "trend_vol_news"]
 
-    def _run_auto() -> dict[str, dict[str, object]]:
+    symbol_run_cache: dict[str, dict[str, object]] = {}
+
+    def _prepare_symbol_run_data(symbol: str) -> dict[str, object]:
+        cached = symbol_run_cache.get(symbol)
+        if cached is not None:
+            return cached
+        loaded = loader.load_symbol_data(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            price_mode=args.backtest_price,
+        )
+        data_health = loaded.diagnostics.get("data_health", {})
+        LOGGER.info(
+            "Backtest data health | symbol=%s tf=%s bars=%s min_ts=%s max_ts=%s dups=%s gaps=%s",
+            symbol,
+            timeframe,
+            data_health.get("bars"),
+            data_health.get("min_ts_utc"),
+            data_health.get("max_ts_utc"),
+            data_health.get("duplicate_timestamps"),
+            data_health.get("gap_count_over_1bar"),
+        )
+        frame = loaded.frame
+        candles = BacktestRunner._frame_to_candles(frame)
+        spread_series = frame.get("spread")
+        spread_from_data = (
+            float(spread_series.dropna().median())
+            if spread_series is not None and hasattr(spread_series, "dropna") and not spread_series.dropna().empty
+            else None
+        )
+        symbol_spread_map = config.backtest_tuning.assumed_spread_by_symbol
+        symbol_spread_default = symbol_spread_map.get(symbol.upper())
+        if symbol_spread_default is None:
+            symbol_spread_default = symbol_spread_map.get(asset_map[symbol].epic.upper())
+        if spread_from_data is not None:
+            assumed_spread = spread_from_data
+        elif symbol_spread_default is not None:
+            assumed_spread = float(symbol_spread_default)
+        else:
+            assumed_spread = float(args.backtest_spread)
+
+        nan_counts = data_health.get("nan_counts", {}) if isinstance(data_health, dict) else {}
+        bars_count = int(data_health.get("bars", 0)) if isinstance(data_health, dict) and data_health.get("bars") is not None else 0
+        close_bid_nan = int(nan_counts.get("close_bid", bars_count)) if isinstance(nan_counts, dict) else bars_count
+        close_ask_nan = int(nan_counts.get("close_ask", bars_count)) if isinstance(nan_counts, dict) else bars_count
+        spread_mode = "ASSUMED_OHLC" if bars_count > 0 and close_bid_nan >= bars_count and close_ask_nan >= bars_count else "REAL_BIDASK"
+
+        prepared = {
+            "loaded": loaded,
+            "frame": frame,
+            "candles": candles,
+            "assumed_spread": float(assumed_spread),
+            "spread_mode": spread_mode,
+        }
+        symbol_run_cache[symbol] = prepared
+        return prepared
+
+    needs_news = any(mode == "trend_vol_news" for mode in all_modes)
+    gate_events: list[Event] = []
+    if needs_news:
+        news_provider = build_news_provider(config, root)
+        gate_events = news_provider.get_high_impact_events(
+            start - timedelta(minutes=max(config.daily_gate.pre_minutes, 1)),
+            end + timedelta(minutes=max(config.daily_gate.post_minutes, 1)),
+        )
+
+    def _summarize_payloads(payloads: dict[str, dict[str, object]]) -> dict[str, float]:
+        total_pnl = 0.0
+        max_drawdown = 0.0
+        expectancy_values: list[float] = []
+        for payload in payloads.values():
+            reports_raw = payload.get("reports")
+            if not isinstance(reports_raw, dict):
+                continue
+            for report in reports_raw.values():
+                if not isinstance(report, dict):
+                    continue
+                total_pnl += float(report.get("total_pnl", 0.0))
+                max_drawdown = max(max_drawdown, float(report.get("max_drawdown", 0.0)))
+                expectancy_values.append(float(report.get("expectancy", 0.0)))
+        expectancy = (sum(expectancy_values) / len(expectancy_values)) if expectancy_values else 0.0
+        return {
+            "total_pnl": total_pnl,
+            "max_drawdown": max_drawdown,
+            "expectancy": expectancy,
+        }
+
+    def _run_auto_for_gate(
+        *,
+        gate_mode: str,
+        gate_overrides: dict[str, float | int | None] | None = None,
+        emit_reports: bool = True,
+    ) -> dict[str, dict[str, object]]:
         payloads: dict[str, dict[str, object]] = {}
         for variant in variants:
             reports: dict[str, dict[str, object]] = {}
             for symbol in symbols:
-                loaded = loader.load_symbol_data(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    start=start,
-                    end=end,
-                    price_mode=args.backtest_price,
+                prepared = _prepare_symbol_run_data(symbol)
+                loaded = prepared["loaded"]
+                frame = prepared["frame"]
+                candles_for_gate = prepared["candles"]
+                daily_gate = _build_daily_gate_provider(
+                    config=config,
+                    mode=gate_mode,
+                    candles=candles_for_gate,
+                    events=gate_events,
+                    overrides=gate_overrides,
                 )
-                data_health = loaded.diagnostics.get("data_health", {})
-                LOGGER.info(
-                    "Backtest data health | symbol=%s tf=%s bars=%s min_ts=%s max_ts=%s dups=%s gaps=%s",
-                    symbol,
-                    timeframe,
-                    data_health.get("bars"),
-                    data_health.get("min_ts_utc"),
-                    data_health.get("max_ts_utc"),
-                    data_health.get("duplicate_timestamps"),
-                    data_health.get("gap_count_over_1bar"),
-                )
-                frame = loaded.frame
-                spread_series = frame.get("spread")
-                spread_from_data = (
-                    float(spread_series.dropna().median())
-                    if spread_series is not None and hasattr(spread_series, "dropna") and not spread_series.dropna().empty
-                    else None
-                )
-                symbol_spread_map = config.backtest_tuning.assumed_spread_by_symbol
-                symbol_spread_default = symbol_spread_map.get(symbol.upper())
-                if symbol_spread_default is None:
-                    symbol_spread_default = symbol_spread_map.get(asset_map[symbol].epic.upper())
-                if spread_from_data is not None:
-                    assumed_spread = spread_from_data
-                elif symbol_spread_default is not None:
-                    assumed_spread = float(symbol_spread_default)
-                else:
-                    assumed_spread = float(args.backtest_spread)
+                assumed_spread = float(prepared["assumed_spread"])
+                spread_mode = str(prepared["spread_mode"])
 
-                nan_counts = data_health.get("nan_counts", {}) if isinstance(data_health, dict) else {}
-                bars_count = int(data_health.get("bars", 0)) if isinstance(data_health, dict) and data_health.get("bars") is not None else 0
-                close_bid_nan = int(nan_counts.get("close_bid", bars_count)) if isinstance(nan_counts, dict) else bars_count
-                close_ask_nan = int(nan_counts.get("close_ask", bars_count)) if isinstance(nan_counts, dict) else bars_count
-                spread_mode = "ASSUMED_OHLC" if bars_count > 0 and close_bid_nan >= bars_count and close_ask_nan >= bars_count else "REAL_BIDASK"
-
-                debug_file = reports_dir / f"{variant.code}_debug_exec_{symbol}.jsonl"
-                no_price_debug_file = reports_dir / f"{variant.code}_debug_no_price_{symbol}.jsonl"
-                reaction_timeout_debug_file = reports_dir / f"{variant.code}_debug_reaction_timeout_{symbol}.jsonl"
+                debug_file = (reports_dir / f"{variant.code}_{gate_mode}_debug_exec_{symbol}.jsonl") if emit_reports else None
+                no_price_debug_file = (reports_dir / f"{variant.code}_{gate_mode}_debug_no_price_{symbol}.jsonl") if emit_reports else None
+                reaction_timeout_debug_file = (
+                    reports_dir / f"{variant.code}_{gate_mode}_debug_reaction_timeout_{symbol}.jsonl"
+                ) if emit_reports else None
                 data_context = {
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "price_mode_requested": args.backtest_price,
                     "spread_mode": spread_mode,
                     "assumed_spread_used": float(assumed_spread),
+                    "daily_gate_mode": gate_mode,
                     **(loaded.diagnostics if isinstance(getattr(loaded, "diagnostics", None), dict) else {}),
                 }
                 if args.walk_forward:
                     report = run_walk_forward_multi_strategy(
                         config=config,
                         asset=asset_map[symbol],
-                        candles_m5=BacktestRunner._frame_to_candles(frame),
+                        candles_m5=candles_for_gate,
                         wf_splits=args.wf_splits,
                         assumed_spread=assumed_spread,
                         slippage_points=args.backtest_slippage_points,
@@ -1117,6 +1395,7 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                         no_price_debug_path=no_price_debug_file,
                         reaction_timeout_debug_path=reaction_timeout_debug_file,
                         data_context=data_context,
+                        daily_gate=daily_gate,
                     )
                     report_dict = report.to_dict()
                     report_trades = list(report.aggregate.trade_log)
@@ -1135,6 +1414,8 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                         no_price_debug_path=no_price_debug_file,
                         reaction_timeout_debug_path=reaction_timeout_debug_file,
                         data_context=data_context,
+                        daily_gate=daily_gate,
+                        daily_gate_prepared=True,
                     )
                     report_dict = report.to_dict()
                     report_dict["segment_health"] = segment_meta
@@ -1149,33 +1430,40 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     "spread_mode": spread_mode,
                     "assumed_spread_used": float(report_dict.get("assumed_spread_used", assumed_spread)),
                 }
+                report_dict["daily_gate_mode"] = gate_mode
+                if gate_overrides:
+                    report_dict["daily_gate_params"] = gate_overrides
                 reports[symbol] = report_dict
-                _emit_detailed_report(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    start_raw=str(args.backtest_start),
-                    end_raw=str(args.backtest_end),
-                    variant_code=variant.code,
-                    mode="walk-forward" if args.walk_forward else "backtest",
-                    trades=report_trades,
-                    payload=report_dict,
-                    data_root_value=str(data_root),
-                )
+                if emit_reports:
+                    _emit_detailed_report(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        start_raw=str(args.backtest_start),
+                        end_raw=str(args.backtest_end),
+                        variant_code=f"{variant.code}_{gate_mode}",
+                        mode="walk-forward" if args.walk_forward else "backtest",
+                        trades=report_trades,
+                        payload=report_dict,
+                        data_root_value=str(data_root),
+                    )
 
-                filename = _variant_report_filename(
-                    variant=variant,
-                    start_raw=str(args.backtest_start),
-                    end_raw=str(args.backtest_end),
-                    start_dt=start,
-                    end_dt=end,
-                    symbol=symbol,
-                )
-                target = reports_dir / filename
-                target.write_text(json.dumps(report_dict, indent=2, ensure_ascii=True), encoding="utf-8")
+                    filename = _variant_report_filename(
+                        variant=variant,
+                        start_raw=str(args.backtest_start),
+                        end_raw=str(args.backtest_end),
+                        start_dt=start,
+                        end_dt=end,
+                        symbol=symbol,
+                    )
+                    suffix = f"_{gate_mode}"
+                    target = reports_dir / filename.replace(".json", f"{suffix}.json")
+                    target.write_text(json.dumps(report_dict, indent=2, ensure_ascii=True), encoding="utf-8")
 
             payloads[variant.code] = {
                 "variant": variant.code,
                 "mode": "walk-forward" if args.walk_forward else "backtest",
+                "daily_gate_mode": gate_mode,
+                "daily_gate_params": gate_overrides or {},
                 "symbols": symbols,
                 "timeframe": timeframe,
                 "price": args.backtest_price,
@@ -1186,16 +1474,95 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
             }
         return payloads
 
+    def _run_grid_for_mode(mode: str) -> tuple[dict[str, float | int | None], list[dict[str, object]]]:
+        ranked: list[dict[str, object]] = []
+        grid_space = _gate_param_space_for_grid(config)
+        if int(args.daily_gate_grid_limit) > 0:
+            grid_space = grid_space[: int(args.daily_gate_grid_limit)]
+        for params in grid_space:
+            payloads = _run_auto_for_gate(gate_mode=mode, gate_overrides=params, emit_reports=False)
+            summary = _summarize_payloads(payloads)
+            ranked.append(
+                {
+                    "mode": mode,
+                    "params": dict(params),
+                    "total_pnl": float(summary["total_pnl"]),
+                    "max_drawdown": float(summary["max_drawdown"]),
+                    "expectancy": float(summary["expectancy"]),
+                }
+            )
+        ranked.sort(key=lambda item: (-float(item["total_pnl"]), float(item["max_drawdown"]), -float(item["expectancy"])))
+        best = ranked[0] if ranked else {"params": {}}
+        best_params = dict(best.get("params", {}))
+        LOGGER.info("Daily gate grid top5 (%s): %s", mode, json.dumps(ranked[:5], ensure_ascii=True))
+        return best_params, ranked[:5]
+
     attempt = 0
     while True:
         try:
-            variant_payloads = _run_auto()
-            if len(variant_payloads) == 1:
-                payload = next(iter(variant_payloads.values()))
-                LOGGER.info("Backtest auto-data report: %s", json.dumps(payload, indent=2, ensure_ascii=True))
-            else:
-                LOGGER.info("Backtest auto-data variants: %s", ",".join(variant_payloads.keys()))
-                _log_variant_comparison(variant_payloads=variant_payloads, symbols=symbols)
+            mode_overrides: dict[str, dict[str, float | int | None]] = {}
+            grid_report: dict[str, object] = {}
+            run_modes = list(all_modes)
+            if args.daily_gate_grid_search:
+                run_modes = ["off", "trend", "trend_vol_news"]
+                for mode in ["trend", "trend_vol_news"]:
+                    best_params, top5 = _run_grid_for_mode(mode)
+                    mode_overrides[mode] = best_params
+                    grid_report[mode] = {"best_params": best_params, "top5": top5}
+                grid_path = reports_dir / "daily_gate_grid_search.json"
+                grid_path.write_text(json.dumps(grid_report, indent=2, ensure_ascii=True), encoding="utf-8")
+                LOGGER.info("Daily gate grid-search report saved: %s", grid_path)
+
+            gate_payloads: dict[str, dict[str, object]] = {}
+            for gate_mode in run_modes:
+                variant_payloads = _run_auto_for_gate(
+                    gate_mode=gate_mode,
+                    gate_overrides=mode_overrides.get(gate_mode),
+                    emit_reports=True,
+                )
+                merged_reports: dict[str, dict[str, object]] = {}
+                for payload in variant_payloads.values():
+                    reports_raw = payload.get("reports")
+                    if isinstance(reports_raw, dict):
+                        for symbol, report in reports_raw.items():
+                            if isinstance(report, dict):
+                                merged_reports[str(symbol)] = report
+                gate_payloads[gate_mode] = {
+                    "variant": ",".join(variant_payloads.keys()),
+                    "mode": "walk-forward" if args.walk_forward else "backtest",
+                    "daily_gate_mode": gate_mode,
+                    "symbols": symbols,
+                    "reports": merged_reports,
+                }
+                if len(variant_payloads) == 1:
+                    payload = next(iter(variant_payloads.values()))
+                    if args.report:
+                        LOGGER.info(
+                            "Backtest auto-data report (daily_gate=%s): %s",
+                            gate_mode,
+                            json.dumps(payload, indent=2, ensure_ascii=True),
+                        )
+                    else:
+                        LOGGER.info(
+                            "Backtest auto-data summary (daily_gate=%s): variant=%s symbols=%s",
+                            gate_mode,
+                            payload.get("variant"),
+                            ",".join(str(item) for item in payload.get("symbols", [])),
+                        )
+                        _log_variant_comparison(variant_payloads=variant_payloads, symbols=symbols)
+                else:
+                    LOGGER.info(
+                        "Backtest auto-data variants (daily_gate=%s): %s",
+                        gate_mode,
+                        ",".join(variant_payloads.keys()),
+                    )
+                    _log_variant_comparison(variant_payloads=variant_payloads, symbols=symbols)
+
+            if len(gate_payloads) > 1:
+                _log_daily_gate_comparison(gate_payloads=gate_payloads, symbols=symbols)
+                comparison_path = reports_dir / "daily_gate_comparison.json"
+                comparison_path.write_text(json.dumps(gate_payloads, indent=2, ensure_ascii=True), encoding="utf-8")
+                LOGGER.info("Daily gate comparison report saved: %s", comparison_path)
             _maybe_open_reports()
             return
         except MissingDataError as exc:
@@ -1248,11 +1615,17 @@ def _batch_trade_rows(
                 "size": float(trade.size),
                 "pnl": float(trade.pnl),
                 "fees": float(getattr(trade, "fees", 0.0) or 0.0),
+                "spread_cost": float(getattr(trade, "spread_cost", 0.0) or 0.0),
+                "slippage_cost": float(getattr(trade, "slippage_cost", 0.0) or 0.0),
+                "commission_cost": float(getattr(trade, "commission_cost", 0.0) or 0.0),
+                "swap_cost": float(getattr(trade, "swap_cost", 0.0) or 0.0),
+                "fx_cost": float(getattr(trade, "fx_cost", 0.0) or 0.0),
                 "r_multiple": float(trade.r_multiple) if trade.r_multiple is not None else None,
                 "score": float(trade.score) if getattr(trade, "score", None) is not None else None,
                 "forced_exit": bool(getattr(trade, "forced_exit", False)),
                 "reason_open": str(getattr(trade, "reason_open", "SIGNAL") or "SIGNAL"),
                 "reason_close": str(getattr(trade, "reason_close", "") or getattr(trade, "reason", "")),
+                "gate_bias": str(getattr(trade, "gate_bias", "") or ""),
                 "trade_id": trade_id,
             }
         )
@@ -1373,6 +1746,11 @@ def run_batch_worker_mode(args: argparse.Namespace, config: AppConfig, assets: l
             "size",
             "pnl",
             "fees",
+            "spread_cost",
+            "slippage_cost",
+            "commission_cost",
+            "swap_cost",
+            "fx_cost",
             "r_multiple",
             "score",
             "forced_exit",
@@ -1495,7 +1873,7 @@ def run_batch_backtest_mode(args: argparse.Namespace, config: AppConfig, root: P
         workers=max(1, int(args.workers)),
         warmup_days=max(0, int(args.warmup_days)),
         out_root=out_root,
-        initial_equity=float(args.initial_equity),
+        initial_equity=float(args.initial_equity if args.initial_equity is not None else config.risk.equity),
         continue_on_error=bool(args.continue_on_error),
     )
     LOGGER.info("Batch backtest summary: %s", json.dumps(summary, indent=2, ensure_ascii=True))
@@ -2258,6 +2636,13 @@ def run_multi_strategy_loop(
     orderflow_full_symbols = set(config.orderflow.full_symbols)
     orderflow_default_mode = config.orderflow.default_mode
     orderflow_default_window = int(config.orderflow.default_window)
+    daily_gate_mode = _daily_gate_mode(config)
+    daily_gate_services: dict[str, DailyGateProvider] = {}
+    if daily_gate_mode != "off":
+        for epic in states.keys():
+            provider = _build_daily_gate_provider(config=config, mode=daily_gate_mode, events=[])
+            if provider is not None:
+                daily_gate_services[epic] = provider
 
     def _stop(signum: int, _frame: object) -> None:
         LOGGER.info("Received signal %s, shutting down.", signum)
@@ -2346,6 +2731,9 @@ def run_multi_strategy_loop(
                 now - timedelta(minutes=config.news_gate.block_minutes + 1),
                 now + timedelta(minutes=config.news_gate.block_minutes + 1),
             )
+            if daily_gate_services:
+                for provider in daily_gate_services.values():
+                    provider.set_events(events)
             news_blocked = is_blocked(now, events, block_minutes=config.news_gate.block_minutes)
             if news_blocked:
                 for order in order_executor.get_pending_orders():
@@ -2420,6 +2808,12 @@ def run_multi_strategy_loop(
                 )
                 q = quotes.get(epic)
                 spread = q[2] if q is not None else None
+                gate_provider = daily_gate_services.get(epic)
+                gate_result = None
+                if gate_provider is not None:
+                    m5_gate_candles = closed_candles(state.cache.get(config.timeframes.m5, []))
+                    gate_provider.refresh_if_needed(now=now, candles=m5_gate_candles)
+                    gate_result = gate_provider.evaluate(ts=now, symbol=epic, spread=spread)
                 routes = strategy_router.routes_for(epic)
                 best_outcome: StrategyOutcome | None = None
                 best_route = routes[0]
@@ -2619,10 +3013,41 @@ def run_multi_strategy_loop(
                 best_outcome.payload["route_rankings"] = route_summaries
                 state.pending_outcome = best_outcome
                 final_decision[epic] = "MANAGE" if state.entry_state == "FILLED" else "NO_SIGNAL"
+                if gate_result is not None:
+                    best_outcome.payload["daily_gate"] = {
+                        "mode": daily_gate_mode,
+                        "bias": gate_result.bias,
+                        "reasons": list(gate_result.reasons),
+                        "allowed_strategies": list(gate_result.allowed_strategies),
+                    }
+                    best_outcome.evaluation.gates.setdefault("DailyGate", True)
 
                 if best_outcome.order_request is None:
                     continue
                 daily_summary.signal_candidates += 1
+                if gate_result is not None:
+                    gate_reasons: list[str] = list(gate_result.reasons)
+                    gate_bias = str(gate_result.bias).upper()
+                    side = str(best_outcome.order_request.side).upper()
+                    if gate_bias == "FLAT":
+                        gate_reasons.append("DAILY_GATE_FLAT")
+                    elif gate_bias == "LONG" and side != "LONG":
+                        gate_reasons.append("DAILY_GATE_LONG_ONLY")
+                    elif gate_bias == "SHORT" and side != "SHORT":
+                        gate_reasons.append("DAILY_GATE_SHORT_ONLY")
+                    if gate_result.allowed_strategies:
+                        allowed = {str(item).upper() for item in gate_result.allowed_strategies}
+                        if str(best_outcome.strategy_name).upper() not in allowed:
+                            gate_reasons.append("DAILY_GATE_STRATEGY_BLOCKED")
+                    if gate_reasons:
+                        best_outcome.evaluation.gates["DailyGate"] = False
+                        if best_outcome.evaluation.gate_blocked is None:
+                            best_outcome.evaluation.gate_blocked = "DailyGate"
+                        for code in list(dict.fromkeys(gate_reasons)):
+                            if code not in best_outcome.reason_codes:
+                                best_outcome.reason_codes.append(code)
+                        final_decision[epic] = "NO_SIGNAL"
+                        continue
                 if not state.asset.trade_enabled:
                     best_outcome.reason_codes.append("OBSERVE_ONLY_ASSET")
                     continue
@@ -2699,6 +3124,10 @@ def run_multi_strategy_loop(
                 cooldown = journal.get_risk_state(f"ASSET:{intent.symbol}").cooldown_until
                 open_asset_now = position_manager.get_open_positions(epic=intent.symbol)
                 open_all_now = position_manager.get_open_positions()
+                effective_risk_per_trade = risk_engine.effective_risk_per_trade(
+                    risk_multiplier=intent.risk_multiplier,
+                    equity=config.risk.equity,
+                )
                 risk_check = risk_engine.can_open_new_trade_multi(
                     now=now,
                     asset_epic=intent.symbol,
@@ -2706,8 +3135,9 @@ def run_multi_strategy_loop(
                     global_stats=global_stats,
                     asset_open_positions=open_asset_now,
                     all_open_positions=open_all_now,
-                    new_trade_risk_amount=risk_engine.per_trade_risk_amount() * intent.risk_multiplier,
+                    new_trade_risk_amount=config.risk.equity * effective_risk_per_trade,
                     cooldown_until=cooldown,
+                    equity=config.risk.equity,
                 )
                 if not risk_check.allowed:
                     for code in risk_check.reason_codes:
@@ -2722,21 +3152,52 @@ def run_multi_strategy_loop(
                     final_decision[intent.symbol] = "NO_SIGNAL"
                     continue
 
-                size = position_size_from_risk(
-                    equity=config.risk.equity,
-                    risk_per_trade=config.risk.risk_per_trade * intent.risk_multiplier,
-                    entry_price=intent.signal.entry_price,
-                    stop_price=intent.signal.stop_price,
-                    min_size=intent.state.asset.min_size,
-                    size_step=intent.state.asset.size_step,
+                risk_distance = abs(float(intent.signal.entry_price) - float(intent.signal.stop_price))
+                raw_size = ((config.risk.equity * effective_risk_per_trade) / risk_distance) if risk_distance > 0 else 0.0
+                spread_now = intent.state.quote[2] if intent.state.quote is not None else None
+                open_margin = _estimated_open_margin(positions=open_all_now, config=config)
+                free_margin = max(0.0, float(config.risk.equity) - float(open_margin))
+                feasibility = validate_order(
+                    raw_size=raw_size,
+                    entry_price=float(intent.signal.entry_price),
+                    stop_price=float(intent.signal.stop_price),
+                    take_profit=float(intent.signal.take_profit),
+                    min_size=float(intent.state.asset.min_size),
+                    size_step=float(intent.state.asset.size_step),
+                    max_risk_cash=float(config.risk.equity) * float(effective_risk_per_trade),
+                    equity=float(config.risk.equity),
+                    open_positions_count=len(open_asset_now),
+                    max_positions=int(config.risk.max_positions),
+                    spread=(float(spread_now) if spread_now is not None else None),
+                    spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+                    min_stop_distance=float(intent.state.asset.minimal_tick_buffer),
+                    free_margin=free_margin,
+                    margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
+                    max_leverage=float(config.backtest_tuning.broker_leverage),
+                    margin_safety_factor=1.0,
+                    cooldown_blocked=bool(cooldown is not None and now < cooldown),
+                    news_blocked=bool(news_blocked),
                 )
-                if size <= 0:
-                    intent.outcome.reason_codes.append("SIZE_INVALID")
+                if not feasibility.ok:
+                    reject_code = feasibility.reason.value if feasibility.reason is not None else "ORDER_FEASIBILITY_REJECT"
+                    intent.outcome.reason_codes.append(reject_code)
                     intent.outcome.reason_codes.append("RISK_GATE_SIZE_INVALID")
                     intent.outcome.evaluation.gates.setdefault("RiskGate", True)
                     intent.outcome.evaluation.gates["RiskGate"] = False
                     if intent.outcome.evaluation.gate_blocked is None:
                         intent.outcome.evaluation.gate_blocked = "RiskGate"
+                    intent.outcome.payload["feasibility"] = feasibility.details
+                    final_decision[intent.symbol] = "NO_SIGNAL"
+                    continue
+                size = float(feasibility.details.get("rounded_size", 0.0))
+                if size <= 0:
+                    intent.outcome.reason_codes.append("SIZE_TOO_SMALL")
+                    intent.outcome.reason_codes.append("RISK_GATE_SIZE_INVALID")
+                    intent.outcome.evaluation.gates.setdefault("RiskGate", True)
+                    intent.outcome.evaluation.gates["RiskGate"] = False
+                    if intent.outcome.evaluation.gate_blocked is None:
+                        intent.outcome.evaluation.gate_blocked = "RiskGate"
+                    intent.outcome.payload["feasibility"] = feasibility.details
                     final_decision[intent.symbol] = "NO_SIGNAL"
                     continue
 
@@ -2928,12 +3389,20 @@ def run() -> None:
     setup_logging(os.getenv("LOG_LEVEL", "INFO"))
 
     root = Path(__file__).resolve().parent
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = root / config_path
+    config_path = _resolve_config_path(root, str(args.config))
     config = load_config(config_path)
+    _apply_cli_overrides(args, config)
     assets = build_asset_universe(config)
     LOGGER.info("Assets configured: %s", ",".join(f"{a.epic}{'' if a.trade_enabled else '(observe)'}" for a in assets))
+    LOGGER.info(
+        "Currency config | account=%s fx_fee_rate=%.6f fx_mode=%s fx_source=%s fx_apply_to=%s reporting=%s",
+        config.account_currency,
+        float(config.fx_conversion_fee_rate),
+        config.fx_fee_mode,
+        config.fx_rate_source,
+        ",".join(config.fx_apply_to),
+        config.reporting_currency,
+    )
 
     if args.batch_worker:
         run_batch_worker_mode(args, config, assets, root)
@@ -3335,6 +3804,10 @@ def run() -> None:
                                     if state.h1_snapshot is not None and state.h1_snapshot.safe_mode
                                     else 1.0
                                 )
+                                effective_risk_per_trade = risk_engine.effective_risk_per_trade(
+                                    risk_multiplier=safe_mode_multiplier,
+                                    equity=config.risk.equity,
+                                )
                                 global_stats = journal.get_daily_stats(day, epic="GLOBAL")
                                 cooldown = journal.get_risk_state(f"ASSET:{epic}").cooldown_until
                                 open_all = position_manager.get_open_positions()
@@ -3345,8 +3818,9 @@ def run() -> None:
                                     global_stats=global_stats,
                                     asset_open_positions=open_asset,
                                     all_open_positions=open_all,
-                                    new_trade_risk_amount=risk_engine.per_trade_risk_amount() * safe_mode_multiplier,
+                                    new_trade_risk_amount=config.risk.equity * effective_risk_per_trade,
                                     cooldown_until=cooldown,
+                                    equity=config.risk.equity,
                                 )
                                 if not risk_check.allowed:
                                     decision.reason_codes.extend([c for c in risk_check.reason_codes if c not in decision.reason_codes])
@@ -3364,18 +3838,44 @@ def run() -> None:
                                         journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
                                         final_decision = "NO_SIGNAL"
                                         continue
-                                    size = position_size_from_risk(
-                                        equity=config.risk.equity,
-                                        risk_per_trade=config.risk.risk_per_trade * safe_mode_multiplier,
-                                        entry_price=decision.signal.entry_price,
-                                        stop_price=decision.signal.stop_price,
-                                        min_size=state.asset.min_size,
-                                        size_step=state.asset.size_step,
+                                    risk_distance = abs(float(decision.signal.entry_price) - float(decision.signal.stop_price))
+                                    raw_size = ((config.risk.equity * effective_risk_per_trade) / risk_distance) if risk_distance > 0 else 0.0
+                                    open_margin = _estimated_open_margin(positions=open_all, config=config)
+                                    free_margin = max(0.0, float(config.risk.equity) - float(open_margin))
+                                    feasibility = validate_order(
+                                        raw_size=raw_size,
+                                        entry_price=float(decision.signal.entry_price),
+                                        stop_price=float(decision.signal.stop_price),
+                                        take_profit=float(decision.signal.take_profit),
+                                        min_size=float(state.asset.min_size),
+                                        size_step=float(state.asset.size_step),
+                                        max_risk_cash=float(config.risk.equity) * float(effective_risk_per_trade),
+                                        equity=float(config.risk.equity),
+                                        open_positions_count=len(open_asset),
+                                        max_positions=int(config.risk.max_positions),
+                                        spread=(float(spread) if spread is not None else None),
+                                        spread_limit=(float(config.daily_gate.max_spread) if config.daily_gate.max_spread is not None else None),
+                                        min_stop_distance=float(state.asset.minimal_tick_buffer),
+                                        free_margin=free_margin,
+                                        margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
+                                        max_leverage=float(config.backtest_tuning.broker_leverage),
+                                        margin_safety_factor=1.0,
+                                        cooldown_blocked=bool(cooldown is not None and now < cooldown),
+                                        news_blocked=bool(news_blocked),
                                     )
                                     if safe_mode_multiplier < 1.0:
                                         decision.payload["safe_mode_risk_multiplier"] = safe_mode_multiplier
+                                    decision.payload["feasibility"] = feasibility.details
+                                    if not feasibility.ok:
+                                        reject_code = feasibility.reason.value if feasibility.reason is not None else "ORDER_FEASIBILITY_REJECT"
+                                        if reject_code not in decision.reason_codes:
+                                            decision.reason_codes.append(reject_code)
+                                        journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
+                                        final_decision = "NO_SIGNAL"
+                                        continue
+                                    size = float(feasibility.details.get("rounded_size", 0.0))
                                     if size <= 0:
-                                        decision.reason_codes.append("SIZE_INVALID")
+                                        decision.reason_codes.append("SIZE_TOO_SMALL")
                                         journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
                                         final_decision = "NO_SIGNAL"
                                     else:

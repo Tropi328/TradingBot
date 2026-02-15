@@ -10,10 +10,18 @@ from pydantic import BaseModel, Field, model_validator
 class InstrumentConfig(BaseModel):
     epic: str = "XAUUSD"
     currency: str = "USD"
+    instrument_currency: str | None = None
     point_size: float = 0.01
     minimal_tick_buffer: float = 0.05
     min_size: float = 0.01
     size_step: float = 0.01
+
+    @model_validator(mode="after")
+    def normalize_currency_fields(self) -> "InstrumentConfig":
+        self.currency = str(self.currency).strip().upper() or "USD"
+        instrument_ccy = str(self.instrument_currency or "").strip().upper()
+        self.instrument_currency = instrument_ccy or self.currency
+        return self
 
 
 class AssetConfig(InstrumentConfig):
@@ -82,6 +90,57 @@ class NewsGateConfig(BaseModel):
     block_minutes: int = 60
 
 
+class DailyGateConfig(BaseModel):
+    mode: str | bool = "off"
+    ema_fast: int = 20
+    ema_slow: int = 50
+    thr: float = 0.001
+    atr_period: int = 14
+    vol_max: float = 0.02
+    max_spread: float | None = None
+    pre_minutes: int = 30
+    post_minutes: int = 30
+    rollover_start_utc: str | None = None
+    rollover_end_utc: str | None = None
+    allowed_strategies: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_values(self) -> "DailyGateConfig":
+        if isinstance(self.mode, bool):
+            mode_normalized = "off" if self.mode is False else "trend"
+        else:
+            mode_normalized = str(self.mode).strip().lower()
+        if mode_normalized in {"false", "none", ""}:
+            mode_normalized = "off"
+        if mode_normalized not in {"off", "trend", "trend_vol_news"}:
+            raise ValueError("daily_gate.mode must be one of: off, trend, trend_vol_news")
+        self.mode = mode_normalized
+        if self.ema_fast <= 0:
+            raise ValueError("daily_gate.ema_fast must be > 0")
+        if self.ema_slow <= 0:
+            raise ValueError("daily_gate.ema_slow must be > 0")
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError("daily_gate.ema_fast must be < daily_gate.ema_slow")
+        if self.thr < 0:
+            raise ValueError("daily_gate.thr must be >= 0")
+        if self.atr_period <= 0:
+            raise ValueError("daily_gate.atr_period must be > 0")
+        if self.vol_max <= 0:
+            raise ValueError("daily_gate.vol_max must be > 0")
+        if self.max_spread is not None and self.max_spread <= 0:
+            raise ValueError("daily_gate.max_spread must be > 0 when provided")
+        if self.pre_minutes < 0:
+            raise ValueError("daily_gate.pre_minutes must be >= 0")
+        if self.post_minutes < 0:
+            raise ValueError("daily_gate.post_minutes must be >= 0")
+        self.allowed_strategies = [
+            str(item).strip().upper()
+            for item in self.allowed_strategies
+            if str(item).strip()
+        ]
+        return self
+
+
 class CorrelationGroupConfig(BaseModel):
     name: str
     epics: list[str]
@@ -105,6 +164,14 @@ class RiskConfig(BaseModel):
     max_total_risk_pct: float = 0.015
     cooldown_loss_streak: int = 2
     cooldown_minutes: int = 60
+    low_equity_mode_enabled: bool = True
+    low_equity_threshold: float = 250.0
+    low_equity_risk_multiplier: float = 0.35
+    low_equity_risk_per_trade_cap: float = 0.02
+    low_equity_max_trades_per_day: int = 2
+    low_equity_daily_stop_pct: float = 0.01
+    low_equity_min_size_fallback_enabled: bool = True
+    low_equity_min_size_fallback_max_risk_pct: float = 0.02
     correlation_groups: list[CorrelationGroupConfig] = Field(
         default_factory=lambda: [
             CorrelationGroupConfig(
@@ -125,6 +192,18 @@ class RiskConfig(BaseModel):
             raise ValueError("max_total_risk_pct must be > 0")
         if self.global_max_positions <= 0:
             raise ValueError("global_max_positions must be > 0")
+        if self.low_equity_threshold <= 0:
+            raise ValueError("low_equity_threshold must be > 0")
+        if not (0 < self.low_equity_risk_multiplier <= 1.0):
+            raise ValueError("low_equity_risk_multiplier must be in (0,1]")
+        if not (0 < self.low_equity_risk_per_trade_cap <= 1.0):
+            raise ValueError("low_equity_risk_per_trade_cap must be in (0,1]")
+        if self.low_equity_max_trades_per_day <= 0:
+            raise ValueError("low_equity_max_trades_per_day must be > 0")
+        if not (0 < self.low_equity_daily_stop_pct <= 1.0):
+            raise ValueError("low_equity_daily_stop_pct must be in (0,1]")
+        if not (0 <= self.low_equity_min_size_fallback_max_risk_pct <= 1.0):
+            raise ValueError("low_equity_min_size_fallback_max_risk_pct must be in [0,1]")
         return self
 
 
@@ -329,6 +408,7 @@ class BacktestTuningConfig(BaseModel):
     overnight_swap_time_utc: str = "23:00"
     overnight_swap_long_pct: float = -0.016
     overnight_swap_short_pct: float = 0.0076
+    fx_conversion_pct: float = 0.0
 
     @model_validator(mode="after")
     def validate_values(self) -> "BacktestTuningConfig":
@@ -392,6 +472,8 @@ class BacktestTuningConfig(BaseModel):
             raise ValueError("broker_leverage must be > 0")
         if not (0 < self.broker_margin_requirement_pct <= 100):
             raise ValueError("broker_margin_requirement_pct must be in (0,100]")
+        if not (0 <= self.fx_conversion_pct <= 100):
+            raise ValueError("fx_conversion_pct must be in [0,100]")
         time_raw = str(self.overnight_swap_time_utc).strip()
         parts = time_raw.split(":")
         if len(parts) != 2:
@@ -477,6 +559,13 @@ class OrderflowConfig(BaseModel):
 
 class AppConfig(BaseModel):
     timezone: str = "Europe/Warsaw"
+    account_currency: str = "USD"
+    fx_conversion_fee_rate: float = 0.007
+    fx_fee_mode: str = "all_in_rate"
+    fx_rate_source: str = "static"
+    fx_static_rates: dict[str, float] = Field(default_factory=dict)
+    fx_apply_to: list[str] = Field(default_factory=lambda: ["pnl", "swap", "commission"])
+    reporting_currency: str = "account"
     instrument: InstrumentConfig = Field(default_factory=InstrumentConfig)
     assets: list[AssetConfig] = Field(default_factory=list)
     timeframes: TimeframesConfig = Field(default_factory=TimeframesConfig)
@@ -487,6 +576,7 @@ class AppConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     spread_filter: SpreadFilterConfig = Field(default_factory=SpreadFilterConfig)
     news_gate: NewsGateConfig = Field(default_factory=NewsGateConfig)
+    daily_gate: DailyGateConfig = Field(default_factory=DailyGateConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
@@ -502,6 +592,44 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def normalize_assets(self) -> "AppConfig":
+        self.account_currency = str(self.account_currency or "USD").strip().upper() or "USD"
+        self.fx_fee_mode = str(self.fx_fee_mode or "all_in_rate").strip().lower()
+        if self.fx_fee_mode not in {"all_in_rate"}:
+            raise ValueError("fx_fee_mode must be all_in_rate")
+        self.fx_rate_source = str(self.fx_rate_source or "static").strip().lower()
+        if self.fx_rate_source not in {"static", "provider"}:
+            raise ValueError("fx_rate_source must be static or provider")
+        if not (0.0 <= float(self.fx_conversion_fee_rate) <= 1.0):
+            raise ValueError("fx_conversion_fee_rate must be in [0,1]")
+        normalized_rates: dict[str, float] = {}
+        for key, value in self.fx_static_rates.items():
+            pair = str(key).strip().upper()
+            if len(pair) < 6:
+                raise ValueError(f"fx_static_rates key '{pair}' must look like USDPLN")
+            rate = float(value)
+            if rate <= 0:
+                raise ValueError(f"fx_static_rates[{pair}] must be > 0")
+            normalized_rates[pair] = rate
+        self.fx_static_rates = normalized_rates
+        valid_apply_to = {"pnl", "swap", "commission"}
+        apply_to: list[str] = []
+        seen_apply_to: set[str] = set()
+        for item in self.fx_apply_to:
+            key = str(item).strip().lower()
+            if not key:
+                continue
+            if key not in valid_apply_to:
+                raise ValueError(f"fx_apply_to contains unsupported value '{item}'")
+            if key in seen_apply_to:
+                continue
+            seen_apply_to.add(key)
+            apply_to.append(key)
+        self.fx_apply_to = apply_to
+        reporting = str(self.reporting_currency or "account").strip().lower()
+        if reporting != "account":
+            raise ValueError("reporting_currency currently supports only 'account'")
+        self.reporting_currency = reporting
+
         if not self.assets:
             self.assets = [AssetConfig(**self.instrument.model_dump(), trade_enabled=True)]
         dedup: list[AssetConfig] = []
@@ -511,6 +639,8 @@ class AppConfig(BaseModel):
             if not epic or epic in seen:
                 continue
             asset.epic = epic
+            if not str(asset.instrument_currency or "").strip():
+                asset.instrument_currency = asset.currency
             seen.add(epic)
             dedup.append(asset)
         self.assets = dedup
