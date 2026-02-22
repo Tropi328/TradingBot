@@ -9,6 +9,7 @@ This runbook covers the Oracle Free Tier paper environment:
 - Daily soak report via `bot-soak-report.timer` (06:05 UTC)
 
 ## Current release SHA
+- Current release SHA: `654f5b0`
 - Record active release SHA before rollout:
 ```bash
 git rev-parse --short HEAD
