@@ -35,6 +35,35 @@ def is_trading_weekday(dt: datetime, timezone_name: str = "Europe/Warsaw") -> bo
     return local_dt.weekday() < 5
 
 
+def normalize_market_profile(profile: str | None) -> str:
+    normalized = str(profile or "WEEKDAYS").strip().upper()
+    return normalized if normalized in {"WEEKDAYS", "ALWAYS"} else "WEEKDAYS"
+
+
+def is_market_profile_open(
+    dt: datetime,
+    *,
+    timezone_name: str = "Europe/Warsaw",
+    profile: str | None = "WEEKDAYS",
+) -> bool:
+    if normalize_market_profile(profile) == "ALWAYS":
+        return True
+    return is_trading_weekday(dt, timezone_name)
+
+
+def is_symbol_market_open(
+    dt: datetime,
+    *,
+    symbol: str,
+    timezone_name: str = "Europe/Warsaw",
+    default_profile: str | None = "WEEKDAYS",
+    symbol_profiles: dict[str, str] | None = None,
+) -> bool:
+    profiles = symbol_profiles or {}
+    profile = profiles.get(str(symbol).strip().upper(), default_profile)
+    return is_market_profile_open(dt, timezone_name=timezone_name, profile=profile)
+
+
 def next_bar_open(last_bar_time: datetime, timeframe_minutes: int) -> datetime:
     return last_bar_time + timedelta(minutes=timeframe_minutes)
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Trading Bot backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=bot-backup.service
+
+[Install]
+WantedBy=timers.target
+

@@ -476,6 +476,32 @@ scalp:
   miss_move_atr: 1.0
   be_after_r: 1.0
   time_stop_minutes: 120
+monte_carlo:
+  sampling_mode: iid_bootstrap
+  block_size: 8
+  equity_mode_backtest: initial
+  equity_mode_adaptive: current
+  count_breakeven_as_loss: false
+  adaptive:
+    enabled: true
+    min_trades: 5
+    resim_interval: 2
+    num_simulations: 500
+    num_simulations_online: 250
+    chart_interval: 3
+    health_ema_alpha: 0.25
+    max_step_up: 0.05
+    max_step_down: 0.10
+  live_window:
+    enabled: true
+    refresh_seconds: 1.0
+    window_title: 'IGNACY BOT — Monte Carlo Live'
+    show_stats_overlay: true
+    max_fps: 2
+    open_on_start: true
+    viewer_mode: 'process'
+    png_path: 'reports/live/monte_carlo.png'
+    json_path: 'reports/live/monte_carlo.json'
 portfolio:
   max_open_positions_total: 2
   max_per_symbol: 1

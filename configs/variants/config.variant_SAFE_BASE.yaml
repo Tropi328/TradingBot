@@ -1,0 +1,54 @@
+timezone: Europe/Warsaw
+
+market_hours:
+  default_profile: WEEKDAYS
+  symbol_profiles:
+    BTCUSD: ALWAYS
+
+ops:
+  heartbeat_stale_seconds: 900
+  watchdog_interval_seconds: 60
+  alert_cooldown_seconds: 300
+  required_services:
+    - bot-paper-fx.service
+    - bot-paper-btc.service
+  backup_retention_days: 14
+  backup_verify_on_create: true
+
+instrument:
+  epic: XAUUSD
+  currency: USD
+  point_size: 0.01
+  minimal_tick_buffer: 0.05
+  min_size: 0.01
+  size_step: 0.01
+
+risk:
+  equity: 10000
+  risk_per_trade: 0.005
+  max_trades_per_day: 3
+  daily_stop_pct: 0.015
+  max_positions: 1
+  global_max_positions: 3
+  max_total_risk_pct: 0.015
+
+daily_gate:
+  mode: off
+
+research:
+  objective_mode: pnl_dd_cap
+  dd_cap_pct: 25.0
+  dd_cap_basis: both
+  min_trades_oos: 120
+  symbols: [XAUUSD, BTCUSD]
+  max_workers: 3
+  seed: 42
+
+diagnostics:
+  decision_trace_enabled: false
+  decision_trace_path: logs/decision_trace.jsonl
+  decision_trace_auto_enable_backtest: false
+
+monte_carlo:
+  live_window:
+    open_on_start: false

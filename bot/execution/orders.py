@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from bot.data.capital_client import CapitalAPIError, CapitalClient
+from bot.execution.utils import strip_mode_prefix as _strip_mode_prefix
 from bot.storage.journal import Journal
 from bot.storage.models import OrderRecord, PositionRecord
 from bot.strategy.state_machine import StrategySignal
@@ -29,13 +30,7 @@ def _map_remote_order_status(raw: str | None) -> str:
     return "PENDING"
 
 
-def _strip_mode_prefix(identifier: str) -> str:
-    if "-" not in identifier:
-        return identifier
-    prefix, rest = identifier.split("-", 1)
-    if prefix in {"DRY", "PAPER"} and rest:
-        return rest
-    return identifier
+# _strip_mode_prefix imported from bot.execution.utils
 
 
 class OrderExecutor:
@@ -275,6 +270,9 @@ class OrderExecutor:
                     "fill_price": fill_price,
                     "strategy_meta": order.metadata,
                     "request_id": order.request_id,
+                    "spread_at_entry": quote[2] if quote is not None else 0.0,
+                    "estimated_roundtrip_cost": order.metadata.get("estimated_roundtrip_cost", 0.0),
+                    "be_buffer_ticks": order.metadata.get("be_buffer_ticks", 0.0),
                 },
             )
             self.journal.upsert_position(position)

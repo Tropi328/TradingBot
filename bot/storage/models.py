@@ -85,3 +85,5 @@ class ClosedPositionEvent:
     epic: str
     pnl: float
     closed_at: datetime
+    side: str = ""           # "LONG" / "SHORT"
+    exit_type: str = ""      # "SL" / "TP" / "BE" / "MANUAL" / ""

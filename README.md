@@ -40,6 +40,13 @@ CSV must include columns: `timestamp,open,high,low,close` (M5 candles).
   `python main.py --backtest --backtest-symbols XAUUSD,EURUSD,US100,US500,BTCUSD --backtest-start 2023-01-01 --backtest-end 2023-12-31 --backtest-autofetch`
 - ScoreV3 enabled backtest (see config variants):
   `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --initial-equity 100`
+- Keep viewers open after run (optional):
+  `python main.py --backtest ... --dashboard --mc-viewer --hold-viewers`
+
+Default behavior:
+- `--dashboard` is OFF by default.
+- Monte Carlo viewer auto-open is OFF in default configs.
+- Backtest process exits automatically after run unless `--hold-viewers` is used.
 
 ## Backtest reports
 Detailed report artifacts are generated automatically in backtest mode (unless disabled).
@@ -77,6 +84,96 @@ Artifacts:
 
 Example A/B on XAUUSD 5m:
 `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config config.variant_B.yaml --initial-equity 100 --daily-gate-ab`
+
+## Research run (PnL with DD cap)
+Use `--research-run` to execute an A/B sweep (`off`, `trend`, `trend_vol_news`) and rank results with:
+- objective: `pnl_dd_cap`
+- hard constraint: `max_drawdown_pct <= dd_cap_pct`
+- tie-breakers: lower drawdown, then higher expectancy
+
+CLI:
+`python main.py --research-run --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --research-symbols XAUUSD,BTCUSD --research-dd-cap 25 --research-dd-cap-basis both --research-workers 3`
+
+Config:
+```yaml
+research:
+  objective_mode: "pnl_dd_cap"
+  dd_cap_pct: 25.0
+  dd_cap_basis: "both"  # initial | peak | both
+  min_trades_oos: 120
+  symbols: ["XAUUSD", "BTCUSD"]
+  max_workers: 3
+  seed: 42
+
+backtest_runtime:
+  feature_cache_enabled: true
+  feature_cache_dir: "runs/cache/features"
+  parallel_workers: 3
+  deterministic: true
+```
+
+Output:
+- `reports/research/<timestamp>/research_summary.json`
+- `reports/research/<timestamp>/research_summary.csv`
+- `configs/variants/config.variant_RESEARCH_WINNER.yaml` (auto-generated effective config with winning `daily_gate.mode`)
+
+If one symbol has missing data in the requested range, research stores a `partial_result` with:
+- `available_symbols`
+- `missing_symbols`
+- tail of stderr from failed subprocess  
+so you can still compare modes on symbols that completed.
+
+## Research optimize (deep PnL+DD pipeline)
+Use `--research-optimize` to run a two-stage optimizer:
+- Stage A: gate-only sweep on IS (70% split by UTC day)
+- Stage B: top gates x risk presets on IS+OOS (30%)
+- ranking objective: `risk_adjusted_pnl_dd = oos_total_pnl_net / max(oos_dd_ref_pct, 0.25)`
+- hard DD constraint enforced with `dd_cap_basis` (`both` recommended)
+
+CLI:
+`python main.py --research-optimize --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --research-benchmark-symbols XAUUSD --research-dd-cap 25 --research-dd-cap-basis both --research-workers 3 --research-runtime-budget deep`
+
+Key config:
+```yaml
+research:
+  optimize:
+    enabled: false
+    runtime_budget: deep
+    split_ratio_is: 0.70
+    min_days_is: 30
+    min_days_oos: 30
+    objective_mode: "risk_adjusted_pnl_dd"
+    dd_cap_basis: "both"
+    max_workers: 3
+    seed: 42
+    top_gate_keep: 10
+    top_final_keep: 20
+  search_space:
+    gate: ...
+    risk_profiles: ...
+```
+
+Artifacts:
+- `reports/research_opt/<timestamp>/search_space.json`
+- `reports/research_opt/<timestamp>/split_info.json`
+- `reports/research_opt/<timestamp>/stage_a_gate_is.csv`
+- `reports/research_opt/<timestamp>/stage_b_gate_risk_is_oos.csv`
+- `reports/research_opt/<timestamp>/top20.json`
+- `reports/research_opt/<timestamp>/best.json`
+- `reports/research_opt/<timestamp>/checkpoint.json` (resume state)
+- `configs/variants/config.variant_RESEARCH_OPT_BEST.yaml` (auto-generated winner config)
+
+## Recommended variants
+- Stress/aggressive profile:
+  `configs/variants/config.variant_PNL_R83.yaml`
+- Stability baseline:
+  `configs/variants/config.variant_SAFE_BASE.yaml`
+
+Reference commands:
+- R83:
+  `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --no-dashboard --no-mc-viewer`
+- SAFE baseline:
+  `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_SAFE_BASE.yaml --no-dashboard --no-mc-viewer`
 
 ## Currency conversion fee (all-in rate, 0.7%)
 Backtest/paper now support explicit account currency conversion with Capital.com-style fee embedded in the FX rate.
@@ -148,6 +245,102 @@ ALERT_COOLDOWN_SECONDS=30
 
 LOG_LEVEL=INFO
 ```
+
+## Oracle Cloud deploy (paper first, BTC 24/7)
+This repo now includes a ready-to-use `deploy/` package for Oracle Free Tier VPS:
+
+- `deploy/systemd/bot-paper-fx.service` (FX/indices 24/5)
+- `deploy/systemd/bot-paper-btc.service` (BTC 24/7)
+- `deploy/systemd/bot-heartbeat.*` (anti-idle every 5 min)
+- `deploy/systemd/bot-watchdog.*` (service + heartbeat checks every 1 min)
+- `deploy/systemd/bot-backup.*` (daily backups)
+- `deploy/scripts/heartbeat.sh`
+- `deploy/scripts/watchdog.sh`
+- `deploy/scripts/backup_state.sh`
+- `deploy/scripts/restore_state.sh`
+- `deploy/env/paper_fx.env.example`
+- `deploy/env/paper_btc.env.example`
+- `deploy/logrotate/trading-bot`
+
+Runtime split:
+- FX process: `CAPITAL_TRADE_EPICS=GOLD,EURUSD,US100,US500` + DB `bot_state_paper_fx.db`
+- BTC process: `CAPITAL_TRADE_EPICS=BTCUSD` + DB `bot_state_paper_btc.db`
+
+### Market hours config
+`BTCUSD` can be forced to 24/7 while other symbols stay weekdays only:
+
+```yaml
+market_hours:
+  default_profile: "WEEKDAYS"
+  symbol_profiles:
+    BTCUSD: "ALWAYS"
+```
+
+Profiles:
+- `WEEKDAYS`: Mon-Fri in configured bot timezone
+- `ALWAYS`: no weekend block
+
+### Quick setup on Oracle VPS
+1. Create runtime dirs:
+   `sudo mkdir -p /opt/trading-bot/{state,logs,runtime,backups,deploy/env}`
+2. Copy repo to `/opt/trading-bot` and create venv.
+3. Copy env templates:
+   - `cp deploy/env/paper_fx.env.example deploy/env/paper_fx.env`
+   - `cp deploy/env/paper_btc.env.example deploy/env/paper_btc.env`
+4. Protect secrets:
+   `chmod 600 /opt/trading-bot/deploy/env/*.env`
+5. Make scripts executable:
+   `chmod +x /opt/trading-bot/deploy/scripts/*.sh`
+6. Install systemd units and timers:
+   - `sudo cp deploy/systemd/*.service /etc/systemd/system/`
+   - `sudo cp deploy/systemd/*.timer /etc/systemd/system/`
+   - `sudo systemctl daemon-reload`
+   - `sudo systemctl enable --now bot-paper-fx.service`
+   - `sudo systemctl enable --now bot-paper-btc.service`
+   - `sudo systemctl enable --now bot-heartbeat.timer`
+   - `sudo systemctl enable --now bot-watchdog.timer`
+   - `sudo systemctl enable --now bot-backup.timer`
+7. Install logrotate:
+   `sudo cp deploy/logrotate/trading-bot /etc/logrotate.d/trading-bot`
+
+### Ops commands (one-shot)
+- Healthcheck:
+  `python main.py --ops-healthcheck --config config.yaml`
+- Backup now:
+  `python main.py --ops-backup-now --config config.yaml`
+- Restore verify-only:
+  `python main.py --ops-restore-verify backups/<timestamp>`
+
+### Ops tools
+- Deploy preflight:
+  `python tools/deploy_preflight.py --root /opt/trading-bot --config config.yaml`
+- Healthcheck tool:
+  `python tools/ops_healthcheck.py --root /opt/trading-bot --config config.yaml`
+- Watchdog one-shot:
+  `python tools/ops_watchdog.py --root /opt/trading-bot --config config.yaml --json`
+
+Runtime artifacts:
+- `runtime/heartbeat.json`
+- `runtime/watchdog.json`
+- `backups/<timestamp>/manifest.json`
+
+### Security baseline
+- SSH keys only, disable password login in `sshd_config`.
+- Keep inbound firewall to `22/tcp` only.
+- Run services as non-root user (`tradingbot`).
+- Store API credentials only in `deploy/env/*.env` with `600` permissions.
+
+### Recommended rollout stages
+1. Start only `bot-paper-fx.service`, observe for 48h.
+2. Enable `bot-paper-btc.service` and verify weekend cycles.
+3. Run both for 7 days and review watchdog/heartbeat alerts.
+4. Consider live rollout only after stable paper metrics and no recurring service faults.
+
+### Next 4-6 weeks roadmap
+1. Week 3-4: off-host backup (Object Storage/S3-compatible) + monthly restore drill.
+2. Week 4-5: ops observability (uptime/restart/backup-age metrics + lightweight dashboard).
+3. Week 5-6: live-readiness gate (7 days without critical alerts, backup pass-rate, restart stability).
+4. In parallel: deduplicate scoring/gating logic between `main.py` and `bot/backtest/engine.py`.
 
 ## Strategy and risk (current implementation)
 - Multi-strategy router per symbol (multiple active strategies are allowed):
@@ -314,6 +507,141 @@ Current unit tests cover:
 - bias + premium/discount gating
 - risk limits and news gate
 - ScoreV3 feature extraction, scoring engine, shadow observer, and integration (43 additional tests)
+
+## Decision Trace & Terminal Visualization
+
+### Decision Trace (JSONL)
+Every evaluation bar emits a **decision** event and every position open/close emits a **fill** event to `logs/decision_trace.jsonl` (append mode, per-line flush).
+
+Enable via CLI:
+```bash
+# Backtest with trace
+python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2024-06-01 \
+    --decision-trace logs/decision_trace.jsonl
+
+# Paper mode with trace
+python main.py --paper --decision-trace logs/decision_trace.jsonl
+```
+
+Or via `config.yaml`:
+```yaml
+diagnostics:
+  decision_trace_enabled: true
+  decision_trace_path: "logs/decision_trace.jsonl"
+```
+
+**Schema** (one JSON object per line):
+| Field           | Type    | Decision | Fill |
+|-----------------|---------|:--------:|:----:|
+| `type`          | string  | yes      | yes  |
+| `ts`            | ISO8601 | yes      | yes  |
+| `symbol`        | string  | yes      | yes  |
+| `candidates`    | int     | yes      |      |
+| `signal`        | string  | yes      |      |
+| `score`         | float   | yes      |      |
+| `threshold`     | float   | yes      |      |
+| `reject_reason` | string  | yes      |      |
+| `side`          | string  |          | yes  |
+| `pnl`           | float   |          | yes  |
+| `equity_after`  | float   |          | yes  |
+| `reason_close`  | string  |          | yes  |
+| `holding_min`   | float   |          | yes  |
+
+### Live TUI Dashboard
+Tails the JSONL file and shows a live Rich TUI with equity sparkline, counters, reject histogram, recent decisions/fills, and alarms.
+```bash
+# Tail new lines only (best for live/paper)
+python -m tools.termviz_live --path logs/decision_trace.jsonl
+
+# Read from start (best after a completed backtest)
+python -m tools.termviz_live --path logs/decision_trace.jsonl --from-start
+
+# Custom refresh interval
+python -m tools.termviz_live --refresh 0.3
+```
+
+### Backtest Replay
+Animates a completed backtest from `trades.csv` (and optionally `equity.csv`) as a Rich TUI.
+```bash
+# Basic replay
+python -m tools.termviz_replay --trades runs/latest/trades.csv
+
+# With equity overlay and faster playback
+python -m tools.termviz_replay --trades runs/latest/trades.csv --equity runs/latest/equity.csv --speed 5
+
+# Only last 50 trades
+python -m tools.termviz_replay --trades runs/latest/trades.csv --last 50
+```
+
+### Monte Carlo Live Viewer
+Real-time Monte Carlo simulation viewer with two modes:
+
+#### Terminal mode (default) - ASCII fan chart via plotext
+A terminal-native viewer that draws equity percentile fan charts directly in a console window using `plotext`. Updates in real time as trades complete.
+
+**Standalone usage:**
+```bash
+python tools/termviz_mc.py \
+    --json reports/live/monte_carlo.json \
+    --refresh 1.0
+```
+
+The terminal viewer shows:
+- **Fan chart** with p5 / p25 / p50 / p75 / p95 equity percentile lines
+- **Ruin threshold** horizontal line
+- **Stats panel** - P(ruin), health score, equity percentiles, max DD, win rate, profit factor, consecutive loss streak
+
+#### Process mode - matplotlib desktop window
+A GUI window that displays the Monte Carlo simulation PNG and refreshes automatically. Uses `matplotlib` TkAgg backend.
+
+**Standalone usage:**
+```bash
+python tools/monte_carlo_live_viewer.py \
+    --png reports/live/monte_carlo.png \
+    --json reports/live/monte_carlo.json \
+    --refresh 1.0
+```
+
+#### Auto-launch with backtest
+When `monte_carlo.live_window.enabled` is `true` and `viewer_mode` is `"terminal"` or `"process"`, the viewer window spawns automatically when a backtest starts.
+
+**Config (`config.yaml`):**
+```yaml
+monte_carlo:
+  sampling_mode: "iid_bootstrap"      # or "moving_block_bootstrap"
+  block_size: 8                       # used by moving_block_bootstrap
+  equity_mode_backtest: "initial"     # initial|current
+  equity_mode_adaptive: "current"     # initial|current
+  ruin_equity_floor_pct: null         # optional additional ruin trigger
+  ruin_equity_floor_abs: null         # optional additional ruin trigger
+  count_breakeven_as_loss: false
+  adaptive:
+    num_simulations_online: 250
+    health_ema_alpha: 0.25
+    max_step_up: 0.05
+    max_step_down: 0.10
+  live_window:
+    enabled: true
+    refresh_seconds: 1.0
+    window_title: "IGNACY BOT - Monte Carlo Live"
+    show_stats_overlay: true
+    max_fps: 2
+    open_on_start: true
+    viewer_mode: "terminal"  # "terminal" (ASCII) | "process" (matplotlib GUI) | "manual"
+    png_path: "reports/live/monte_carlo.png"
+    json_path: "reports/live/monte_carlo.json"
+```
+
+**Dependencies:** `plotext` (terminal mode), `matplotlib` + `Pillow` (process mode) - all in `requirements.txt`.
+
+The viewer handles missing files gracefully - it shows "Waiting for Monte Carlo data..." until the PNG appears.
+
+MC JSON remains backward-compatible (`prob_ruin`, `equity_end_pXX`, `max_dd_pXX`, `health_score`, `step_percentiles`) and now adds simulation metadata (`sampling_mode`, `block_size`, `equity_mode`, ruin floors, `count_breakeven_as_loss`).
+
+**Window title example:**
+```
+IGNACY BOT - MC Live | P(ruin>=50%)=12.4% | EqEnd p50=132.5 p5=88.1 p95=210.7 | maxDD p95=43.0%
+```
 
 ## Notes
 - Epic names differ by account. For Gold on many DEMO accounts use `GOLD` (not `XAUUSD`).

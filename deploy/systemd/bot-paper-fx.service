@@ -1,0 +1,20 @@
+[Unit]
+Description=Trading Bot Paper FX (24/5)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+Group=tradingbot
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/opt/trading-bot/deploy/env/paper_fx.env
+ExecStart=/opt/trading-bot/.venv/bin/python main.py --paper --config configs/variants/config.variant_SAFE_BASE.yaml --no-dashboard --no-mc-viewer --decision-trace /opt/trading-bot/logs/decision_trace_paper_fx.jsonl
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=append:/opt/trading-bot/logs/bot-paper-fx.log
+StandardError=append:/opt/trading-bot/logs/bot-paper-fx.err.log
+
+[Install]
+WantedBy=multi-user.target

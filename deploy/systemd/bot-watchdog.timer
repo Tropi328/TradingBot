@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Trading Bot watchdog every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=bot-watchdog.service
+
+[Install]
+WantedBy=timers.target
+

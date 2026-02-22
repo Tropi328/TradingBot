@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -11,11 +12,13 @@ import threading
 import time
 import webbrowser
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import yaml
 from dotenv import load_dotenv
 
 from bot.batch_backtest import make_trade_id, orchestrate_batch
@@ -30,9 +33,10 @@ from bot.backtest.engine import (
     run_walk_forward_from_csv,
     run_walk_forward_multi_strategy,
 )
+from bot.backtest.monte_carlo import MCAdaptiveModel, run_monte_carlo_simulation
 from bot.backtest.runner import BacktestRunner
 from bot.clock import (
-    is_trading_weekday,
+    is_symbol_market_open,
     should_poll_closed_candle,
     trading_day,
     utc_now,
@@ -41,15 +45,72 @@ from bot.config import AppConfig, AssetConfig, load_config
 from bot.data.capital_client import CapitalAPIError, CapitalClient
 from bot.data.market_data import MarketDataService
 from bot.execution.orders import OrderExecutor
-from bot.execution.position_manager import PositionManager
+from bot.execution.position_manager import MultiTPProfile, PositionManager, build_multi_tp_profile
 from bot.execution.feasibility import estimate_required_margin, validate_order
 from bot.execution.order_validation import compute_risk_cash_plan, price_to_points
+from bot.execution.sizing import (
+    compute_compound_equity,
+    resolve_score_tier,
+    tier_risk_multiplier,
+)
+from bot.execution.paper_costs import (
+    PaperCostConfig,
+    SlippageModelConfig,
+    compute_be_offset,
+    compute_fill_prices,
+    estimate_roundtrip_cost,
+    estimate_roundtrip_cost_points,
+)
+from bot.execution.micro_loss_defense import (
+    MicroLossCheckResult,
+    MicroLossDefenseConfig,
+    MicroLossMetrics,
+    run_micro_loss_checks,
+)
 from bot.monitoring.alerts import AlertConfig, AlertDispatcher
 from bot.monitoring.dashboard import DashboardWriter
+from bot.monitoring.signal_candidates import (
+    SignalCandidate,
+    SignalCandidateAggregator,
+    SignalCandidateLogger,
+    export_diagnostics,
+    init_signal_candidates_table,
+)
+from bot.ops_runtime import run_backup_now, run_ops_healthcheck, run_restore_verify
 from bot.news.calendar_provider import CalendarProvider, Event, build_calendar_provider
 from bot.news.gate import is_blocked, should_cancel_pending
 from bot.gating.daily_gate import DailyGateProvider
+from bot.gating.adaptive import (
+    AdaptiveThresholdConfig,
+    ReentryState,
+    SoftGateResult,
+    apply_soft_gates,
+    build_adaptive_config,
+    compute_adaptive_threshold,
+    normalize_action_adaptive,
+)
+from bot.strategy.session_filter import (
+    SessionMatch,
+    SessionWindow,
+    build_session_windows,
+    match_session,
+)
 from bot.reporting.backtest_reporter import BacktestMeta, BacktestReporter, BacktestRun
+from bot.research.objective import OBJECTIVE_FAIL_VALUE, aggregate_reports, augment_report, objective_rank_key
+from bot.research.optimizer import (
+    build_search_space_payload,
+    build_stage_a_gate_candidates,
+    build_stage_b_candidates,
+    build_stage_b_summary,
+    build_time_split,
+    failed_stage_summary,
+    get_checkpoint_record,
+    load_checkpoint,
+    normalize_runtime_budget,
+    optimizer_rank_key,
+    save_checkpoint,
+    upsert_checkpoint_record,
+)
 from bot.storage.db import get_connection, init_db
 from bot.storage.journal import Journal
 from bot.storage.models import ClosedPositionEvent, DailyStats, StrategyDecisionRecord
@@ -117,6 +178,7 @@ class AssetRuntimeState:
     pending_outcome: StrategyOutcome | None = None
     entry_state: str = "WAIT"
     last_trace_signature: str = ""
+    reentry: ReentryState = field(default_factory=ReentryState)
 
 
 @dataclass(slots=True)
@@ -195,6 +257,55 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated formats for detailed reports: json,csv,png,html",
     )
     parser.add_argument("--report-open", action="store_true", help="Open generated report.html after backtest completion.")
+    parser.add_argument("--research-run", action="store_true", help="Run research A/B experiments with DD-cap objective.")
+    parser.add_argument("--research-optimize", action="store_true", help="Run deep IS/OOS optimizer pipeline.")
+    parser.add_argument("--ops-healthcheck", action="store_true", help="Run one-shot ops healthcheck and exit with 0/1.")
+    parser.add_argument("--ops-backup-now", action="store_true", help="Run one-shot state backup with manifest and validation.")
+    parser.add_argument(
+        "--ops-restore-verify",
+        default=None,
+        metavar="BACKUP_DIR",
+        help="Verify backup integrity/manifest without restoring runtime DB files.",
+    )
+    parser.add_argument(
+        "--research-runtime-budget",
+        choices=["quick", "medium", "deep"],
+        default=None,
+        help="Optimizer runtime budget for search-space size.",
+    )
+    parser.add_argument(
+        "--research-benchmark-symbols",
+        default=None,
+        help="Comma-separated symbols for optimizer benchmark (default from config.research.symbols).",
+    )
+    parser.add_argument(
+        "--research-symbols",
+        default=None,
+        help="Comma-separated symbols for research run (default from config.research.symbols).",
+    )
+    parser.add_argument(
+        "--research-objective",
+        default=None,
+        help="Research objective mode (e.g. pnl_dd_cap).",
+    )
+    parser.add_argument(
+        "--research-dd-cap",
+        type=float,
+        default=None,
+        help="Hard max drawdown cap in percent for research ranking.",
+    )
+    parser.add_argument(
+        "--research-dd-cap-basis",
+        choices=["initial", "peak", "both"],
+        default=None,
+        help="DD-cap basis used in research objective: initial, peak or both.",
+    )
+    parser.add_argument(
+        "--research-workers",
+        type=int,
+        default=None,
+        help="Max parallel research workers (capped to 3).",
+    )
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--wf-splits", type=int, default=4)
 
@@ -206,7 +317,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
     parser.add_argument("--chunk", default="monthly")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--warmup-days", type=int, default=60)
     parser.add_argument("--out-root", default="runs/batch")
     parser.add_argument("--out-dir", default=None)
@@ -217,6 +328,55 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--state-log", choices=["text", "json"], default="text")
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
+    parser.add_argument(
+        "--diagnostics-export",
+        default=None,
+        metavar="PATH",
+        help="Export signal_candidates diagnostics JSON/CSV on shutdown (PAPER/DRY mode).",
+    )
+    parser.add_argument(
+        "--diagnostics-format",
+        choices=["json", "csv"],
+        default="json",
+        help="Format for --diagnostics-export output.",
+    )
+    parser.add_argument(
+        "--decision-trace",
+        default=None,
+        metavar="PATH",
+        help="Write decision-trace JSONL to PATH (e.g. logs/decision_trace.jsonl). "
+             "Overrides diagnostics.decision_trace_path in config.",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        default=False,
+        help="Open web dashboard after backtest (default: off).",
+    )
+    parser.add_argument(
+        "--no-dashboard",
+        dest="dashboard",
+        action="store_false",
+        help="Disable auto-opening the web dashboard after backtest.",
+    )
+    parser.add_argument(
+        "--mc-viewer",
+        action="store_true",
+        default=None,
+        help="Force-enable Monte Carlo live viewer window (overrides config).",
+    )
+    parser.add_argument(
+        "--no-mc-viewer",
+        dest="mc_viewer",
+        action="store_false",
+        help="Disable Monte Carlo live viewer window.",
+    )
+    parser.add_argument(
+        "--hold-viewers",
+        action="store_true",
+        default=False,
+        help="Keep process alive after backtest when dashboard/MC viewer is running.",
+    )
     return parser.parse_args()
 
 
@@ -244,6 +404,24 @@ def parse_epics_csv(raw: str | None) -> list[str]:
 def _apply_cli_overrides(args: argparse.Namespace, config: AppConfig) -> None:
     if args.initial_equity is not None:
         config.risk.equity = float(args.initial_equity)
+    if args.research_benchmark_symbols is not None:
+        config.research.symbols = parse_epics_csv(args.research_benchmark_symbols)
+    if args.research_symbols is not None:
+        config.research.symbols = parse_epics_csv(args.research_symbols)
+    if args.research_objective is not None:
+        config.research.objective_mode = str(args.research_objective).strip().lower()
+    if args.research_dd_cap is not None:
+        config.research.dd_cap_pct = float(args.research_dd_cap)
+    if args.research_dd_cap_basis is not None:
+        config.research.dd_cap_basis = str(args.research_dd_cap_basis).strip().lower()
+        config.research.optimize.dd_cap_basis = str(args.research_dd_cap_basis).strip().lower()
+    if args.research_runtime_budget is not None:
+        config.research.optimize.runtime_budget = str(args.research_runtime_budget).strip().lower()
+    if args.research_workers is not None:
+        workers = max(1, min(3, int(args.research_workers)))
+        config.research.max_workers = workers
+        config.research.optimize.max_workers = workers
+        config.backtest_runtime.parallel_workers = workers
     if args.daily_gate is not None:
         config.daily_gate.mode = str(args.daily_gate).strip().lower()
     if args.daily_gate_thr is not None:
@@ -256,6 +434,22 @@ def _apply_cli_overrides(args: argparse.Namespace, config: AppConfig) -> None:
         config.daily_gate.vol_max = float(args.daily_gate_vol_max)
     if args.daily_gate_max_spread is not None:
         config.daily_gate.max_spread = float(args.daily_gate_max_spread)
+    # Decision-trace CLI override
+    if getattr(args, "decision_trace", None) is not None:
+        config.diagnostics.decision_trace_enabled = True
+        config.diagnostics.decision_trace_path = str(args.decision_trace)
+
+    # Dashboard implies live decision trace stream.
+    if getattr(args, "dashboard", False):
+        config.diagnostics.decision_trace_enabled = True
+
+    # Optional config-based auto-enable for backtest mode.
+    if (
+        getattr(args, "backtest", False)
+        and bool(config.diagnostics.decision_trace_auto_enable_backtest)
+        and not config.diagnostics.decision_trace_enabled
+    ):
+        config.diagnostics.decision_trace_enabled = True
 
 
 def _daily_gate_mode(config: AppConfig) -> str:
@@ -479,23 +673,7 @@ def _bias_to_legacy_label(direction: str) -> str:
     return "NEUTRAL"
 
 
-def _tp2_r_for_target_total_r(
-    *,
-    target_total_r: float,
-    tp1_trigger_r: float,
-    tp1_fraction: float,
-    mode: str = "strict_tp_price",
-) -> float:
-    total_r = max(0.1, float(target_total_r))
-    mode_norm = str(mode).strip().lower()
-    if mode_norm == "strict_tp_price":
-        return total_r
-    frac = max(0.0, min(0.99, float(tp1_fraction)))
-    trigger_r = max(0.0, float(tp1_trigger_r))
-    if frac <= 0.0:
-        return total_r
-    tp2_r = (total_r - (frac * trigger_r)) / max(1e-9, 1.0 - frac)
-    return max(total_r, tp2_r)
+from bot.strategy.tp_profile import tp2_r_for_target_total_r as _tp2_r_for_target_total_r  # noqa: E402
 
 
 def _apply_rr_profile_to_signal(
@@ -781,7 +959,7 @@ def _parse_backtest_variants(raw: str) -> list[BacktestVariant]:
 def _first_variant_code(raw: str) -> str:
     try:
         variants = _parse_backtest_variants(raw)
-    except Exception:
+    except (ValueError, KeyError, IndexError):
         return "W0"
     return variants[0].code if variants else "W0"
 
@@ -944,6 +1122,1241 @@ def _log_daily_gate_comparison(*, gate_payloads: dict[str, dict[str, object]], s
             )
 
 
+def _augment_report_with_research_fields(
+    report_dict: dict[str, object],
+    *,
+    config: AppConfig,
+    oos_pass: bool | None = None,
+) -> dict[str, object]:
+    return augment_report(
+        report_dict,
+        initial_equity=float(config.risk.equity),
+        dd_cap_pct=float(config.research.dd_cap_pct),
+        dd_cap_basis=str(config.research.dd_cap_basis),
+        min_trades_oos=int(config.research.min_trades_oos),
+        objective_mode=str(config.research.objective_mode),
+        oos_pass=oos_pass,
+    )
+
+
+def _extract_source_reports_from_report_dir(report_dir: Path) -> list[dict[str, object]]:
+    reports: list[dict[str, object]] = []
+    if not report_dir.exists():
+        return reports
+    for report_path in sorted(report_dir.rglob("report.json")):
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            LOGGER.warning("Research: failed to parse %s", report_path)
+            continue
+        source_report: dict[str, object] | None = None
+        extra = payload.get("extra")
+        if isinstance(extra, dict):
+            src = extra.get("source_report")
+            if isinstance(src, dict):
+                if isinstance(src.get("aggregate"), dict):
+                    source_report = dict(src.get("aggregate") or {})
+                else:
+                    source_report = dict(src)
+        if source_report is None:
+            metrics = payload.get("metrics")
+            if not isinstance(metrics, dict):
+                continue
+            source_report = {
+                "trades": metrics.get("trades_count", 0),
+                "wins": metrics.get("wins", 0),
+                "losses": metrics.get("losses", 0),
+                "total_pnl": metrics.get("total_pnl", 0.0),
+                "total_pnl_net": metrics.get("total_pnl_net", metrics.get("total_pnl", 0.0)),
+                "max_drawdown": metrics.get("max_drawdown", 0.0),
+                "max_drawdown_pct_peak": metrics.get("max_drawdown_pct_peak", metrics.get("max_drawdown_pct", 0.0)),
+                "max_drawdown_pct_initial": metrics.get("max_drawdown_pct_initial", 0.0),
+                "max_drawdown_pct": metrics.get("max_drawdown_pct", 0.0),
+                "expectancy": metrics.get("avg_pnl", 0.0),
+                "avg_r": 0.0,
+                "spread_cost_sum": metrics.get("spread_cost_sum", 0.0),
+                "slippage_cost_sum": metrics.get("slippage_cost_sum", 0.0),
+                "commission_cost_sum": metrics.get("commission_cost_sum", 0.0),
+                "swap_cost_sum": metrics.get("swap_cost_sum", 0.0),
+                "fx_cost_sum": metrics.get("fx_cost_sum", 0.0),
+                "constraint_dd_cap_pass_peak": metrics.get("constraint_dd_cap_pass_peak"),
+                "constraint_dd_cap_pass_initial": metrics.get("constraint_dd_cap_pass_initial"),
+                "constraint_dd_cap_pass": metrics.get("constraint_dd_cap_pass"),
+                "objective_value": metrics.get("objective_value"),
+                "blocked_by_reason": {},
+            }
+        meta = payload.get("meta")
+        if isinstance(meta, dict):
+            symbol = str(meta.get("symbol", "")).strip().upper()
+            if symbol and "symbol" not in source_report:
+                source_report["symbol"] = symbol
+        reports.append(source_report)
+    return reports
+
+
+def _build_research_subprocess_command(
+    *,
+    root: Path,
+    args: argparse.Namespace,
+    config_path: Path,
+    symbols: list[str],
+    gate_mode: str,
+    run_report_dir: Path,
+    run_auto_reports_dir: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(root / "main.py"),
+        "--backtest",
+        "--backtest-symbols",
+        ",".join(symbols),
+        "--backtest-start",
+        str(args.backtest_start),
+        "--backtest-end",
+        str(args.backtest_end),
+        "--backtest-tf",
+        str(args.backtest_tf),
+        "--backtest-price",
+        str(args.backtest_price),
+        "--backtest-data-root",
+        str(args.backtest_data_root),
+        "--backtest-spread",
+        str(args.backtest_spread),
+        "--backtest-slippage-points",
+        str(args.backtest_slippage_points),
+        "--backtest-slippage-atr-multiplier",
+        str(args.backtest_slippage_atr_multiplier),
+        "--backtest-variants",
+        str(args.backtest_variants),
+        "--daily-gate",
+        str(gate_mode),
+        "--report",
+        "--report-formats",
+        "json",
+        "--report-dir",
+        str(run_report_dir),
+        "--backtest-reports-dir",
+        str(run_auto_reports_dir),
+        "--config",
+        str(config_path),
+        "--no-dashboard",
+        "--no-mc-viewer",
+    ]
+    if str(args.backtest_source_priority or "").strip():
+        command.extend(["--backtest-source-priority", str(args.backtest_source_priority)])
+    if bool(args.backtest_autofetch):
+        command.append("--backtest-autofetch")
+    if bool(args.walk_forward):
+        command.extend(["--walk-forward", "--wf-splits", str(args.wf_splits)])
+    if args.initial_equity is not None:
+        command.extend(["--initial-equity", str(args.initial_equity)])
+    return command
+
+
+def _run_single_research_candidate(
+    *,
+    root: Path,
+    args: argparse.Namespace,
+    config: AppConfig,
+    config_path: Path,
+    symbols: list[str],
+    gate_mode: str,
+    run_dir: Path,
+) -> dict[str, object]:
+    report_dir = run_dir / "detailed_reports"
+    auto_reports_dir = run_dir / "auto_reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    auto_reports_dir.mkdir(parents=True, exist_ok=True)
+
+    command = _build_research_subprocess_command(
+        root=root,
+        args=args,
+        config_path=config_path,
+        symbols=symbols,
+        gate_mode=gate_mode,
+        run_report_dir=report_dir,
+        run_auto_reports_dir=auto_reports_dir,
+    )
+    env = os.environ.copy()
+    if config.backtest_runtime.deterministic:
+        env["PYTHONHASHSEED"] = str(config.research.seed)
+
+    started_at = time.time()
+    result = subprocess.run(command, cwd=str(root), capture_output=True, text=True, env=env)
+    elapsed_seconds = round(time.time() - started_at, 3)
+
+    source_reports = _extract_source_reports_from_report_dir(report_dir)
+    if source_reports:
+        summary = aggregate_reports(
+            source_reports,
+            initial_equity=float(config.risk.equity),
+            dd_cap_pct=float(config.research.dd_cap_pct),
+            dd_cap_basis=str(config.research.dd_cap_basis),
+            min_trades_oos=int(config.research.min_trades_oos),
+            objective_mode=str(config.research.objective_mode),
+        )
+    else:
+        summary = {
+            "reports_count": 0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "total_pnl_net": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_pct_peak": 0.0,
+            "max_drawdown_pct_initial": 0.0,
+            "max_drawdown_pct": 0.0,
+            "expectancy": 0.0,
+            "expectancy_net": 0.0,
+            "avg_r": 0.0,
+            "cost_breakdown_net": {},
+            "blocked_by_reason": {},
+            "oos_pass": False,
+            "constraint_dd_cap_pass_peak": False,
+            "constraint_dd_cap_pass_initial": False,
+            "constraint_dd_cap_pass": False,
+            "objective_value": OBJECTIVE_FAIL_VALUE,
+        }
+
+    available_symbols = sorted(
+        {
+            str(item.get("symbol", "")).strip().upper()
+            for item in source_reports
+            if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+        }
+    )
+    missing_symbols = sorted(set(symbols) - set(available_symbols)) if available_symbols else list(symbols)
+    partial_result = bool(result.returncode != 0 and bool(source_reports))
+    if partial_result:
+        summary = dict(summary)
+        summary["partial_result"] = True
+        summary["available_symbols"] = available_symbols
+        summary["missing_symbols"] = missing_symbols
+
+    return {
+        "gate_mode": gate_mode,
+        "command": command,
+        "returncode": int(result.returncode),
+        "partial_result": partial_result,
+        "available_symbols": available_symbols,
+        "missing_symbols": missing_symbols,
+        "elapsed_seconds": elapsed_seconds,
+        "stdout_tail": "\n".join((result.stdout or "").splitlines()[-20:]),
+        "stderr_tail": "\n".join((result.stderr or "").splitlines()[-20:]),
+        "run_dir": str(run_dir),
+        "report_dir": str(report_dir),
+        "auto_reports_dir": str(auto_reports_dir),
+        "summary": summary,
+    }
+
+
+def _write_research_summary_files(research_dir: Path, payload: dict[str, object]) -> None:
+    research_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = research_dir / "research_summary.json"
+    summary_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return
+    csv_path = research_dir / "research_summary.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "rank",
+                "gate_mode",
+                "returncode",
+                "partial_result",
+                "available_symbols",
+                "missing_symbols",
+                "trades",
+                "total_pnl_net",
+                "max_drawdown_pct_peak",
+                "max_drawdown_pct_initial",
+                "max_drawdown_pct",
+                "expectancy_net",
+                "objective_value",
+                "constraint_dd_cap_pass_peak",
+                "constraint_dd_cap_pass_initial",
+                "constraint_dd_cap_pass",
+                "oos_pass",
+                "elapsed_seconds",
+            ],
+        )
+        writer.writeheader()
+        for idx, item in enumerate(candidates, start=1):
+            if not isinstance(item, dict):
+                continue
+            summary = item.get("summary", {})
+            if not isinstance(summary, dict):
+                summary = {}
+            writer.writerow(
+                {
+                    "rank": idx,
+                    "gate_mode": item.get("gate_mode"),
+                    "returncode": item.get("returncode"),
+                    "partial_result": item.get("partial_result", False),
+                    "available_symbols": ",".join(str(v) for v in item.get("available_symbols", [])),
+                    "missing_symbols": ",".join(str(v) for v in item.get("missing_symbols", [])),
+                    "trades": summary.get("trades", 0),
+                    "total_pnl_net": summary.get("total_pnl_net", 0.0),
+                    "max_drawdown_pct_peak": summary.get("max_drawdown_pct_peak", summary.get("max_drawdown_pct", 0.0)),
+                    "max_drawdown_pct_initial": summary.get("max_drawdown_pct_initial", 0.0),
+                    "max_drawdown_pct": summary.get("max_drawdown_pct", 0.0),
+                    "expectancy_net": summary.get("expectancy_net", summary.get("expectancy", 0.0)),
+                    "objective_value": summary.get("objective_value", OBJECTIVE_FAIL_VALUE),
+                    "constraint_dd_cap_pass_peak": summary.get("constraint_dd_cap_pass_peak", False),
+                    "constraint_dd_cap_pass_initial": summary.get("constraint_dd_cap_pass_initial", False),
+                    "constraint_dd_cap_pass": summary.get("constraint_dd_cap_pass", False),
+                    "oos_pass": summary.get("oos_pass", False),
+                    "elapsed_seconds": item.get("elapsed_seconds", 0.0),
+                }
+            )
+
+
+def _write_research_winner_config(
+    *,
+    root: Path,
+    base_config: AppConfig,
+    source_config_path: Path,
+    research_dir: Path,
+    best_candidate: dict[str, object] | None,
+) -> Path | None:
+    if not isinstance(best_candidate, dict):
+        return None
+    winner_mode = str(best_candidate.get("gate_mode", "")).strip().lower()
+    if winner_mode not in {"off", "trend", "trend_vol_news"}:
+        return None
+
+    winner_config = base_config.model_copy(deep=True)
+    winner_config.daily_gate.mode = winner_mode
+
+    target_path = root / "configs" / "variants" / "config.variant_RESEARCH_WINNER.yaml"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    header_lines = [
+        "# Auto-generated by --research-run",
+        f"# generated_at_utc: {datetime.now(timezone.utc).isoformat()}",
+        f"# source_config: {source_config_path}",
+        f"# research_report_dir: {research_dir}",
+        f"# winner_gate_mode: {winner_mode}",
+        "",
+    ]
+    payload = winner_config.model_dump()
+    body = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+    target_path.write_text("\n".join(header_lines) + body, encoding="utf-8")
+    return target_path
+
+
+def run_research_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig], root: Path) -> None:
+    if not args.backtest_start or not args.backtest_end:
+        raise RuntimeError("--research-run requires --backtest-start and --backtest-end")
+
+    symbols = parse_epics_csv(args.research_symbols) if args.research_symbols else list(config.research.symbols)
+    if not symbols:
+        symbols = _backtest_symbols(args, assets)
+    workers = max(1, min(3, int(config.research.max_workers)))
+    objective_mode = str(config.research.objective_mode).strip().lower()
+    dd_cap_pct = float(config.research.dd_cap_pct)
+    dd_cap_basis = str(config.research.dd_cap_basis).strip().lower()
+    min_trades_oos = int(config.research.min_trades_oos)
+
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    research_dir = _resolve_runtime_path(root, f"reports/research/{run_stamp}")
+    config_path = _resolve_config_path(root, str(args.config))
+    candidate_modes = ["off", "trend", "trend_vol_news"]
+
+    LOGGER.info(
+        "Research run started | objective=%s dd_cap_pct=%.2f dd_cap_basis=%s min_trades_oos=%d symbols=%s workers=%d",
+        objective_mode,
+        dd_cap_pct,
+        dd_cap_basis,
+        min_trades_oos,
+        ",".join(symbols),
+        workers,
+    )
+
+    futures = []
+    results: list[dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for mode in candidate_modes:
+            candidate_dir = research_dir / mode
+            futures.append(
+                executor.submit(
+                    _run_single_research_candidate,
+                    root=root,
+                    args=args,
+                    config=config,
+                    config_path=config_path,
+                    symbols=symbols,
+                    gate_mode=mode,
+                    run_dir=candidate_dir,
+                )
+            )
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            summary = result.get("summary", {})
+            if not isinstance(summary, dict):
+                summary = {}
+            LOGGER.info(
+                "Research candidate done | mode=%s rc=%s partial=%s reports=%s pnl_net=%.4f dd_peak=%.4f dd_initial=%.4f objective=%.4f",
+                result.get("gate_mode"),
+                result.get("returncode"),
+                bool(result.get("partial_result", False)),
+                int(summary.get("reports_count", 0)),
+                float(summary.get("total_pnl_net", 0.0)),
+                float(summary.get("max_drawdown_pct_peak", summary.get("max_drawdown_pct", 0.0))),
+                float(summary.get("max_drawdown_pct_initial", 0.0)),
+                float(summary.get("objective_value", OBJECTIVE_FAIL_VALUE)),
+            )
+            if bool(result.get("partial_result", False)):
+                LOGGER.warning(
+                    "Research partial result | mode=%s available_symbols=%s missing_symbols=%s",
+                    result.get("gate_mode"),
+                    ",".join(str(item) for item in result.get("available_symbols", [])),
+                    ",".join(str(item) for item in result.get("missing_symbols", [])),
+                )
+
+    results.sort(key=lambda item: objective_rank_key(item.get("summary", {})))
+    best = results[0] if results else None
+    payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "objective_mode": objective_mode,
+        "dd_cap_pct": dd_cap_pct,
+        "dd_cap_basis": dd_cap_basis,
+        "min_trades_oos": min_trades_oos,
+        "symbols": symbols,
+        "max_workers": workers,
+        "seed": int(config.research.seed),
+        "config": str(config_path),
+        "backtest": {
+            "start": str(args.backtest_start),
+            "end": str(args.backtest_end),
+            "timeframe": str(args.backtest_tf),
+            "price": str(args.backtest_price),
+            "variants": str(args.backtest_variants),
+            "initial_equity": float(args.initial_equity if args.initial_equity is not None else config.risk.equity),
+        },
+        "candidates": results,
+        "best": best,
+    }
+    _write_research_summary_files(research_dir, payload)
+    winner_config_path = _write_research_winner_config(
+        root=root,
+        base_config=config,
+        source_config_path=config_path,
+        research_dir=research_dir,
+        best_candidate=best,
+    )
+
+    LOGGER.info("Research summary saved: %s", research_dir)
+    if winner_config_path is not None:
+        LOGGER.info("Research winner config saved: %s", winner_config_path)
+    LOGGER.info("Research ranking (best->worst):")
+    LOGGER.info(
+        "rank | mode | pnl_net | max_dd_peak | max_dd_initial | objective | dd_cap_pass | oos_pass | trades"
+    )
+    for idx, item in enumerate(results, start=1):
+        summary = item.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+        LOGGER.info(
+            "%d | %s | %.4f | %.4f | %.4f | %.4f | %s | %s | %s",
+            idx,
+            item.get("gate_mode"),
+            float(summary.get("total_pnl_net", 0.0)),
+            float(summary.get("max_drawdown_pct_peak", summary.get("max_drawdown_pct", 0.0))),
+            float(summary.get("max_drawdown_pct_initial", 0.0)),
+            float(summary.get("objective_value", OBJECTIVE_FAIL_VALUE)),
+            bool(summary.get("constraint_dd_cap_pass", False)),
+            bool(summary.get("oos_pass", False)),
+            int(summary.get("trades", 0)),
+        )
+
+
+def _empty_aggregate_summary() -> dict[str, object]:
+    return {
+        "reports_count": 0,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "total_pnl": 0.0,
+        "total_pnl_net": 0.0,
+        "max_drawdown": 0.0,
+        "max_drawdown_pct_peak": 0.0,
+        "max_drawdown_pct_initial": 0.0,
+        "dd_ref_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "expectancy": 0.0,
+        "expectancy_net": 0.0,
+        "avg_r": 0.0,
+        "cost_breakdown_net": {},
+        "blocked_by_reason": {},
+        "oos_pass": False,
+        "constraint_dd_cap_pass_peak": False,
+        "constraint_dd_cap_pass_initial": False,
+        "constraint_dd_cap_pass": False,
+        "objective_value": OBJECTIVE_FAIL_VALUE,
+    }
+
+
+def _safe_json_primitive(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _safe_json_primitive(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_json_primitive(v) for v in value]
+    return str(value)
+
+
+def _write_csv(path: Path, *, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _safe_json_primitive(row.get(key)) for key in fieldnames})
+
+
+def _build_optimizer_candidate_config(
+    *,
+    base_config: AppConfig,
+    gate_mode: str,
+    gate_params: dict[str, object],
+    risk_profile: dict[str, object] | None,
+) -> dict[str, object]:
+    payload = base_config.model_dump()
+
+    daily_gate = payload.setdefault("daily_gate", {})
+    if not isinstance(daily_gate, dict):
+        daily_gate = {}
+        payload["daily_gate"] = daily_gate
+    daily_gate["mode"] = str(gate_mode).strip().lower()
+    if "thr" in gate_params:
+        daily_gate["thr"] = float(gate_params["thr"])
+    if "pre_minutes" in gate_params:
+        daily_gate["pre_minutes"] = int(gate_params["pre_minutes"])
+    if "post_minutes" in gate_params:
+        daily_gate["post_minutes"] = int(gate_params["post_minutes"])
+    if "vol_max" in gate_params:
+        daily_gate["vol_max"] = float(gate_params["vol_max"])
+    if "max_spread" in gate_params:
+        daily_gate["max_spread"] = float(gate_params["max_spread"])
+    if "max_spread_mult" in gate_params:
+        base_spread = daily_gate.get("max_spread", base_config.daily_gate.max_spread)
+        if base_spread is not None:
+            daily_gate["max_spread"] = float(base_spread) * float(gate_params["max_spread_mult"])
+
+    if risk_profile:
+        risk = payload.setdefault("risk", {})
+        if not isinstance(risk, dict):
+            risk = {}
+            payload["risk"] = risk
+        if "risk_per_trade" in risk_profile:
+            risk["risk_per_trade"] = float(risk_profile["risk_per_trade"])
+        if "max_trades_per_day" in risk_profile:
+            risk["max_trades_per_day"] = int(risk_profile["max_trades_per_day"])
+        if "max_total_risk_pct" in risk_profile:
+            risk["max_total_risk_pct"] = float(risk_profile["max_total_risk_pct"])
+        if "daily_stop_pct" in risk_profile:
+            risk["daily_stop_pct"] = float(risk_profile["daily_stop_pct"])
+
+    return payload
+
+
+def _build_backtest_subprocess_command_for_optimizer(
+    *,
+    root: Path,
+    args: argparse.Namespace,
+    config_path: Path,
+    symbols: list[str],
+    start: str,
+    end: str,
+    run_report_dir: Path,
+    run_auto_reports_dir: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(root / "main.py"),
+        "--backtest",
+        "--backtest-symbols",
+        ",".join(symbols),
+        "--backtest-start",
+        str(start),
+        "--backtest-end",
+        str(end),
+        "--backtest-tf",
+        str(args.backtest_tf),
+        "--backtest-price",
+        str(args.backtest_price),
+        "--backtest-data-root",
+        str(args.backtest_data_root),
+        "--backtest-spread",
+        str(args.backtest_spread),
+        "--backtest-slippage-points",
+        str(args.backtest_slippage_points),
+        "--backtest-slippage-atr-multiplier",
+        str(args.backtest_slippage_atr_multiplier),
+        "--backtest-variants",
+        str(args.backtest_variants),
+        "--report",
+        "--report-formats",
+        "json",
+        "--report-dir",
+        str(run_report_dir),
+        "--backtest-reports-dir",
+        str(run_auto_reports_dir),
+        "--config",
+        str(config_path),
+        "--no-dashboard",
+        "--no-mc-viewer",
+    ]
+    if str(args.backtest_source_priority or "").strip():
+        command.extend(["--backtest-source-priority", str(args.backtest_source_priority)])
+    if bool(args.backtest_autofetch):
+        command.append("--backtest-autofetch")
+    if bool(args.walk_forward):
+        command.extend(["--walk-forward", "--wf-splits", str(args.wf_splits)])
+    if args.initial_equity is not None:
+        command.extend(["--initial-equity", str(args.initial_equity)])
+    return command
+
+
+def _run_optimizer_window_candidate(
+    *,
+    root: Path,
+    args: argparse.Namespace,
+    config: AppConfig,
+    config_path: Path,
+    symbols: list[str],
+    start: str,
+    end: str,
+    run_dir: Path,
+    dd_cap_pct: float,
+    dd_cap_basis: str,
+    min_trades_oos: int,
+    objective_mode: str,
+    seed: int,
+) -> dict[str, object]:
+    report_dir = run_dir / "detailed_reports"
+    auto_reports_dir = run_dir / "auto_reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    auto_reports_dir.mkdir(parents=True, exist_ok=True)
+
+    command = _build_backtest_subprocess_command_for_optimizer(
+        root=root,
+        args=args,
+        config_path=config_path,
+        symbols=symbols,
+        start=start,
+        end=end,
+        run_report_dir=report_dir,
+        run_auto_reports_dir=auto_reports_dir,
+    )
+
+    env = os.environ.copy()
+    if config.backtest_runtime.deterministic:
+        env["PYTHONHASHSEED"] = str(seed)
+
+    started_at = time.time()
+    result = subprocess.run(command, cwd=str(root), capture_output=True, text=True, env=env)
+    elapsed_seconds = round(time.time() - started_at, 3)
+
+    source_reports = _extract_source_reports_from_report_dir(report_dir)
+    if result.returncode != 0 and not source_reports:
+        # One retry for transient failures.
+        retry = subprocess.run(command, cwd=str(root), capture_output=True, text=True, env=env)
+        elapsed_seconds = round(time.time() - started_at, 3)
+        result = retry
+        source_reports = _extract_source_reports_from_report_dir(report_dir)
+
+    if source_reports:
+        summary = aggregate_reports(
+            source_reports,
+            initial_equity=float(config.risk.equity),
+            dd_cap_pct=dd_cap_pct,
+            dd_cap_basis=dd_cap_basis,
+            min_trades_oos=min_trades_oos,
+            objective_mode=objective_mode,
+        )
+    else:
+        summary = _empty_aggregate_summary()
+
+    return {
+        "command": command,
+        "returncode": int(result.returncode),
+        "elapsed_seconds": elapsed_seconds,
+        "stdout_tail": "\n".join((result.stdout or "").splitlines()[-20:]),
+        "stderr_tail": "\n".join((result.stderr or "").splitlines()[-20:]),
+        "report_dir": str(report_dir),
+        "auto_reports_dir": str(auto_reports_dir),
+        "summary": summary,
+    }
+
+
+def _find_resumable_research_opt_dir(base_dir: Path, *, resume_key: dict[str, object]) -> Path | None:
+    if not base_dir.exists():
+        return None
+    candidates = sorted((path for path in base_dir.iterdir() if path.is_dir()), reverse=True)
+    for path in candidates:
+        checkpoint_path = path / "checkpoint.json"
+        if not checkpoint_path.exists():
+            continue
+        checkpoint = load_checkpoint(checkpoint_path)
+        metadata = checkpoint.get("metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        if bool(metadata.get("completed", False)):
+            continue
+        key = metadata.get("resume_key")
+        if isinstance(key, dict) and key == resume_key:
+            return path
+    return None
+
+
+def _summarize_stage_progress(
+    *,
+    stage: str,
+    completed: int,
+    total: int,
+    started_at: float,
+) -> None:
+    elapsed = max(1e-9, time.time() - started_at)
+    throughput_per_min = (completed / elapsed) * 60.0
+    remaining = max(0, total - completed)
+    eta_minutes = (remaining / throughput_per_min) if throughput_per_min > 1e-9 else 0.0
+    LOGGER.info(
+        "Research optimize progress | stage=%s done=%d/%d throughput=%.2f cand/min eta=%.2f min",
+        stage,
+        completed,
+        total,
+        throughput_per_min,
+        eta_minutes,
+    )
+
+
+def _write_optimizer_best_config(
+    *,
+    root: Path,
+    base_config: AppConfig,
+    source_config_path: Path,
+    report_dir: Path,
+    best_record: dict[str, object] | None,
+    split_payload: dict[str, object],
+    objective_mode: str,
+    dd_cap_pct: float,
+    dd_cap_basis: str,
+) -> Path | None:
+    if not isinstance(best_record, dict):
+        return None
+    gate_mode = str(best_record.get("gate_mode", "")).strip().lower()
+    if gate_mode not in {"off", "trend", "trend_vol_news"}:
+        return None
+    gate_params = best_record.get("gate_params", {})
+    if not isinstance(gate_params, dict):
+        gate_params = {}
+    risk_profile = best_record.get("risk_profile", {})
+    if not isinstance(risk_profile, dict):
+        risk_profile = {}
+
+    winner_payload = _build_optimizer_candidate_config(
+        base_config=base_config,
+        gate_mode=gate_mode,
+        gate_params=gate_params,
+        risk_profile=risk_profile,
+    )
+
+    target_path = root / "configs" / "variants" / "config.variant_RESEARCH_OPT_BEST.yaml"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "# Auto-generated by --research-optimize",
+        f"# generated_at_utc: {datetime.now(timezone.utc).isoformat()}",
+        f"# source_config: {source_config_path}",
+        f"# research_opt_report_dir: {report_dir}",
+        f"# objective_mode: {objective_mode}",
+        f"# dd_cap_pct: {dd_cap_pct}",
+        f"# dd_cap_basis: {dd_cap_basis}",
+        f"# split: {json.dumps(split_payload, ensure_ascii=True)}",
+        "",
+    ]
+    body = yaml.safe_dump(winner_payload, sort_keys=False, allow_unicode=False)
+    target_path.write_text("\n".join(header) + body, encoding="utf-8")
+    return target_path
+
+
+def run_research_optimize_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig], root: Path) -> None:
+    if not args.backtest_start or not args.backtest_end:
+        raise RuntimeError("--research-optimize requires --backtest-start and --backtest-end")
+
+    optimize_cfg = config.research.optimize
+    runtime_budget = normalize_runtime_budget(
+        args.research_runtime_budget if args.research_runtime_budget is not None else optimize_cfg.runtime_budget
+    )
+    symbols = parse_epics_csv(args.research_benchmark_symbols) if args.research_benchmark_symbols else list(config.research.symbols)
+    if not symbols:
+        symbols = _backtest_symbols(args, assets)
+    if not symbols:
+        raise RuntimeError("No symbols available for --research-optimize")
+
+    workers = max(1, min(3, int(optimize_cfg.max_workers)))
+    dd_cap_pct = float(config.research.dd_cap_pct)
+    dd_cap_basis = str(optimize_cfg.dd_cap_basis or config.research.dd_cap_basis).strip().lower()
+    min_trades_oos = int(config.research.min_trades_oos)
+    objective_mode = str(optimize_cfg.objective_mode).strip().lower()
+    seed = int(optimize_cfg.seed)
+    config_path = _resolve_config_path(root, str(args.config))
+
+    split = build_time_split(
+        backtest_start=str(args.backtest_start),
+        backtest_end=str(args.backtest_end),
+        split_ratio_is=float(optimize_cfg.split_ratio_is),
+        min_days_is=int(optimize_cfg.min_days_is),
+        min_days_oos=int(optimize_cfg.min_days_oos),
+    )
+    split_payload = split.to_dict()
+
+    search_space_payload = config.research.search_space.model_dump()
+    gate_space = dict(search_space_payload.get("gate", {}))
+    risk_profiles = list(search_space_payload.get("risk_profiles", []))
+    stage_a_candidates = build_stage_a_gate_candidates(
+        search_space_gate=gate_space,
+        runtime_budget=runtime_budget,
+    )
+    top_gate_keep = min(int(optimize_cfg.top_gate_keep), len(stage_a_candidates))
+    top_final_keep = max(1, int(optimize_cfg.top_final_keep))
+
+    resume_key = {
+        "config": str(config_path),
+        "symbols": symbols,
+        "backtest_start": str(args.backtest_start),
+        "backtest_end": str(args.backtest_end),
+        "timeframe": str(args.backtest_tf),
+        "price": str(args.backtest_price),
+        "runtime_budget": runtime_budget,
+        "dd_cap_pct": dd_cap_pct,
+        "dd_cap_basis": dd_cap_basis,
+        "objective_mode": objective_mode,
+    }
+    base_dir = _resolve_runtime_path(root, "reports/research_opt")
+    resumable = _find_resumable_research_opt_dir(base_dir, resume_key=resume_key)
+    if resumable is not None:
+        run_dir = resumable
+        resumed = True
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        run_dir = base_dir / stamp
+        resumed = False
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = run_dir / "checkpoint.json"
+    checkpoint = load_checkpoint(checkpoint_path)
+    checkpoint_meta = checkpoint.setdefault("metadata", {})
+    if not isinstance(checkpoint_meta, dict):
+        checkpoint_meta = {}
+        checkpoint["metadata"] = checkpoint_meta
+    checkpoint_meta["resume_key"] = resume_key
+    checkpoint_meta["runtime_budget"] = runtime_budget
+    checkpoint_meta["objective_mode"] = objective_mode
+    checkpoint_meta["dd_cap_pct"] = dd_cap_pct
+    checkpoint_meta["dd_cap_basis"] = dd_cap_basis
+    checkpoint_meta["completed"] = False
+    save_checkpoint(checkpoint_path, checkpoint)
+
+    search_space_out = build_search_space_payload(
+        runtime_budget=runtime_budget,
+        gate_space=gate_space,
+        risk_profiles=risk_profiles,
+        stage_a_candidates=stage_a_candidates,
+    )
+    (run_dir / "search_space.json").write_text(json.dumps(search_space_out, indent=2, ensure_ascii=True), encoding="utf-8")
+    (run_dir / "split_info.json").write_text(json.dumps(split_payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+    LOGGER.info(
+        "Research optimize started | resumed=%s budget=%s symbols=%s workers=%d stageA=%d",
+        resumed,
+        runtime_budget,
+        ",".join(symbols),
+        workers,
+        len(stage_a_candidates),
+    )
+
+    stage_a_results: list[dict[str, object]] = []
+    stage_a_started_at = time.time()
+    stage_a_total = len(stage_a_candidates)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures: dict[object, tuple[dict[str, object], Path]] = {}
+        for candidate in stage_a_candidates:
+            candidate_id = str(candidate.get("candidate_id", ""))
+            cached = get_checkpoint_record(checkpoint, stage="A", candidate_id=candidate_id)
+            if cached is not None and cached.get("status") == "done":
+                stage_a_results.append(cached)
+                continue
+            candidate_dir = run_dir / "stage_a" / candidate_id
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            candidate_config_payload = _build_optimizer_candidate_config(
+                base_config=config,
+                gate_mode=str(candidate.get("gate_mode", "off")),
+                gate_params=dict(candidate.get("gate_params", {})),
+                risk_profile=None,
+            )
+            candidate_config_path = candidate_dir / "candidate_config.yaml"
+            candidate_config_path.write_text(
+                yaml.safe_dump(candidate_config_payload, sort_keys=False, allow_unicode=False),
+                encoding="utf-8",
+            )
+            future = executor.submit(
+                _run_optimizer_window_candidate,
+                root=root,
+                args=args,
+                config=config,
+                config_path=candidate_config_path,
+                symbols=symbols,
+                start=split.is_start,
+                end=split.is_end,
+                run_dir=candidate_dir / "is",
+                dd_cap_pct=dd_cap_pct,
+                dd_cap_basis=dd_cap_basis,
+                min_trades_oos=min_trades_oos,
+                objective_mode=objective_mode,
+                seed=seed,
+            )
+            futures[future] = (candidate, candidate_config_path)
+
+        completed = len(stage_a_results)
+        if completed:
+            _summarize_stage_progress(stage="A", completed=completed, total=stage_a_total, started_at=stage_a_started_at)
+        for future in as_completed(futures):
+            candidate, candidate_config_path = futures[future]
+            result = future.result()
+            record = {
+                "status": "done",
+                "stage": "A",
+                "candidate_id": candidate.get("candidate_id"),
+                "gate_mode": candidate.get("gate_mode"),
+                "gate_params": candidate.get("gate_params", {}),
+                "risk_profile": None,
+                "config_path": str(candidate_config_path),
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "summary": result.get("summary", _empty_aggregate_summary()),
+                "stdout_tail": result.get("stdout_tail", ""),
+                "stderr_tail": result.get("stderr_tail", ""),
+                "report_dir": result.get("report_dir"),
+            }
+            stage_a_results.append(record)
+            upsert_checkpoint_record(checkpoint, stage="A", candidate_id=str(record.get("candidate_id", "")), record=record)
+            save_checkpoint(checkpoint_path, checkpoint)
+            completed += 1
+            if completed % 5 == 0 or completed == stage_a_total:
+                _summarize_stage_progress(stage="A", completed=completed, total=stage_a_total, started_at=stage_a_started_at)
+
+    stage_a_results.sort(key=lambda item: optimizer_rank_key(item.get("summary", {})))
+    top_gate_candidates = [
+        {
+            "candidate_id": item.get("candidate_id"),
+            "gate_mode": item.get("gate_mode"),
+            "gate_params": item.get("gate_params", {}),
+        }
+        for item in stage_a_results[:top_gate_keep]
+    ]
+
+    stage_a_csv_rows: list[dict[str, object]] = []
+    for rank, item in enumerate(stage_a_results, start=1):
+        summary = item.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+        stage_a_csv_rows.append(
+            {
+                "rank": rank,
+                "candidate_id": item.get("candidate_id"),
+                "gate_mode": item.get("gate_mode"),
+                "gate_params": json.dumps(item.get("gate_params", {}), ensure_ascii=True, sort_keys=True),
+                "returncode": item.get("returncode"),
+                "elapsed_seconds": item.get("elapsed_seconds", 0.0),
+                "trades": summary.get("trades", 0),
+                "total_pnl_net": summary.get("total_pnl_net", 0.0),
+                "max_drawdown_pct_peak": summary.get("max_drawdown_pct_peak", summary.get("max_drawdown_pct", 0.0)),
+                "max_drawdown_pct_initial": summary.get("max_drawdown_pct_initial", 0.0),
+                "dd_ref_pct": summary.get("dd_ref_pct", 0.0),
+                "constraint_dd_cap_pass": summary.get("constraint_dd_cap_pass", False),
+                "oos_pass": summary.get("oos_pass", False),
+                "objective_value": summary.get("objective_value", OBJECTIVE_FAIL_VALUE),
+            }
+        )
+    _write_csv(
+        run_dir / "stage_a_gate_is.csv",
+        fieldnames=[
+            "rank",
+            "candidate_id",
+            "gate_mode",
+            "gate_params",
+            "returncode",
+            "elapsed_seconds",
+            "trades",
+            "total_pnl_net",
+            "max_drawdown_pct_peak",
+            "max_drawdown_pct_initial",
+            "dd_ref_pct",
+            "constraint_dd_cap_pass",
+            "oos_pass",
+            "objective_value",
+        ],
+        rows=stage_a_csv_rows,
+    )
+
+    stage_b_candidates = build_stage_b_candidates(
+        top_gate_candidates=top_gate_candidates,
+        risk_profiles=risk_profiles,
+        runtime_budget=runtime_budget,
+    )
+    stage_b_total = len(stage_b_candidates)
+    used_risk_profiles = len(
+        {str(item.get("risk_profile", {}).get("name", "")) for item in stage_b_candidates if isinstance(item, dict)}
+    )
+    LOGGER.info(
+        "Research optimize stage B | top_gate_keep=%d risk_profiles=%d candidates=%d",
+        len(top_gate_candidates),
+        used_risk_profiles,
+        stage_b_total,
+    )
+
+    stage_b_results: list[dict[str, object]] = []
+    stage_b_started_at = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures: dict[object, tuple[str, dict[str, object], Path]] = {}
+        for candidate in stage_b_candidates:
+            candidate_id = str(candidate.get("candidate_id", ""))
+            cached = get_checkpoint_record(checkpoint, stage="B", candidate_id=candidate_id)
+            if cached is not None and cached.get("status") == "done":
+                stage_b_results.append(cached)
+                continue
+
+            candidate_dir = run_dir / "stage_b" / candidate_id
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            candidate_config_payload = _build_optimizer_candidate_config(
+                base_config=config,
+                gate_mode=str(candidate.get("gate_mode", "off")),
+                gate_params=dict(candidate.get("gate_params", {})),
+                risk_profile=dict(candidate.get("risk_profile", {})),
+            )
+            candidate_config_path = candidate_dir / "candidate_config.yaml"
+            candidate_config_path.write_text(
+                yaml.safe_dump(candidate_config_payload, sort_keys=False, allow_unicode=False),
+                encoding="utf-8",
+            )
+
+            future_is = executor.submit(
+                _run_optimizer_window_candidate,
+                root=root,
+                args=args,
+                config=config,
+                config_path=candidate_config_path,
+                symbols=symbols,
+                start=split.is_start,
+                end=split.is_end,
+                run_dir=candidate_dir / "is",
+                dd_cap_pct=dd_cap_pct,
+                dd_cap_basis=dd_cap_basis,
+                min_trades_oos=min_trades_oos,
+                objective_mode=objective_mode,
+                seed=seed,
+            )
+            futures[future_is] = ("is", candidate, candidate_config_path)
+
+            future_oos = executor.submit(
+                _run_optimizer_window_candidate,
+                root=root,
+                args=args,
+                config=config,
+                config_path=candidate_config_path,
+                symbols=symbols,
+                start=split.oos_start,
+                end=split.oos_end,
+                run_dir=candidate_dir / "oos",
+                dd_cap_pct=dd_cap_pct,
+                dd_cap_basis=dd_cap_basis,
+                min_trades_oos=min_trades_oos,
+                objective_mode=objective_mode,
+                seed=seed,
+            )
+            futures[future_oos] = ("oos", candidate, candidate_config_path)
+
+        interim: dict[str, dict[str, object]] = {}
+        completed = len(stage_b_results)
+        if completed:
+            _summarize_stage_progress(stage="B", completed=completed, total=stage_b_total, started_at=stage_b_started_at)
+
+        for future in as_completed(futures):
+            window_name, candidate, candidate_config_path = futures[future]
+            result = future.result()
+            candidate_id = str(candidate.get("candidate_id", ""))
+            bucket = interim.setdefault(candidate_id, {"candidate": candidate, "config_path": candidate_config_path})
+            bucket[window_name] = result
+            if "is" in bucket and "oos" in bucket:
+                is_summary = bucket["is"].get("summary", _empty_aggregate_summary())
+                oos_summary = bucket["oos"].get("summary", _empty_aggregate_summary())
+                if not isinstance(is_summary, dict):
+                    is_summary = _empty_aggregate_summary()
+                if not isinstance(oos_summary, dict):
+                    oos_summary = _empty_aggregate_summary()
+                summary = build_stage_b_summary(
+                    is_summary=is_summary,
+                    oos_summary=oos_summary,
+                    dd_cap_pct=dd_cap_pct,
+                    dd_cap_basis=dd_cap_basis,
+                    min_trades_oos=min_trades_oos,
+                    objective_mode=objective_mode,
+                )
+                combined = {
+                    "status": "done",
+                    "stage": "B",
+                    "candidate_id": candidate.get("candidate_id"),
+                    "gate_candidate_id": candidate.get("gate_candidate_id"),
+                    "gate_mode": candidate.get("gate_mode"),
+                    "gate_params": candidate.get("gate_params", {}),
+                    "risk_profile": candidate.get("risk_profile", {}),
+                    "risk_profile_name": dict(candidate.get("risk_profile", {})).get("name", ""),
+                    "config_path": str(candidate_config_path),
+                    "is_returncode": bucket["is"].get("returncode"),
+                    "oos_returncode": bucket["oos"].get("returncode"),
+                    "elapsed_seconds": float(bucket["is"].get("elapsed_seconds", 0.0))
+                    + float(bucket["oos"].get("elapsed_seconds", 0.0)),
+                    "is_summary": is_summary,
+                    "oos_summary": oos_summary,
+                    "summary": summary,
+                    "stderr_tail_is": bucket["is"].get("stderr_tail", ""),
+                    "stderr_tail_oos": bucket["oos"].get("stderr_tail", ""),
+                }
+                stage_b_results.append(combined)
+                upsert_checkpoint_record(checkpoint, stage="B", candidate_id=candidate_id, record=combined)
+                save_checkpoint(checkpoint_path, checkpoint)
+                interim.pop(candidate_id, None)
+                completed += 1
+                if completed % 5 == 0 or completed == stage_b_total:
+                    _summarize_stage_progress(stage="B", completed=completed, total=stage_b_total, started_at=stage_b_started_at)
+
+    stage_b_results.sort(key=lambda item: optimizer_rank_key(item.get("summary", failed_stage_summary())))
+    top_records = stage_b_results[: min(top_final_keep, len(stage_b_results))]
+    best_record = top_records[0] if top_records else None
+
+    stage_b_csv_rows: list[dict[str, object]] = []
+    for rank, item in enumerate(stage_b_results, start=1):
+        summary = item.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = failed_stage_summary()
+        stage_b_csv_rows.append(
+            {
+                "rank": rank,
+                "candidate_id": item.get("candidate_id"),
+                "gate_candidate_id": item.get("gate_candidate_id"),
+                "gate_mode": item.get("gate_mode"),
+                "gate_params": json.dumps(item.get("gate_params", {}), ensure_ascii=True, sort_keys=True),
+                "risk_profile_name": item.get("risk_profile_name"),
+                "risk_profile": json.dumps(item.get("risk_profile", {}), ensure_ascii=True, sort_keys=True),
+                "is_returncode": item.get("is_returncode"),
+                "oos_returncode": item.get("oos_returncode"),
+                "elapsed_seconds": item.get("elapsed_seconds", 0.0),
+                "is_total_pnl_net": summary.get("is_total_pnl_net", 0.0),
+                "is_dd_ref_pct": summary.get("is_dd_ref_pct", 0.0),
+                "oos_total_pnl_net": summary.get("oos_total_pnl_net", 0.0),
+                "oos_dd_ref_pct": summary.get("oos_dd_ref_pct", 0.0),
+                "oos_expectancy_net": summary.get("oos_expectancy_net", 0.0),
+                "oos_trades": summary.get("oos_trades", 0),
+                "constraint_dd_cap_pass_peak": summary.get("constraint_dd_cap_pass_peak", False),
+                "constraint_dd_cap_pass_initial": summary.get("constraint_dd_cap_pass_initial", False),
+                "constraint_dd_cap_pass": summary.get("constraint_dd_cap_pass", False),
+                "oos_pass": summary.get("oos_pass", False),
+                "objective_value": summary.get("objective_value", OBJECTIVE_FAIL_VALUE),
+            }
+        )
+    _write_csv(
+        run_dir / "stage_b_gate_risk_is_oos.csv",
+        fieldnames=[
+            "rank",
+            "candidate_id",
+            "gate_candidate_id",
+            "gate_mode",
+            "gate_params",
+            "risk_profile_name",
+            "risk_profile",
+            "is_returncode",
+            "oos_returncode",
+            "elapsed_seconds",
+            "is_total_pnl_net",
+            "is_dd_ref_pct",
+            "oos_total_pnl_net",
+            "oos_dd_ref_pct",
+            "oos_expectancy_net",
+            "oos_trades",
+            "constraint_dd_cap_pass_peak",
+            "constraint_dd_cap_pass_initial",
+            "constraint_dd_cap_pass",
+            "oos_pass",
+            "objective_value",
+        ],
+        rows=stage_b_csv_rows,
+    )
+
+    top20_payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "runtime_budget": runtime_budget,
+        "objective_mode": objective_mode,
+        "dd_cap_pct": dd_cap_pct,
+        "dd_cap_basis": dd_cap_basis,
+        "split": split_payload,
+        "top": top_records,
+    }
+    (run_dir / "top20.json").write_text(json.dumps(top20_payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    (run_dir / "best.json").write_text(
+        json.dumps({"best": best_record, "split": split_payload, "objective_mode": objective_mode}, indent=2, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+    winner_path = _write_optimizer_best_config(
+        root=root,
+        base_config=config,
+        source_config_path=config_path,
+        report_dir=run_dir,
+        best_record=best_record,
+        split_payload=split_payload,
+        objective_mode=objective_mode,
+        dd_cap_pct=dd_cap_pct,
+        dd_cap_basis=dd_cap_basis,
+    )
+
+    checkpoint["metadata"]["completed"] = True
+    checkpoint["metadata"]["stage_a_candidates"] = len(stage_a_candidates)
+    checkpoint["metadata"]["stage_b_candidates"] = len(stage_b_candidates)
+    save_checkpoint(checkpoint_path, checkpoint)
+
+    LOGGER.info("Research optimize summary saved: %s", run_dir)
+    if winner_path is not None:
+        LOGGER.info("Research optimize winner config saved: %s", winner_path)
+    LOGGER.info("Research optimize ranking (best->worst):")
+    LOGGER.info("rank | gate | risk | oos_pnl_net | oos_dd_ref | objective | dd_pass | oos_pass | oos_trades")
+    for idx, record in enumerate(top_records[:20], start=1):
+        summary = record.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = failed_stage_summary()
+        LOGGER.info(
+            "%d | %s | %s | %.4f | %.4f | %.4f | %s | %s | %d",
+            idx,
+            record.get("gate_mode"),
+            record.get("risk_profile_name"),
+            float(summary.get("oos_total_pnl_net", 0.0)),
+            float(summary.get("oos_dd_ref_pct", 0.0)),
+            float(summary.get("objective_value", OBJECTIVE_FAIL_VALUE)),
+            bool(summary.get("constraint_dd_cap_pass", False)),
+            bool(summary.get("oos_pass", False)),
+            int(summary.get("oos_trades", 0)),
+        )
+
+
 def _run_multi_strategy_segmented(
     *,
     config: AppConfig,
@@ -963,6 +2376,7 @@ def _run_multi_strategy_segmented(
     flatten_at_chunk_end: bool = False,
     daily_gate: DailyGateProvider | None = None,
     daily_gate_prepared: bool = False,
+    mc_model: MCAdaptiveModel | None = None,
 ):
     segments, segment_info = loader.split_frame_by_gaps(
         frame,
@@ -988,6 +2402,7 @@ def _run_multi_strategy_segmented(
 
     reports = []
     skipped_small = 0
+    rolling_equity = float(config.risk.equity)
     warmup_bars_per_segment = max(260, int(config.execution.history_bars.m5))
     for idx, segment in enumerate(segments):
         segment_input = segment
@@ -1017,8 +2432,11 @@ def _run_multi_strategy_segmented(
         segment_context["segment_end_utc"] = segment["ts_utc"].iloc[-1].isoformat()
         segment_context["segment_input_bars"] = int(len(segment_input))
         segment_context["segment_trade_bars"] = int(len(segment))
+        segment_context["segment_start_equity"] = float(rolling_equity)
+        segment_config = config.model_copy(deep=True)
+        segment_config.risk.equity = float(rolling_equity)
         report = run_backtest_multi_strategy(
-            config=config,
+            config=segment_config,
             asset=asset,
             candles_m5=candles,
             assumed_spread=assumed_spread,
@@ -1033,8 +2451,10 @@ def _run_multi_strategy_segmented(
             flatten_at_chunk_end=flatten_at_chunk_end,
             daily_gate=daily_gate,
             daily_gate_prepared=daily_gate_prepared,
+            mc_model=mc_model,
         )
         reports.append(report)
+        rolling_equity = float(getattr(report, "equity_end", rolling_equity))
 
     if not reports:
         candles_all = BacktestRunner._frame_to_candles(frame)
@@ -1054,6 +2474,7 @@ def _run_multi_strategy_segmented(
             flatten_at_chunk_end=flatten_at_chunk_end,
             daily_gate=daily_gate,
             daily_gate_prepared=daily_gate_prepared,
+            mc_model=mc_model,
         )
         reports = [report]
 
@@ -1069,10 +2490,524 @@ def _run_multi_strategy_segmented(
     segment_meta = dict(segment_info)
     segment_meta["segment_run_count"] = len(reports)
     segment_meta["segment_skipped_small"] = skipped_small
+    segment_meta["equity_start"] = float(config.risk.equity)
+    segment_meta["equity_end"] = float(rolling_equity)
     return merged, segment_meta
 
 
+_dashboard_server = None  # module-level so both helpers share state
+
+
+def _maybe_start_dashboard(args: argparse.Namespace, config: AppConfig) -> None:
+    """Start the web dashboard in the background (non-blocking).
+
+    Called *before* the backtest runs so the user can watch data live.
+    The JSONL file doesn't need to exist yet – the reader thread will
+    wait for it to appear.
+    """
+    global _dashboard_server
+    if not getattr(args, "dashboard", False):
+        return
+    if not config.diagnostics.decision_trace_enabled:
+        return
+    trace_path = Path(config.diagnostics.decision_trace_path)
+    try:
+        from tools.termviz_web import start_dashboard
+        LOGGER.info("Starting decision-trace dashboard on http://localhost:8777 ...")
+        _dashboard_server = start_dashboard(
+            path=trace_path,
+            port=8777,
+            open_browser=True,
+            blocking=False,   # returns immediately
+        )
+    except (ImportError, OSError):
+        LOGGER.exception("Could not start dashboard")
+
+
+def _maybe_block_dashboard(*, hold_open: bool = False) -> None:
+    """Optionally keep process alive so dashboard/MC viewer stay open.
+
+    Called *after* backtest. When hold_open is False, viewers are closed and
+    function returns immediately. When hold_open is True, process blocks until
+    dashboard/viewer are closed or interrupted.
+    """
+    global _dashboard_server
+    global _mc_viewer_proc
+
+    has_dashboard = _dashboard_server is not None
+    has_mc = _mc_viewer_proc is not None and _mc_viewer_proc.poll() is None
+
+    if not has_dashboard and not has_mc:
+        return
+
+    if not hold_open:
+        if _dashboard_server is not None:
+            _dashboard_server.shutdown()
+            _dashboard_server = None
+        _maybe_stop_mc_viewer()
+        return
+
+    parts: list[str] = []
+    if has_dashboard:
+        parts.append("dashboard")
+    if has_mc:
+        parts.append("MC viewer")
+    running_label = " + ".join(parts)
+
+    print(f"\n  Backtest complete – {running_label} still running.")
+    print("  Press Ctrl+C to stop.\n")
+    try:
+        while True:
+            # If MC viewer was closed by the user (window closed), note it
+            if _mc_viewer_proc is not None and _mc_viewer_proc.poll() is not None:
+                _mc_viewer_proc = None
+            # If dashboard is gone and MC viewer is gone, stop blocking
+            if _dashboard_server is None and (_mc_viewer_proc is None or _mc_viewer_proc.poll() is not None):
+                break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if _dashboard_server is not None:
+            _dashboard_server.shutdown()
+            _dashboard_server = None
+        _maybe_stop_mc_viewer()
+        print("Stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo live viewer auto-launch
+# ---------------------------------------------------------------------------
+_mc_viewer_proc: subprocess.Popen | None = None
+_mc_viewer_stderr_fh = None  # file handle for MC viewer stderr log
+
+
+def _maybe_start_mc_viewer(config: AppConfig, root: Path, cli_override: bool | None = None) -> None:
+    """Spawn the Monte Carlo live viewer as a child process (non-blocking).
+
+    Starts when ``monte_carlo.live_window.enabled`` is True and
+    ``viewer_mode`` is ``"process"`` or ``"terminal"`` — or when forced
+    via *cli_override*.  Failures are logged and swallowed.
+    """
+    global _mc_viewer_proc, _mc_viewer_stderr_fh
+    lw = config.monte_carlo.live_window
+
+    # CLI --mc-viewer / --no-mc-viewer override config
+    if cli_override is not None:
+        if not cli_override:
+            return
+        # cli_override True → force-start regardless of config flags
+    else:
+        if not lw.enabled or lw.viewer_mode not in ("process", "terminal") or not lw.open_on_start:
+            return
+
+    png_path = root / lw.png_path
+    json_path = root / lw.json_path
+    # Ensure the parent directory exists so the bot can later write files
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # -- Terminal mode: launch the plotext-based terminal viewer ----------
+    if lw.viewer_mode == "terminal":
+        viewer_script = root / "tools" / "termviz_mc.py"
+        if not viewer_script.exists():
+            LOGGER.warning("MC terminal viewer script not found: %s — skipping", viewer_script)
+            return
+        cmd = [
+            sys.executable,
+            str(viewer_script),
+            "--json", str(json_path),
+            "--refresh", str(lw.refresh_seconds),
+            "--title", lw.window_title,
+        ]
+        mc_log = root / "logs" / "mc_viewer.log"
+        mc_log.parent.mkdir(parents=True, exist_ok=True)
+        stderr_fh = None
+        try:
+            stderr_fh = open(mc_log, "w", encoding="utf-8")  # noqa: SIM115
+            # CREATE_NEW_CONSOLE on Windows gives the viewer its own terminal window
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NEW_CONSOLE
+            _mc_viewer_proc = subprocess.Popen(
+                cmd,
+                stderr=stderr_fh,
+                creationflags=creation_flags,
+            )
+            _mc_viewer_stderr_fh = stderr_fh
+            LOGGER.info("MC terminal viewer started (PID %s)", _mc_viewer_proc.pid)
+            time.sleep(0.5)
+            if _mc_viewer_proc.poll() is not None:
+                rc = _mc_viewer_proc.returncode
+                _mc_viewer_proc = None
+                LOGGER.warning(
+                    "MC terminal viewer exited immediately (code %s) — check %s", rc, mc_log,
+                )
+        except Exception:
+            LOGGER.exception("Could not start MC terminal viewer")
+            if stderr_fh is not None and _mc_viewer_proc is None:
+                try:
+                    stderr_fh.close()
+                except OSError:
+                    pass
+                _mc_viewer_stderr_fh = None
+        return
+
+    # -- Process mode: launch the matplotlib PNG viewer -------------------
+    viewer_script = root / "tools" / "monte_carlo_live_viewer.py"
+    if not viewer_script.exists():
+        LOGGER.warning("MC viewer script not found: %s — skipping auto-launch", viewer_script)
+        return
+
+    cmd = [
+        sys.executable,
+        str(viewer_script),
+        "--png", str(png_path),
+        "--json", str(json_path),
+        "--refresh", str(lw.refresh_seconds),
+        "--title", lw.window_title,
+        "--max-fps", str(lw.max_fps),
+    ]
+    if not lw.show_stats_overlay:
+        cmd.append("--no-overlay")
+
+    # Log stderr to file so viewer errors are visible for debugging
+    mc_log = root / "logs" / "mc_viewer.log"
+    mc_log.parent.mkdir(parents=True, exist_ok=True)
+    stderr_fh = None
+    try:
+        stderr_fh = open(mc_log, "w", encoding="utf-8")  # noqa: SIM115
+        _mc_viewer_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_fh,
+        )
+        _mc_viewer_stderr_fh = stderr_fh  # store for cleanup
+        LOGGER.info("Monte Carlo live viewer started (PID %s)", _mc_viewer_proc.pid)
+        # Brief health-check: give the process a moment to die on import errors
+        time.sleep(0.5)
+        if _mc_viewer_proc.poll() is not None:
+            rc = _mc_viewer_proc.returncode
+            _mc_viewer_proc = None
+            LOGGER.warning(
+                "MC viewer exited immediately (code %s) — check %s for details", rc, mc_log,
+            )
+    except Exception:
+        LOGGER.exception("Could not start Monte Carlo live viewer")
+        # Close stderr_fh if Popen failed so we don't leak the handle
+        if stderr_fh is not None and _mc_viewer_proc is None:
+            try:
+                stderr_fh.close()
+            except OSError:
+                pass
+            _mc_viewer_stderr_fh = None
+
+
+def _maybe_stop_mc_viewer() -> None:
+    """Terminate the MC viewer child process if it is still running."""
+    global _mc_viewer_proc, _mc_viewer_stderr_fh
+    if _mc_viewer_proc is None:
+        return
+    try:
+        _mc_viewer_proc.terminate()
+        _mc_viewer_proc.wait(timeout=3)
+    except Exception:
+        pass
+    _mc_viewer_proc = None
+    # Close the stderr log file handle
+    if _mc_viewer_stderr_fh is not None:
+        try:
+            _mc_viewer_stderr_fh.close()
+        except OSError:
+            pass
+        _mc_viewer_stderr_fh = None
+
+
+def _resolve_monte_carlo_starting_equity(
+    *,
+    mode: str,
+    configured_initial_equity: float,
+    initial_equity: float | None,
+    current_equity: float | None,
+    fallback_current_equity: float | None,
+) -> float:
+    mode_norm = str(mode or "initial").strip().lower()
+    if mode_norm not in {"initial", "current"}:
+        mode_norm = "initial"
+
+    configured = float(configured_initial_equity) if configured_initial_equity > 0 else 1.0
+    initial = configured
+    if initial_equity is not None:
+        try:
+            initial_candidate = float(initial_equity)
+        except (TypeError, ValueError):
+            initial_candidate = None
+        if initial_candidate is not None and initial_candidate > 0:
+            initial = initial_candidate
+
+    if mode_norm == "current":
+        for candidate in (current_equity, fallback_current_equity):
+            if candidate is None:
+                continue
+            try:
+                current_val = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if current_val > 0:
+                return current_val
+
+    return initial
+
+
+def _run_monte_carlo_for_payloads(
+    config: AppConfig,
+    root: Path,
+    gate_payloads: dict[str, dict[str, object]],
+) -> None:
+    """Extract trade PnLs from gate_payloads and run Monte Carlo simulation.
+
+    When multiple gate modes are present (e.g. off / trend / trend_vol_news),
+    uses only the **primary** configured mode — mixing trades from different
+    strategy variants would produce meaningless MC results.
+    Falls back to the first available mode if the configured mode is absent.
+    """
+    mc = config.monte_carlo
+    if not mc.enabled:
+        return
+
+    # Pick the single gate mode to simulate: configured mode first,
+    # else the first mode with actual reports.
+    primary_mode = _daily_gate_mode(config)
+    if primary_mode not in gate_payloads:
+        primary_mode = next(iter(gate_payloads), None)
+    if primary_mode is None:
+        LOGGER.info("Monte Carlo: no gate payloads — skipping simulation.")
+        return
+
+    payload = gate_payloads[primary_mode]
+    reports_map = payload.get("reports")
+    if not isinstance(reports_map, dict):
+        LOGGER.info("Monte Carlo: no reports in gate mode %s — skipping.", primary_mode)
+        return
+
+    # Collect PnLs from selected gate mode only
+    pnls: list[float] = []
+    for _sym, report in reports_map.items():
+        if not isinstance(report, dict):
+            continue
+        # Walk-forward reports nest under 'aggregate'
+        src = report.get("aggregate", report)
+        # Prefer pre-computed _trade_pnls list (raw trade PnLs)
+        trade_pnls = src.get("_trade_pnls") or report.get("_trade_pnls")
+        if trade_pnls:
+            pnls.extend(float(v) for v in trade_pnls)
+            continue
+        # Fallback: try to extract from serialised trade_log dicts
+        trade_log = src.get("trade_log", [])
+        for trade in trade_log:
+            if isinstance(trade, dict):
+                pnl_val = trade.get("pnl")
+                if pnl_val is not None:
+                    pnls.append(float(pnl_val))
+
+    if not pnls:
+        LOGGER.info("Monte Carlo: no trades in mode %s — skipping simulation.", primary_mode)
+        return
+
+    # Extract both initial and current equity from reports, then choose
+    # starting_equity via a single mode resolver.
+    initial_equity_report: float | None = None
+    current_equity_report: float | None = None
+    for _sym, report in reports_map.items():
+        if not isinstance(report, dict):
+            continue
+        src = report.get("aggregate", report)
+        if initial_equity_report is None:
+            _init = src.get("initial_equity")
+            if _init is None:
+                _init = report.get("initial_equity")
+            try:
+                _init_f = float(_init)
+            except (TypeError, ValueError):
+                _init_f = None
+            if _init_f is not None and _init_f > 0:
+                initial_equity_report = _init_f
+        if current_equity_report is None:
+            _eq = src.get("equity_end")
+            if _eq is None:
+                _eq = report.get("equity_end")
+            try:
+                _eq_f = float(_eq)
+            except (TypeError, ValueError):
+                _eq_f = None
+            if _eq_f is not None and _eq_f > 0:
+                current_equity_report = _eq_f
+    configured_initial = float(config.risk.equity)
+    fallback_current = configured_initial + float(sum(pnls))
+    starting_equity = _resolve_monte_carlo_starting_equity(
+        mode=mc.equity_mode_backtest,
+        configured_initial_equity=configured_initial,
+        initial_equity=initial_equity_report,
+        current_equity=current_equity_report,
+        fallback_current_equity=fallback_current,
+    )
+
+    png_path = _resolve_runtime_path(root, mc.live_window.png_path)
+    json_path = _resolve_runtime_path(root, mc.live_window.json_path)
+
+    try:
+        run_monte_carlo_simulation(
+            trade_pnls=pnls,
+            starting_equity=starting_equity,
+            png_path=png_path,
+            json_path=json_path,
+            num_simulations=mc.num_simulations,
+            ruin_dd_threshold=mc.ruin_dd_threshold,
+            seed=mc.seed,
+            max_paths_plotted=mc.max_paths_plotted,
+            sampling_mode=mc.sampling_mode,
+            block_size=mc.block_size,
+            equity_mode=mc.equity_mode_backtest,
+            ruin_equity_floor_pct=mc.ruin_equity_floor_pct,
+            ruin_equity_floor_abs=mc.ruin_equity_floor_abs,
+            count_breakeven_as_loss=mc.count_breakeven_as_loss,
+        )
+    except Exception:
+        LOGGER.exception("Monte Carlo simulation failed")
+
+
+def _run_monte_carlo_for_trades(
+    config: AppConfig,
+    root: Path,
+    trade_log: list[object],
+) -> None:
+    """Run Monte Carlo directly from a list of BacktestTrade objects."""
+    mc = config.monte_carlo
+    if not mc.enabled:
+        return
+
+    pnls: list[float] = []
+    for trade in trade_log:
+        pnl_val = getattr(trade, "pnl", None)
+        if pnl_val is not None:
+            pnls.append(float(pnl_val))
+
+    if not pnls:
+        LOGGER.info("Monte Carlo: no trades found — skipping simulation.")
+        return
+
+    configured_initial = float(config.risk.equity)
+    current_equity = configured_initial + float(sum(pnls))
+    starting_equity = _resolve_monte_carlo_starting_equity(
+        mode=mc.equity_mode_backtest,
+        configured_initial_equity=configured_initial,
+        initial_equity=configured_initial,
+        current_equity=current_equity,
+        fallback_current_equity=current_equity,
+    )
+
+    png_path = _resolve_runtime_path(root, mc.live_window.png_path)
+    json_path = _resolve_runtime_path(root, mc.live_window.json_path)
+
+    try:
+        run_monte_carlo_simulation(
+            trade_pnls=pnls,
+            starting_equity=starting_equity,
+            png_path=png_path,
+            json_path=json_path,
+            num_simulations=mc.num_simulations,
+            ruin_dd_threshold=mc.ruin_dd_threshold,
+            seed=mc.seed,
+            max_paths_plotted=mc.max_paths_plotted,
+            sampling_mode=mc.sampling_mode,
+            block_size=mc.block_size,
+            equity_mode=mc.equity_mode_backtest,
+            ruin_equity_floor_pct=mc.ruin_equity_floor_pct,
+            ruin_equity_floor_abs=mc.ruin_equity_floor_abs,
+            count_breakeven_as_loss=mc.count_breakeven_as_loss,
+        )
+    except Exception:
+        LOGGER.exception("Monte Carlo simulation failed")
+
+
+def _run_monte_carlo_for_batch(
+    config: AppConfig,
+    root: Path,
+    out_root: Path,
+    summary: dict[str, object],
+) -> None:
+    """Run Monte Carlo on the combined batch-backtest trades (from parquet)."""
+    mc = config.monte_carlo
+    if not mc.enabled:
+        return
+
+    parquet_path = out_root / "all" / "combined_trades.parquet"
+    if not parquet_path.exists():
+        LOGGER.info("Monte Carlo: no combined_trades.parquet — skipping.")
+        return
+
+    try:
+        import pyarrow.parquet as pq
+        table = pq.read_table(str(parquet_path), columns=["pnl"])
+        pnls = [float(v) for v in table.column("pnl").to_pylist() if v is not None]
+    except Exception:
+        LOGGER.exception("Monte Carlo: failed to read batch trade PnLs from parquet")
+        return
+
+    if not pnls:
+        LOGGER.info("Monte Carlo: no trades in batch results — skipping.")
+        return
+
+    combined_metrics = summary.get("combined_metrics", {})
+    if not isinstance(combined_metrics, dict):
+        combined_metrics = {}
+    try:
+        initial_equity = float(combined_metrics.get("initial_equity", config.risk.equity))
+    except (TypeError, ValueError):
+        initial_equity = float(config.risk.equity)
+    try:
+        current_equity = float(combined_metrics.get("equity_end"))
+    except (TypeError, ValueError):
+        current_equity = None
+    fallback_current = initial_equity + float(sum(pnls))
+    starting_equity = _resolve_monte_carlo_starting_equity(
+        mode=mc.equity_mode_backtest,
+        configured_initial_equity=float(config.risk.equity),
+        initial_equity=initial_equity,
+        current_equity=current_equity,
+        fallback_current_equity=fallback_current,
+    )
+
+    png_path = _resolve_runtime_path(root, mc.live_window.png_path)
+    json_path = _resolve_runtime_path(root, mc.live_window.json_path)
+
+    try:
+        run_monte_carlo_simulation(
+            trade_pnls=pnls,
+            starting_equity=starting_equity,
+            png_path=png_path,
+            json_path=json_path,
+            num_simulations=mc.num_simulations,
+            ruin_dd_threshold=mc.ruin_dd_threshold,
+            seed=mc.seed,
+            max_paths_plotted=mc.max_paths_plotted,
+            sampling_mode=mc.sampling_mode,
+            block_size=mc.block_size,
+            equity_mode=mc.equity_mode_backtest,
+            ruin_equity_floor_pct=mc.ruin_equity_floor_pct,
+            ruin_equity_floor_abs=mc.ruin_equity_floor_abs,
+            count_breakeven_as_loss=mc.count_breakeven_as_loss,
+        )
+    except Exception:
+        LOGGER.exception("Monte Carlo simulation failed")
+
+
 def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[AssetConfig], root: Path) -> None:
+    # Start the live dashboard BEFORE the backtest so we can watch in real-time
+    _maybe_start_dashboard(args, config)
+
+    # Start Monte Carlo live viewer (non-blocking subprocess)
+    _maybe_start_mc_viewer(config, root, cli_override=getattr(args, "mc_viewer", None))
+
     report_formats = _parse_report_formats(args.report_formats)
     reporter = BacktestReporter(_resolve_runtime_path(root, str(args.report_dir))) if args.report else None
     generated_report_dirs: list[Path] = []
@@ -1112,7 +3047,10 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
             meta=meta,
             trades=trades,
             equity=[],
-            extra={"source_report": payload},
+            extra={
+                "source_report": payload.get("aggregate", payload) if isinstance(payload, dict) else payload,
+                "source_report_full": payload,
+            },
         )
         reporter.generate(run=run, formats=report_formats)
         if reporter.last_output_dir is not None:
@@ -1155,6 +3093,13 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     daily_gate=daily_gate,
                 )
                 report_dict = report.to_dict()
+                aggregate_payload = report_dict.get("aggregate")
+                if isinstance(aggregate_payload, dict):
+                    report_dict["aggregate"] = _augment_report_with_research_fields(
+                        aggregate_payload,
+                        config=config,
+                        oos_pass=None,
+                    )
                 LOGGER.info(
                     "Walk-forward report (daily_gate=%s): %s",
                     gate_mode,
@@ -1179,11 +3124,13 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     payload=report_dict,
                     data_root_value=str(csv_path),
                 )
+                _wf_agg = report_dict.get("aggregate", {})
+                _wf_agg["_trade_pnls"] = [float(t.pnl) for t in aggregate_report.trade_log]
                 gate_payloads[gate_mode] = {
                     "variant": _first_variant_code(args.backtest_variants),
                     "mode": "walk-forward",
                     "symbols": [selected.epic],
-                    "reports": {selected.epic: report_dict.get("aggregate", {})},
+                    "reports": {selected.epic: _wf_agg},
                 }
             else:
                 report = run_backtest_from_csv(
@@ -1195,7 +3142,11 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     slippage_atr_multiplier=args.backtest_slippage_atr_multiplier,
                     daily_gate=daily_gate,
                 )
-                report_dict = report.to_dict()
+                report_dict = _augment_report_with_research_fields(
+                    report.to_dict(),
+                    config=config,
+                    oos_pass=None,
+                )
                 LOGGER.info(
                     "Backtest report (daily_gate=%s): %s",
                     gate_mode,
@@ -1219,6 +3170,7 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     payload=report_dict,
                     data_root_value=str(csv_path),
                 )
+                report_dict["_trade_pnls"] = [float(t.pnl) for t in report.trade_log]
                 gate_payloads[gate_mode] = {
                     "variant": _first_variant_code(args.backtest_variants),
                     "mode": "backtest",
@@ -1227,7 +3179,9 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                 }
         if len(gate_payloads) > 1:
             _log_daily_gate_comparison(gate_payloads=gate_payloads, symbols=[selected.epic])
+        _run_monte_carlo_for_payloads(config, root, gate_payloads)
         _maybe_open_reports()
+        _maybe_block_dashboard(hold_open=bool(getattr(args, "hold_viewers", False)))
         return
 
     # New automatic parquet data mode (without --backtest-data).
@@ -1334,9 +3288,13 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
             for report in reports_raw.values():
                 if not isinstance(report, dict):
                     continue
-                total_pnl += float(report.get("total_pnl", 0.0))
-                max_drawdown = max(max_drawdown, float(report.get("max_drawdown", 0.0)))
-                expectancy_values.append(float(report.get("expectancy", 0.0)))
+                source = report
+                aggregate = report.get("aggregate")
+                if isinstance(aggregate, dict):
+                    source = aggregate
+                total_pnl += float(source.get("total_pnl", 0.0))
+                max_drawdown = max(max_drawdown, float(source.get("max_drawdown", 0.0)))
+                expectancy_values.append(float(source.get("expectancy", 0.0)))
         expectancy = (sum(expectancy_values) / len(expectancy_values)) if expectancy_values else 0.0
         return {
             "total_pnl": total_pnl,
@@ -1399,8 +3357,24 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                         daily_gate=daily_gate,
                     )
                     report_dict = report.to_dict()
+                    aggregate_payload = report_dict.get("aggregate")
+                    if isinstance(aggregate_payload, dict):
+                        report_dict["aggregate"] = _augment_report_with_research_fields(
+                            aggregate_payload,
+                            config=config,
+                            oos_pass=None,
+                        )
                     report_trades = list(report.aggregate.trade_log)
                 else:
+                    # Create MC adaptive model if enabled — shares state
+                    # across segments so risk scaling accumulates correctly.
+                    _mc_model: MCAdaptiveModel | None = None
+                    if config.monte_carlo.enabled and config.monte_carlo.adaptive.enabled:
+                        _mc_png = _resolve_runtime_path(root, config.monte_carlo.live_window.png_path)
+                        _mc_json = _resolve_runtime_path(root, config.monte_carlo.live_window.json_path)
+                        _mc_model = MCAdaptiveModel.from_config(
+                            config.monte_carlo, png_path=_mc_png, json_path=_mc_json,
+                        )
                     report, segment_meta = _run_multi_strategy_segmented(
                         config=config,
                         asset=asset_map[symbol],
@@ -1417,24 +3391,34 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                         data_context=data_context,
                         daily_gate=daily_gate,
                         daily_gate_prepared=True,
+                        mc_model=_mc_model,
                     )
-                    report_dict = report.to_dict()
+                    report_dict = _augment_report_with_research_fields(
+                        report.to_dict(),
+                        config=config,
+                        oos_pass=None,
+                    )
                     report_dict["segment_health"] = segment_meta
                     report_trades = list(report.trade_log)
-                report_dict["data_health"] = loaded.diagnostics.get("data_health", {})
-                report_dict["price_diagnostics"] = {
+                report_payload: dict[str, object] = report_dict
+                aggregate_payload = report_dict.get("aggregate")
+                if args.walk_forward and isinstance(aggregate_payload, dict):
+                    report_payload = aggregate_payload
+
+                report_payload["data_health"] = loaded.diagnostics.get("data_health", {})
+                report_payload["price_diagnostics"] = {
                     "price_mode_requested": loaded.diagnostics.get("price_mode_requested", args.backtest_price),
                     "source_datasets": loaded.diagnostics.get("source_datasets", []),
                     "source_files_count": len(loaded.diagnostics.get("source_files", [])),
                     "fallback_counters": loaded.diagnostics.get("fallback_counters", {}),
                     "gap_segments": loaded.diagnostics.get("gap_segments", {}),
                     "spread_mode": spread_mode,
-                    "assumed_spread_used": float(report_dict.get("assumed_spread_used", assumed_spread)),
+                    "assumed_spread_used": float(report_payload.get("assumed_spread_used", assumed_spread)),
                 }
-                report_dict["daily_gate_mode"] = gate_mode
+                report_payload["daily_gate_mode"] = gate_mode
                 if gate_overrides:
-                    report_dict["daily_gate_params"] = gate_overrides
-                reports[symbol] = report_dict
+                    report_payload["daily_gate_params"] = gate_overrides
+                reports[symbol] = report_payload
                 if emit_reports:
                     _emit_detailed_report(
                         symbol=symbol,
@@ -1458,7 +3442,16 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                     )
                     suffix = f"_{gate_mode}"
                     target = reports_dir / filename.replace(".json", f"{suffix}.json")
-                    target.write_text(json.dumps(report_dict, indent=2, ensure_ascii=True), encoding="utf-8")
+                    # Strip internal _trade_pnls before writing to disk
+                    _disk_dict = {k: v for k, v in report_dict.items() if not k.startswith("_")}
+                    target.write_text(json.dumps(_disk_dict, indent=2, ensure_ascii=True), encoding="utf-8")
+
+                # Stash raw trade PnLs AFTER file-write so they don't leak
+                # to JSON report files.  MC helper reads them from the dict.
+                trade_pnls = [float(t.pnl) for t in report_trades]
+                report_payload["_trade_pnls"] = trade_pnls
+                if report_payload is not report_dict:
+                    report_dict["_trade_pnls"] = trade_pnls
 
             payloads[variant.code] = {
                 "variant": variant.code,
@@ -1564,7 +3557,9 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
                 comparison_path = reports_dir / "daily_gate_comparison.json"
                 comparison_path.write_text(json.dumps(gate_payloads, indent=2, ensure_ascii=True), encoding="utf-8")
                 LOGGER.info("Daily gate comparison report saved: %s", comparison_path)
+            _run_monte_carlo_for_payloads(config, root, gate_payloads)
             _maybe_open_reports()
+            _maybe_block_dashboard(hold_open=bool(getattr(args, "hold_viewers", False)))
             return
         except MissingDataError as exc:
             for item in exc.missing:
@@ -1702,6 +3697,15 @@ def run_batch_worker_mode(args: argparse.Namespace, config: AppConfig, assets: l
             assumed_spread = float(configured_spread if configured_spread is not None else args.backtest_spread)
             spread_mode = "ASSUMED_OHLC"
 
+        # Create MC adaptive model if enabled
+        _mc_model: MCAdaptiveModel | None = None
+        if config.monte_carlo.enabled and config.monte_carlo.adaptive.enabled:
+            _mc_png = _resolve_runtime_path(root, config.monte_carlo.live_window.png_path)
+            _mc_json = _resolve_runtime_path(root, config.monte_carlo.live_window.json_path)
+            _mc_model = MCAdaptiveModel.from_config(
+                config.monte_carlo, png_path=_mc_png, json_path=_mc_json,
+            )
+
         report, segment_meta = _run_multi_strategy_segmented(
             config=config,
             asset=asset,
@@ -1717,6 +3721,7 @@ def run_batch_worker_mode(args: argparse.Namespace, config: AppConfig, assets: l
             reaction_timeout_debug_path=out_dir / "debug_reaction_timeout.jsonl",
             trade_start_utc=start,
             flatten_at_chunk_end=True,
+            mc_model=_mc_model,
             data_context={
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -1765,6 +3770,11 @@ def run_batch_worker_mode(args: argparse.Namespace, config: AppConfig, assets: l
         trades_df.to_parquet(out_dir / "trades.parquet", index=False, engine="pyarrow")
 
         report_dict = report.to_dict()
+        report_dict = _augment_report_with_research_fields(
+            report_dict,
+            config=config,
+            oos_pass=None,
+        )
         report_dict["data_health"] = loaded.diagnostics.get("data_health", {})
         report_dict["segment_health"] = segment_meta
         report_dict["price_diagnostics"] = {
@@ -1839,6 +3849,9 @@ def run_batch_worker_mode(args: argparse.Namespace, config: AppConfig, assets: l
 
 
 def run_batch_backtest_mode(args: argparse.Namespace, config: AppConfig, root: Path) -> None:
+    # Start Monte Carlo live viewer for batch backtest mode
+    _maybe_start_mc_viewer(config, root, cli_override=getattr(args, "mc_viewer", None))
+
     if not args.symbol:
         raise RuntimeError("--batch-backtest requires --symbol")
     if not args.start or not args.end:
@@ -1871,13 +3884,18 @@ def run_batch_backtest_mode(args: argparse.Namespace, config: AppConfig, root: P
         start=start,
         end=end,
         chunk=str(args.chunk),
-        workers=max(1, int(args.workers)),
+        workers=max(1, min(3, int(args.workers))),
         warmup_days=max(0, int(args.warmup_days)),
         out_root=out_root,
         initial_equity=float(args.initial_equity if args.initial_equity is not None else config.risk.equity),
         continue_on_error=bool(args.continue_on_error),
     )
     LOGGER.info("Batch backtest summary: %s", json.dumps(summary, indent=2, ensure_ascii=True))
+
+    # Run Monte Carlo on the combined batch trades
+    _run_monte_carlo_for_batch(config, root, out_root, summary)
+
+    _maybe_stop_mc_viewer()
 
 
 def _timeframe_history(config: AppConfig) -> dict[str, int]:
@@ -2171,13 +4189,58 @@ def _pick_best_candidate(
     return best_candidate, best_eval
 
 
-def _normalize_action_for_score(*, evaluation: StrategyEvaluation, config: AppConfig) -> StrategyEvaluation:
+def _normalize_action_for_score(
+    *,
+    evaluation: StrategyEvaluation,
+    config: AppConfig,
+    adaptive_cfg: AdaptiveThresholdConfig | None = None,
+    soft_gate_result: SoftGateResult | None = None,
+    session_threshold_adjust: float = 0.0,
+) -> StrategyEvaluation:
     if evaluation.score_total is None:
         return evaluation
     if evaluation.reasons_blocking:
         evaluation.action = DecisionAction.OBSERVE
         return evaluation
     score = float(evaluation.score_total)
+
+    # ── Adaptive threshold path ──────────────────────────
+    if adaptive_cfg is not None and adaptive_cfg.enabled:
+        # Apply soft-gate penalty to score (reversible metadata, not permanent)
+        penalty = soft_gate_result.total_penalty if soft_gate_result else 0.0
+        adjusted_score = score - penalty
+        evaluation.metadata["adaptive_score_before_penalty"] = score
+        evaluation.metadata["adaptive_soft_penalty"] = penalty
+        evaluation.metadata["adaptive_score_adjusted"] = adjusted_score
+
+        trend_regime = str(evaluation.metadata.get("trend_regime", "UNKNOWN"))
+        vol_regime = str(evaluation.metadata.get("volatility_regime", "NORMAL"))
+        threshold = compute_adaptive_threshold(
+            config=adaptive_cfg,
+            trend_regime=trend_regime,
+            vol_regime=vol_regime,
+        )
+        # Apply session-based threshold adjustment
+        threshold += session_threshold_adjust
+        evaluation.metadata["adaptive_threshold"] = threshold
+        evaluation.metadata["session_threshold_adjust"] = session_threshold_adjust
+
+        action_str = normalize_action_adaptive(
+            score=adjusted_score,
+            threshold=threshold,
+            small_band=5.0,
+        )
+        if action_str == "TRADE":
+            evaluation.action = DecisionAction.TRADE
+        elif action_str == "SMALL":
+            evaluation.action = DecisionAction.SMALL
+        else:
+            evaluation.action = DecisionAction.OBSERVE
+            if "SCORE_BELOW_MIN" not in evaluation.reasons_blocking:
+                evaluation.reasons_blocking.append("SCORE_BELOW_MIN")
+        return evaluation
+
+    # ── Default fixed-threshold path ─────────────────────
     if score >= config.decision_policy.trade_score_threshold:
         evaluation.action = DecisionAction.TRADE
     elif config.decision_policy.small_score_min <= score <= config.decision_policy.small_score_max:
@@ -2611,6 +4674,9 @@ def run_multi_strategy_loop(
     sync_pending_seconds: int,
     sync_positions_seconds: int,
     tf_history: dict[str, int],
+    sc_logger: SignalCandidateLogger | None = None,
+    sc_aggregator: SignalCandidateAggregator | None = None,
+    micro_loss_metrics: MicroLossMetrics | None = None,
 ) -> None:
     metrics_start = client.metrics_snapshot() if client is not None else {}
     daily_summary = DailyRuntimeSummary(
@@ -2637,6 +4703,62 @@ def run_multi_strategy_loop(
     orderflow_full_symbols = set(config.orderflow.full_symbols)
     orderflow_default_mode = config.orderflow.default_mode
     orderflow_default_window = int(config.orderflow.default_window)
+    # Paper cost model
+    paper_cost_cfg = PaperCostConfig(
+        enabled=config.paper_costs.enabled,
+        slippage_market=SlippageModelConfig(
+            base_ticks=config.paper_costs.slippage_market.base_ticks,
+            beta_spread=config.paper_costs.slippage_market.beta_spread,
+            beta_atr=config.paper_costs.slippage_market.beta_atr,
+        ),
+        slippage_stop=SlippageModelConfig(
+            base_ticks=config.paper_costs.slippage_stop.base_ticks,
+            beta_spread=config.paper_costs.slippage_stop.beta_spread,
+            beta_atr=config.paper_costs.slippage_stop.beta_atr,
+        ),
+        slippage_limit=SlippageModelConfig(
+            base_ticks=config.paper_costs.slippage_limit.base_ticks,
+            beta_spread=config.paper_costs.slippage_limit.beta_spread,
+            beta_atr=config.paper_costs.slippage_limit.beta_atr,
+        ),
+        commission_per_side=config.paper_costs.commission_per_side,
+        swap_per_day=config.paper_costs.swap_per_day,
+        use_bid_ask_fills=config.paper_costs.use_bid_ask_fills,
+    )
+    # Micro-loss defense config
+    ml_defense_cfg = MicroLossDefenseConfig(
+        enabled=config.micro_loss_defense.enabled,
+        micro_loss_k=config.micro_loss_defense.micro_loss_k,
+        min_stop_spread_mult=config.micro_loss_defense.min_stop_spread_mult,
+        min_stop_atr_mult=config.micro_loss_defense.min_stop_atr_mult,
+        edge_mult=config.micro_loss_defense.edge_mult,
+        be_buffer_atr_frac=config.micro_loss_defense.be_buffer_atr_frac,
+        be_buffer_ticks=config.micro_loss_defense.be_buffer_ticks,
+    )
+    # Adaptive threshold config
+    adaptive_cfg: AdaptiveThresholdConfig | None = None
+    if config.adaptive_threshold.enabled:
+        adaptive_cfg = build_adaptive_config(config.adaptive_threshold)
+        LOGGER.info(
+            "Adaptive threshold ENABLED  base=%.1f  range_adj=%.1f  trend_adj=%.1f  "
+            "soft_gates=%s  penalty=%.1f",
+            adaptive_cfg.base_threshold, adaptive_cfg.range_adjust,
+            adaptive_cfg.trend_adjust, adaptive_cfg.soft_gates_enabled,
+            adaptive_cfg.soft_gate_penalty,
+        )
+    elif config.adaptive_threshold.soft_gates_enabled:
+        # Soft gates can be on independently of adaptive threshold
+        adaptive_cfg = build_adaptive_config(config.adaptive_threshold)
+        LOGGER.info("Soft gates ENABLED (adaptive threshold OFF)")
+    # ── Session-aware windows ────────────────────────────
+    session_windows: list[SessionWindow] = build_session_windows(config.session_filter)
+    if session_windows:
+        LOGGER.info(
+            "Session filter ENABLED  windows=%d  block_outside=%s",
+            len(session_windows),
+            config.session_filter.block_outside_sessions,
+        )
+    session_start_utc = utc_now()
     daily_gate_mode = _daily_gate_mode(config)
     daily_gate_services: dict[str, DailyGateProvider] = {}
     if daily_gate_mode != "off":
@@ -2667,8 +4789,23 @@ def run_multi_strategy_loop(
                 api_429_start=metrics.get("http_429_count", 0),
             )
         daily_summary.cycles += 1
+        # ── Session matching (multi-strategy loop) ────
+        session_match: SessionMatch = match_session(
+            now, session_windows,
+            block_outside=bool(config.session_filter.block_outside_sessions),
+        ) if session_windows else SessionMatch.no_match()
         try:
-            if not is_trading_weekday(now, config.timezone):
+            symbol_market_open = {
+                epic: is_symbol_market_open(
+                    now,
+                    symbol=epic,
+                    timezone_name=config.timezone,
+                    default_profile=config.market_hours.default_profile,
+                    symbol_profiles=config.market_hours.symbol_profiles,
+                )
+                for epic in states.keys()
+            }
+            if not any(symbol_market_open.values()):
                 stop_event.wait(config.execution.loop_seconds)
                 continue
 
@@ -2694,6 +4831,8 @@ def run_multi_strategy_loop(
 
             quotes: dict[str, tuple[float, float, float]] = {}
             for epic, state in states.items():
+                if not symbol_market_open.get(epic, True):
+                    continue
                 quote_interval = _quote_refresh_interval_seconds(
                     config=config,
                     trade_enabled=state.asset.trade_enabled,
@@ -2762,12 +4901,25 @@ def run_multi_strategy_loop(
             closed = closed_sync + closed_manage
             if closed:
                 apply_closed_events(closed, day, journal, risk_engine, now, alerts)
+                # ── Update re-entry state per asset ──────────
+                for _cev in closed:
+                    _rs = states.get(_cev.epic)
+                    if _rs is not None:
+                        _rs.reentry.record_close(
+                            side=_cev.side or "UNKNOWN",
+                            exit_type=_cev.exit_type or "UNKNOWN",
+                            pnl=_cev.pnl,
+                            closed_at=_cev.closed_at,
+                        )
 
-            pending_intents: list[PendingOrderIntent] = []
             close_meta: dict[str, tuple[bool, datetime | None, bool, datetime | None, bool, datetime | None]] = {}
+            pending_intents: list[PendingOrderIntent] = []
             final_decision: dict[str, str] = {}
-
             for epic, state in states.items():
+                if not symbol_market_open.get(epic, True):
+                    final_decision[epic] = "MARKET_CLOSED"
+                    state.last_reason_codes = ["MARKET_CLOSED"]
+                    continue
                 asset_stats = journal.get_daily_stats(day, epic=epic)
                 if risk_engine.should_turn_off_for_day(asset_stats.pnl) and asset_stats.status != "OFF":
                     journal.set_daily_status(day, "OFF", epic=epic)
@@ -2922,7 +5074,10 @@ def run_multi_strategy_loop(
                             setup_side=candidate.side if candidate is not None else None,
                             orderflow_settings=orderflow_settings,
                         )
-                        _ = _normalize_action_for_score(evaluation=evaluation, config=config)
+                        _ = _normalize_action_for_score(
+                            evaluation=evaluation, config=config,
+                            session_threshold_adjust=session_match.threshold_adjust,
+                        )
                         gate_reasons = _quality_gate_reasons(
                             symbol=epic,
                             route_params=route.params,
@@ -2930,11 +5085,46 @@ def run_multi_strategy_loop(
                             now=now,
                             timezone_name=config.timezone,
                         )
-                        if gate_reasons:
+                        # ── Soft-gate conversion ─────────────────
+                        _sg_result: SoftGateResult | None = None
+                        if adaptive_cfg is not None and adaptive_cfg.soft_gates_enabled and gate_reasons:
+                            _sg_result = apply_soft_gates(
+                                gate_reasons,
+                                soft_gates_enabled=True,
+                                soft_gate_penalty=adaptive_cfg.soft_gate_penalty,
+                            )
+                            evaluation.metadata["soft_gate_converted"] = _sg_result.converted_gates
+                            evaluation.metadata["soft_gate_penalty"] = _sg_result.total_penalty
+                            # Only hard reasons block; soft ones become penalties
+                            if _sg_result.hard_reasons:
+                                evaluation.action = DecisionAction.OBSERVE
+                                for code in _sg_result.hard_reasons:
+                                    if code not in evaluation.reasons_blocking:
+                                        evaluation.reasons_blocking.append(code)
+                            # Re-normalize with adaptive threshold + soft penalty
+                            if not _sg_result.hard_reasons:
+                                evaluation.reasons_blocking.clear()
+                                _ = _normalize_action_for_score(
+                                    evaluation=evaluation,
+                                    config=config,
+                                    adaptive_cfg=adaptive_cfg,
+                                    soft_gate_result=_sg_result,
+                                    session_threshold_adjust=session_match.threshold_adjust,
+                                )
+                        elif gate_reasons:
                             evaluation.action = DecisionAction.OBSERVE
                             for code in gate_reasons:
                                 if code not in evaluation.reasons_blocking:
                                     evaluation.reasons_blocking.append(code)
+                        elif adaptive_cfg is not None and adaptive_cfg.enabled:
+                            # No gates hit → still re-normalize with adaptive threshold
+                            evaluation.reasons_blocking.clear()
+                            _ = _normalize_action_for_score(
+                                evaluation=evaluation,
+                                config=config,
+                                adaptive_cfg=adaptive_cfg,
+                                session_threshold_adjust=session_match.threshold_adjust,
+                            )
                         evaluation = _apply_orderflow_small_soft_gate(
                             route_params=route.params,
                             evaluation=evaluation,
@@ -2977,6 +5167,64 @@ def run_multi_strategy_loop(
                                     if code not in outcome.reason_codes:
                                         outcome.reason_codes.append(code)
                         rank_value = rank_score(evaluation) + (route.priority * 0.01)
+
+                    # --- SignalCandidate logging (telemetry) ---
+                    if sc_logger is not None:
+                        _atr_val = outcome.evaluation.metadata.get(
+                            "atr_m5", outcome.evaluation.snapshot.get("atr_m5")
+                        )
+                        _atr_float: float | None = None
+                        try:
+                            _atr_float = float(_atr_val) if _atr_val is not None else None
+                        except (TypeError, ValueError):
+                            pass
+                        _sl_dist: float | None = None
+                        _tp_dist: float | None = None
+                        _expected_rr: float | None = None
+                        _estimated_rtc: float | None = None
+                        if outcome.order_request is not None:
+                            sig = outcome.order_request
+                            _sl_dist = abs(sig.entry_price - sig.stop_price) if sig.entry_price and sig.stop_price else None
+                            _tp_dist = abs(sig.take_profit - sig.entry_price) if sig.take_profit and sig.entry_price else None
+                            if _sl_dist and _sl_dist > 0 and _tp_dist is not None:
+                                _expected_rr = _tp_dist / _sl_dist
+                        if spread is not None and paper_cost_cfg.enabled:
+                            _estimated_rtc = estimate_roundtrip_cost_points(
+                                spread=spread, atr=_atr_float, config=paper_cost_cfg
+                            )
+                        _setup_name = "NONE"
+                        if outcome.candidate is not None:
+                            _setup_name = outcome.candidate.setup_type or outcome.candidate.strategy_name
+                        _trend_regime = str(outcome.evaluation.metadata.get("trend_regime", "UNKNOWN"))
+                        _vol_regime = str(outcome.evaluation.metadata.get("volatility_regime", "UNKNOWN"))
+                        _session_name = str(outcome.evaluation.metadata.get("session_name", "UNKNOWN"))
+                        sc_logger.log(SignalCandidate(
+                            timestamp=now,
+                            symbol=epic,
+                            timeframe=config.timeframes.m5,
+                            strategy_name=outcome.strategy_name,
+                            setup_name=_setup_name,
+                            side=outcome.order_request.side if outcome.order_request else (outcome.candidate.side if outcome.candidate else None),
+                            score=outcome.evaluation.score_total,
+                            spread=spread,
+                            atr=_atr_float,
+                            trend_regime=_trend_regime,
+                            volatility_regime=_vol_regime,
+                            session_name=_session_name,
+                            bias_direction=outcome.bias.direction if outcome.bias else None,
+                            sl_distance=_sl_dist,
+                            tp_distance=_tp_dist,
+                            expected_rr=_expected_rr,
+                            expected_move=_tp_dist,
+                            estimated_roundtrip_cost=_estimated_rtc,
+                            action=outcome.evaluation.action.value,
+                            accepted=outcome.order_request is not None,
+                            rejection_reasons=list(outcome.evaluation.reasons_blocking),
+                            score_breakdown=dict(outcome.evaluation.score_breakdown),
+                            features=dict(outcome.evaluation.snapshot) if outcome.evaluation.snapshot else {},
+                            gates=dict(outcome.evaluation.gates),
+                            metadata={"route_strategy": route.strategy, "route_priority": route.priority},
+                        ))
 
                     route_summaries.append(
                         {
@@ -3125,10 +5373,53 @@ def run_multi_strategy_loop(
                 cooldown = journal.get_risk_state(f"ASSET:{intent.symbol}").cooldown_until
                 open_asset_now = position_manager.get_open_positions(epic=intent.symbol)
                 open_all_now = position_manager.get_open_positions()
+
+                # ── Session block check ──────────────────
+                if session_match.blocked:
+                    intent.outcome.reason_codes.append("SESSION_BLOCKED")
+                    intent.outcome.payload["session"] = {"name": session_match.session_name, "blocked": True}
+                    final_decision[intent.symbol] = "NO_SIGNAL"
+                    continue
+
+                # ── Tier-based sizing ────────────────────
+                _score_for_tier = float(intent.outcome.evaluation.score_total or 0.0)
+                _tier_label = resolve_score_tier(
+                    _score_for_tier,
+                    tier_cfg=config.tier_sizing if config.tier_sizing.enabled else None,
+                )
+                _tier_mult = tier_risk_multiplier(
+                    _tier_label,
+                    tier_cfg=config.tier_sizing if config.tier_sizing.enabled else None,
+                )
+                if config.tier_sizing.enabled and _tier_mult <= 0:
+                    intent.outcome.reason_codes.append("TIER_OBSERVE_SKIP")
+                    intent.outcome.payload["tier"] = {"label": _tier_label, "mult": 0.0}
+                    final_decision[intent.symbol] = "NO_SIGNAL"
+                    continue
+
+                # ── Compound equity ──────────────────────
+                _sizing_equity = float(config.risk.equity)
+                if config.compound_equity.enabled:
+                    _sizing_equity = compute_compound_equity(
+                        _sizing_equity,
+                        floor_equity=float(config.compound_equity.floor_equity),
+                        cap_equity=float(config.compound_equity.cap_equity),
+                    )
+
+                # ── Session + tier adjusted risk ─────────
+                _session_risk_mult = session_match.risk_mult
                 effective_risk_per_trade = risk_engine.effective_risk_per_trade(
                     risk_multiplier=intent.risk_multiplier,
-                    equity=config.risk.equity,
+                    equity=_sizing_equity,
                 )
+                effective_risk_per_trade *= _tier_mult * _session_risk_mult
+                intent.outcome.payload["sizing_meta"] = {
+                    "tier": _tier_label, "tier_mult": _tier_mult,
+                    "session": session_match.session_name,
+                    "session_risk_mult": _session_risk_mult,
+                    "sizing_equity": _sizing_equity,
+                }
+
                 risk_check = risk_engine.can_open_new_trade_multi(
                     now=now,
                     asset_epic=intent.symbol,
@@ -3136,9 +5427,9 @@ def run_multi_strategy_loop(
                     global_stats=global_stats,
                     asset_open_positions=open_asset_now,
                     all_open_positions=open_all_now,
-                    new_trade_risk_amount=config.risk.equity * effective_risk_per_trade,
+                    new_trade_risk_amount=_sizing_equity * effective_risk_per_trade,
                     cooldown_until=cooldown,
-                    equity=config.risk.equity,
+                    equity=_sizing_equity,
                 )
                 if not risk_check.allowed:
                     for code in risk_check.reason_codes:
@@ -3156,7 +5447,7 @@ def run_multi_strategy_loop(
                 risk_distance = abs(float(intent.signal.entry_price) - float(intent.signal.stop_price))
                 risk_cash_plan = compute_risk_cash_plan(
                     risk=config.risk,
-                    equity=config.risk.equity,
+                    equity=_sizing_equity,
                     effective_risk_per_trade=effective_risk_per_trade,
                 )
                 raw_size = (float(risk_cash_plan.target_risk_cash) / risk_distance) if risk_distance > 0 else 0.0
@@ -3167,7 +5458,7 @@ def run_multi_strategy_loop(
                     else None
                 )
                 open_margin = _estimated_open_margin(positions=open_all_now, config=config)
-                free_margin = max(0.0, float(config.risk.equity) - float(open_margin))
+                free_margin = max(0.0, _sizing_equity - float(open_margin))
                 spread_limit_points = config.backtest_tuning.spread_limit_points
                 feasibility = validate_order(
                     raw_size=raw_size,
@@ -3177,7 +5468,7 @@ def run_multi_strategy_loop(
                     min_size=float(intent.state.asset.min_size),
                     size_step=float(intent.state.asset.size_step),
                     max_risk_cash=float(risk_cash_plan.max_risk_cash),
-                    equity=float(config.risk.equity),
+                    equity=float(_sizing_equity),
                     open_positions_count=len(open_asset_now),
                     max_positions=int(config.risk.max_positions),
                     spread=(float(spread_points_now) if spread_points_now is not None else None),
@@ -3229,10 +5520,87 @@ def run_multi_strategy_loop(
                     final_decision[intent.symbol] = "NO_SIGNAL"
                     continue
 
+                # --- Re-entry check ---
+                if adaptive_cfg is not None:
+                    _re_state = states.get(intent.symbol)
+                    if _re_state is not None:
+                        _re_side = intent.signal.side if intent.signal else "UNKNOWN"
+                        _re_ok, _re_reason = _re_state.reentry.can_reenter(_re_side, now)
+                        if not _re_ok:
+                            if _re_reason not in intent.outcome.reason_codes:
+                                intent.outcome.reason_codes.append(_re_reason)
+                            intent.outcome.payload["reentry_blocked"] = _re_reason
+                            final_decision[intent.symbol] = "NO_SIGNAL"
+                            LOGGER.info(
+                                "Re-entry blocked %s side=%s reason=%s",
+                                intent.symbol, _re_side, _re_reason,
+                            )
+                            continue
+
+                # --- Micro-loss defense: min SL + edge filter ---
+                if ml_defense_cfg.enabled:
+                    _ml_spread = float(spread_now) if spread_now is not None else 0.0
+                    _ml_atr_raw = intent.outcome.evaluation.metadata.get(
+                        "atr_m5", intent.outcome.evaluation.snapshot.get("atr_m5")
+                    )
+                    _ml_atr: float | None = None
+                    try:
+                        _ml_atr = float(_ml_atr_raw) if _ml_atr_raw is not None else None
+                    except (TypeError, ValueError):
+                        pass
+                    _ml_sl_dist = abs(float(intent.signal.entry_price) - float(intent.signal.stop_price))
+                    _ml_tp_dist = abs(float(intent.signal.take_profit) - float(intent.signal.entry_price))
+                    _ml_rtc = estimate_roundtrip_cost_points(
+                        spread=_ml_spread, atr=_ml_atr, config=paper_cost_cfg
+                    )
+                    ml_check = run_micro_loss_checks(
+                        sl_distance=_ml_sl_dist,
+                        tp_distance=_ml_tp_dist,
+                        spread=_ml_spread,
+                        atr=_ml_atr,
+                        roundtrip_cost_points=_ml_rtc,
+                        config=ml_defense_cfg,
+                    )
+                    if not ml_check.passed:
+                        for reason in ml_check.rejection_reasons:
+                            if reason not in intent.outcome.reason_codes:
+                                intent.outcome.reason_codes.append(reason)
+                        intent.outcome.reason_codes.append("MICRO_LOSS_DEFENSE")
+                        intent.outcome.payload["micro_loss_check"] = ml_check.details
+                        final_decision[intent.symbol] = "NO_SIGNAL"
+                        LOGGER.info(
+                            "Micro-loss defense blocked %s: reasons=%s sl=%.4f min=%.4f edge=%.2f",
+                            intent.symbol,
+                            ml_check.rejection_reasons,
+                            ml_check.actual_sl,
+                            ml_check.min_sl_required,
+                            ml_check.edge_ratio,
+                        )
+                        continue
+
+                    # Store roundtrip cost estimate in metadata for later PnL accounting
+                    intent.outcome.payload["estimated_roundtrip_cost_points"] = _ml_rtc
+                    intent.outcome.payload["micro_loss_check"] = ml_check.details
+
                 key = (
                     f"{intent.symbol}:{intent.signal.side}:{intent.signal.entry_price:.5f}:"
                     f"{intent.signal.expires_at.isoformat()}"
                 )
+                # Embed cost metadata into signal for fill simulation
+                _order_spread = float(spread_now) if spread_now is not None else 0.0
+                _rtc_size = estimate_roundtrip_cost(
+                    spread=_order_spread,
+                    atr=_ml_atr if ml_defense_cfg.enabled else None,
+                    size=size,
+                    config=paper_cost_cfg,
+                ) if paper_cost_cfg.enabled else None
+                signal_meta = dict(intent.signal.metadata)
+                signal_meta["spread_at_entry"] = _order_spread
+                signal_meta["be_buffer_ticks"] = ml_defense_cfg.be_buffer_ticks if ml_defense_cfg.enabled else 0.0
+                if _rtc_size is not None:
+                    signal_meta["estimated_roundtrip_cost"] = _rtc_size.total
+                    signal_meta["cost_breakdown"] = _rtc_size.to_dict()
+                intent.signal.metadata = signal_meta
                 order = order_executor.place_limit_order(
                     intent.signal,
                     size=size,
@@ -3268,8 +5636,16 @@ def run_multi_strategy_loop(
                     f"{intent.outcome.evaluation.score_total:.2f}" if intent.outcome.evaluation.score_total is not None else "-",
                 )
                 final_decision[intent.symbol] = "PLACE_LIMIT"
-
-            for epic, state in states.items():
+                # ── Mark re-entry if applicable ──────────
+                if adaptive_cfg is not None:
+                    _re_s = states.get(intent.symbol)
+                    if _re_s is not None and _re_s.reentry.last_close_side == intent.signal.side:
+                        _re_s.reentry.mark_reentry(now)
+                        LOGGER.info(
+                            "Re-entry #%d for %s %s",
+                            _re_s.reentry.reentries_this_leg,
+                            intent.symbol, intent.signal.side,
+                        )
                 outcome = state.pending_outcome
                 if outcome is None:
                     continue
@@ -3359,6 +5735,9 @@ def run_multi_strategy_loop(
                     http_429,
                 )
                 last_heartbeat = mono
+                # Periodic signal candidate aggregation
+                if sc_aggregator is not None:
+                    sc_aggregator.maybe_log_summary(session_start_utc, now)
 
             if (mono - last_dashboard) >= config.monitoring.dashboard_interval_seconds:
                 dashboard_writer.write(
@@ -3394,45 +5773,24 @@ def run_multi_strategy_loop(
     LOGGER.info("Bot stopped.")
 
 
-def run() -> None:
-    args = parse_args()
-    mode_dry_run = True if (not args.paper and not args.dry_run) else args.dry_run
-    paper_mode = args.paper
-    load_dotenv()
-    setup_logging(os.getenv("LOG_LEVEL", "INFO"))
-
-    root = Path(__file__).resolve().parent
-    config_path = _resolve_config_path(root, str(args.config))
-    config = load_config(config_path)
-    _apply_cli_overrides(args, config)
-    assets = build_asset_universe(config)
-    LOGGER.info("Assets configured: %s", ",".join(f"{a.epic}{'' if a.trade_enabled else '(observe)'}" for a in assets))
-    LOGGER.info(
-        "Currency config | account=%s fx_fee_rate=%.6f fx_mode=%s fx_source=%s fx_apply_to=%s reporting=%s",
-        config.account_currency,
-        float(config.fx_conversion_fee_rate),
-        config.fx_fee_mode,
-        config.fx_rate_source,
-        ",".join(config.fx_apply_to),
-        config.reporting_currency,
-    )
-
-    if args.batch_worker:
-        run_batch_worker_mode(args, config, assets, root)
-        return
-
-    if args.batch_backtest:
-        run_batch_backtest_mode(args, config, root)
-        return
-
-    if args.backtest:
-        run_backtest_mode(args, config, assets, root)
-        return
-
-    db_path = resolve_db_path(root, paper_mode=paper_mode)
-    conn = get_connection(db_path)
+def _run_live_body(
+    args: argparse.Namespace,
+    config: "AppConfig",
+    assets: list,
+    root: Path,
+    paper_mode: bool,
+    mode_dry_run: bool,
+    conn: object,
+    db_path: object,
+) -> None:
+    """Inner body of the live/paper/dry-run mode, extracted so that *run()*
+    can wrap the SQLite *conn* in a ``try / finally`` for guaranteed cleanup."""
     init_db(conn)
+    init_signal_candidates_table(conn)
     journal = Journal(conn)
+    sc_logger = SignalCandidateLogger(conn)
+    sc_aggregator = SignalCandidateAggregator(conn, interval_seconds=600)
+    micro_loss_metrics = MicroLossMetrics()
     LOGGER.info("SQLite state path: %s", db_path)
 
     client = build_client(config, paper_mode)
@@ -3452,7 +5810,10 @@ def run() -> None:
     )
     portfolio_supervisor = PortfolioSupervisor(config.portfolio)
     order_executor = OrderExecutor(client=client, journal=journal, dry_run=mode_dry_run, default_epic=assets[0].epic, default_currency=assets[0].currency)
-    position_manager = PositionManager(client=client, journal=journal, dry_run=mode_dry_run)
+    position_manager = PositionManager(
+        client=client, journal=journal, dry_run=mode_dry_run,
+        multi_tp=build_multi_tp_profile(config.multi_tp),
+    )
     dashboard_writer = DashboardWriter(os.getenv("DASHBOARD_PATH", config.monitoring.dashboard_path))
     alerts = build_alert_dispatcher(config)
 
@@ -3521,512 +5882,139 @@ def run() -> None:
         sync_pending_seconds=sync_pending_seconds,
         sync_positions_seconds=sync_positions_seconds,
         tf_history=tf_history,
-    )
-    return
-
-    metrics_start = client.metrics_snapshot() if client is not None else {}
-    daily_summary = DailyRuntimeSummary(
-        trading_day=trading_day(utc_now(), config.timezone).isoformat(),
-        api_requests_start=metrics_start.get("total_requests", 0),
-        api_retries_start=metrics_start.get("total_retries", 0),
-        api_429_start=metrics_start.get("http_429_count", 0),
+        sc_logger=sc_logger,
+        sc_aggregator=sc_aggregator,
+        micro_loss_metrics=micro_loss_metrics,
     )
 
-    stop_event = threading.Event()
-    last_heartbeat = time.monotonic()
-    last_dashboard = time.monotonic()
-    last_pending_sync_at: datetime | None = None
-    last_positions_sync_at: datetime | None = None
+    # Export diagnostics on shutdown if requested
+    if args.diagnostics_export:
+        export_diagnostics(
+            conn,
+            Path(args.diagnostics_export),
+            fmt=args.diagnostics_format,
+        )
 
-    def _stop(signum: int, _frame: object) -> None:
-        LOGGER.info("Received signal %s, shutting down.", signum)
-        stop_event.set()
+    # Stop Monte Carlo viewer if running
+    _maybe_stop_mc_viewer()
 
-    signal.signal(signal.SIGINT, _stop)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _stop)
 
-    cycle = 0
-    while not stop_event.is_set():
-        cycle += 1
-        now = utc_now()
-        day = trading_day(now, config.timezone).isoformat()
-        if day != daily_summary.trading_day:
-            _log_daily_summary(summary=daily_summary, client=client)
-            metrics = client.metrics_snapshot() if client is not None else {}
-            daily_summary = DailyRuntimeSummary(
-                trading_day=day,
-                api_requests_start=metrics.get("total_requests", 0),
-                api_retries_start=metrics.get("total_retries", 0),
-                api_429_start=metrics.get("http_429_count", 0),
-            )
-        daily_summary.cycles += 1
+def run() -> None:
+    args = parse_args()
+    mode_dry_run = True if (not args.paper and not args.dry_run) else args.dry_run
+    paper_mode = args.paper
+    load_dotenv()
+    setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+
+    root = Path(__file__).resolve().parent
+    config_path = _resolve_config_path(root, str(args.config))
+    config = load_config(config_path)
+    _apply_cli_overrides(args, config)
+
+    if bool(args.ops_healthcheck):
+        payload = run_ops_healthcheck(root=root, config=config)
+        LOGGER.info("Ops healthcheck: %s", json.dumps(payload, ensure_ascii=True))
+        if payload.get("status") != "ok":
+            raise RuntimeError("Ops healthcheck failed")
+        return
+
+    if bool(args.ops_backup_now):
+        payload = run_backup_now(root=root, config=config)
+        LOGGER.info("Ops backup-now: %s", json.dumps(payload, ensure_ascii=True))
+        if payload.get("status") != "ok":
+            raise RuntimeError("Ops backup-now failed")
+        return
+
+    if args.ops_restore_verify:
+        backup_dir = Path(str(args.ops_restore_verify)).expanduser()
+        if not backup_dir.is_absolute():
+            backup_dir = (root / backup_dir).resolve()
+        payload = run_restore_verify(backup_dir=backup_dir)
+        LOGGER.info("Ops restore-verify: %s", json.dumps(payload, ensure_ascii=True))
+        if payload.get("status") != "ok":
+            raise RuntimeError("Ops restore-verify failed")
+        return
+
+    assets = build_asset_universe(config)
+    LOGGER.info("Assets configured: %s", ",".join(f"{a.epic}{'' if a.trade_enabled else '(observe)'}" for a in assets))
+    LOGGER.info(
+        "Market hours config | default=%s overrides=%s",
+        config.market_hours.default_profile,
+        ",".join(f"{symbol}:{profile}" for symbol, profile in sorted(config.market_hours.symbol_profiles.items())) or "none",
+    )
+    LOGGER.info(
+        "Ops config | heartbeat_stale=%ds watchdog_interval=%ds alert_cooldown=%ds backup_retention=%dd verify_on_create=%s required_services=%s",
+        int(config.ops.heartbeat_stale_seconds),
+        int(config.ops.watchdog_interval_seconds),
+        int(config.ops.alert_cooldown_seconds),
+        int(config.ops.backup_retention_days),
+        bool(config.ops.backup_verify_on_create),
+        ",".join(config.ops.required_services) if config.ops.required_services else "none",
+    )
+    LOGGER.info(
+        "Currency config | account=%s fx_fee_rate=%.6f fx_mode=%s fx_source=%s fx_apply_to=%s reporting=%s",
+        config.account_currency,
+        float(config.fx_conversion_fee_rate),
+        config.fx_fee_mode,
+        config.fx_rate_source,
+        ",".join(config.fx_apply_to),
+        config.reporting_currency,
+    )
+    LOGGER.info(
+        "Research config | objective=%s dd_cap_pct=%.2f dd_cap_basis=%s min_trades_oos=%d workers=%d deterministic=%s",
+        config.research.objective_mode,
+        float(config.research.dd_cap_pct),
+        config.research.dd_cap_basis,
+        int(config.research.min_trades_oos),
+        int(config.research.max_workers),
+        bool(config.backtest_runtime.deterministic),
+    )
+    LOGGER.info(
+        "Research optimize config | enabled=%s budget=%s split_ratio_is=%.2f workers=%d objective=%s dd_cap_basis=%s",
+        bool(config.research.optimize.enabled),
+        config.research.optimize.runtime_budget,
+        float(config.research.optimize.split_ratio_is),
+        int(config.research.optimize.max_workers),
+        config.research.optimize.objective_mode,
+        config.research.optimize.dd_cap_basis,
+    )
+
+    if args.batch_worker:
+        run_batch_worker_mode(args, config, assets, root)
+        return
+
+    if args.batch_backtest:
+        run_batch_backtest_mode(args, config, root)
+        return
+
+    if args.research_run and args.research_optimize:
+        raise RuntimeError("Use either --research-run or --research-optimize, not both.")
+
+    if args.research_run:
+        run_research_mode(args, config, assets, root)
+        return
+
+    if args.research_optimize:
+        run_research_optimize_mode(args, config, assets, root)
+        return
+
+    if args.backtest:
+        run_backtest_mode(args, config, assets, root)
+        return
+
+    # Start Monte Carlo live viewer for live/paper/dry-run modes
+    _maybe_start_mc_viewer(config, root, cli_override=getattr(args, "mc_viewer", None))
+
+    db_path = resolve_db_path(root, paper_mode=paper_mode)
+    conn = get_connection(db_path)
+    try:  # try/finally guarantees conn.close() even on crash
+        _run_live_body(args, config, assets, root, paper_mode, mode_dry_run, conn, db_path)
+    finally:
         try:
-            if not is_trading_weekday(now, config.timezone):
-                stop_event.wait(config.execution.loop_seconds)
-                continue
-
-            global_stats = journal.get_daily_stats(day, epic="GLOBAL")
-            if risk_engine.should_turn_off_for_day(global_stats.pnl):
-                if global_stats.status != "OFF":
-                    journal.set_daily_status(day, "OFF", epic="GLOBAL")
-                    alerts.send(
-                        event="DAILY_STOP_GLOBAL",
-                        level="warning",
-                        message=f"Global daily stop triggered pnl={global_stats.pnl:.2f}",
-                        dedupe_key=f"daily-stop-global-{day}",
-                    )
-
-            if should_refresh_quote(
-                now=now,
-                last_fetch_at=last_pending_sync_at,
-                interval_seconds=sync_pending_seconds,
-            ):
-                order_executor.sync_remote_pending_orders()
-                last_pending_sync_at = now
-
-            closed_sync: list[ClosedPositionEvent] = []
-            if should_refresh_quote(
-                now=now,
-                last_fetch_at=last_positions_sync_at,
-                interval_seconds=sync_positions_seconds,
-            ):
-                closed_sync = position_manager.sync_positions_from_api()
-                last_positions_sync_at = now
-
-            quotes: dict[str, tuple[float, float, float]] = {}
-            for epic, state in states.items():
-                quote_interval = _quote_refresh_interval_seconds(
-                    config=config,
-                    trade_enabled=state.asset.trade_enabled,
-                )
-                if should_refresh_quote(
-                    now=now,
-                    last_fetch_at=state.quote_last_fetch_at,
-                    interval_seconds=quote_interval,
-                ):
-                    bid, ask, spread = market_data.fetch_quote_and_spread(epic)
-                    if bid is not None and ask is not None and spread is not None:
-                        state.quote = (bid, ask, spread)
-                        state.quote_last_fetch_at = now
-                if state.quote is not None:
-                    quotes[epic] = state.quote
-
-            if config.watchlist.log_quotes:
-                rows = []
-                for epic, state in states.items():
-                    if state.asset.trade_enabled:
-                        continue
-                    q = quotes.get(epic)
-                    if q is None:
-                        continue
-                    b, a, s = q
-                    rows.append(f"{epic} bid={b:.2f} ask={a:.2f} spr={s:.2f}")
-                if rows:
-                    LOGGER.info("Watchlist quotes | %s", " | ".join(rows))
-
-            expired = order_executor.cancel_expired_orders(now)
-            for order_id in expired:
-                alerts.send(
-                    event="ORDER_CANCELLED",
-                    level="warning",
-                    message=f"Pending order cancelled by TTL: {order_id}",
-                    dedupe_key=f"cancel-ttl-{order_id}",
-                )
-
-            events = news_provider.get_high_impact_events(
-                now - timedelta(minutes=config.news_gate.block_minutes + 1),
-                now + timedelta(minutes=config.news_gate.block_minutes + 1),
-            )
-            news_blocked = is_blocked(now, events, block_minutes=config.news_gate.block_minutes)
-            if news_blocked:
-                for order in order_executor.get_pending_orders():
-                    if should_cancel_pending({"status": order.status}, now, events, block_minutes=config.news_gate.block_minutes):
-                        order_executor.cancel_order(order.order_id)
-                        alerts.send(
-                            event="ORDER_CANCELLED",
-                            level="warning",
-                            message=f"Pending order cancelled by news gate: {order.order_id}",
-                            dedupe_key=f"cancel-news-{order.order_id}",
-                        )
-
-            filled = order_executor.process_pending_fills(quotes_by_epic=quotes, now=now)
-            for pos in filled:
-                journal.increment_daily_trades(day, epic=pos.epic)
-                journal.increment_daily_trades(day, epic="GLOBAL")
-                alerts.send(
-                    event="ORDER_FILLED",
-                    level="info",
-                    message=f"{pos.epic} deal={pos.deal_id} side={pos.side}",
-                    dedupe_key=f"filled-{pos.deal_id}",
-                )
-
-            closed_manage = position_manager.manage_open_positions(now=now, quotes_by_epic=quotes)
-            closed = closed_sync + closed_manage
-            if closed:
-                apply_closed_events(closed, day, journal, risk_engine, now, alerts)
-
-            for epic, state in states.items():
-                asset_stats = journal.get_daily_stats(day, epic=epic)
-                if risk_engine.should_turn_off_for_day(asset_stats.pnl) and asset_stats.status != "OFF":
-                    journal.set_daily_status(day, "OFF", epic=epic)
-                    alerts.send(
-                        event="DAILY_STOP_ASSET",
-                        level="warning",
-                        message=f"{epic} daily stop triggered pnl={asset_stats.pnl:.2f}",
-                        dedupe_key=f"daily-stop-{epic}-{day}",
-                    )
-
-                h1_new, h1_closed = refresh_timeframe_cache(
-                    market_data=market_data,
-                    state=state,
-                    now=now,
-                    timeframe=config.timeframes.h1,
-                    history_count=tf_history[config.timeframes.h1],
-                    close_grace_seconds=close_grace_seconds,
-                    retry_seconds=candle_retry_seconds,
-                )
-                m15_new, m15_closed = refresh_timeframe_cache(
-                    market_data=market_data,
-                    state=state,
-                    now=now,
-                    timeframe=config.timeframes.m15,
-                    history_count=tf_history[config.timeframes.m15],
-                    close_grace_seconds=close_grace_seconds,
-                    retry_seconds=candle_retry_seconds,
-                )
-                m5_new, m5_closed = refresh_timeframe_cache(
-                    market_data=market_data,
-                    state=state,
-                    now=now,
-                    timeframe=config.timeframes.m5,
-                    history_count=tf_history[config.timeframes.m5],
-                    close_grace_seconds=close_grace_seconds,
-                    retry_seconds=candle_retry_seconds,
-                )
-
-                if h1_new and config.timeframes.h1 in state.cache:
-                    h1_closed_candles = closed_candles(state.cache[config.timeframes.h1])
-                    if h1_closed_candles:
-                        state.h1_snapshot = strategy_engine.evaluate_h1(h1_closed_candles)
-
-                if m15_new and config.timeframes.m15 in state.cache:
-                    m15_closed_candles = closed_candles(state.cache[config.timeframes.m15])
-                    if m15_closed_candles:
-                        if state.h1_snapshot is None and config.timeframes.h1 in state.cache:
-                            h1_closed_candles = closed_candles(state.cache[config.timeframes.h1])
-                            if h1_closed_candles:
-                                state.h1_snapshot = strategy_engine.evaluate_h1(h1_closed_candles)
-                        if state.h1_snapshot is not None:
-                            state.m15_snapshot = strategy_engine.evaluate_m15(
-                                candles_m15=m15_closed_candles,
-                                h1=state.h1_snapshot,
-                                minimal_tick_buffer=state.asset.minimal_tick_buffer,
-                                now=now,
-                                previous=state.m15_snapshot,
-                            )
-
-                open_asset = position_manager.get_open_positions(epic=epic)
-                pending_asset = order_executor.get_pending_orders(epic=epic)
-                state.entry_state = derive_entry_state(
-                    state.entry_state,
-                    has_open=bool(open_asset),
-                    has_pending=bool(pending_asset),
-                )
-                if state.m5_snapshot is None:
-                    state.m5_snapshot = M5Snapshot(
-                        entry_state=state.entry_state,
-                        mss_ok=False,
-                        displacement_ok=False,
-                        fvg_ok=False,
-                        fvg_range=None,
-                        fvg_mid=None,
-                        limit_price=None,
-                        reason_codes=["M5_WAIT_NEW_CLOSE"],
-                    )
-                else:
-                    state.m5_snapshot.entry_state = state.entry_state
-
-                extra_reasons: list[str] = []
-                final_decision = "MANAGE" if state.entry_state == "FILLED" else "NO_SIGNAL"
-                decision: StrategyDecision | None = None
-
-                if m5_closed is None:
-                    state.stale_data = False
-                    extra_reasons.append("M5_NO_CLOSED_BAR")
-                elif (now - m5_closed).total_seconds() > config.execution.max_data_stale_seconds:
-                    state.stale_data = True
-                    extra_reasons.append("DATA_STALE")
-                else:
-                    state.stale_data = False
-
-                q = quotes.get(epic)
-                spread = q[2] if q is not None else None
-                if q is None:
-                    extra_reasons.append("QUOTE_MISSING")
-
-                if m5_new and not state.stale_data and q is not None:
-                    if state.h1_snapshot is None and config.timeframes.h1 in state.cache:
-                        h1_closed_candles = closed_candles(state.cache[config.timeframes.h1])
-                        if h1_closed_candles:
-                            state.h1_snapshot = strategy_engine.evaluate_h1(h1_closed_candles)
-                    if state.m15_snapshot is None and config.timeframes.m15 in state.cache and state.h1_snapshot is not None:
-                        m15_closed_candles = closed_candles(state.cache[config.timeframes.m15])
-                        if m15_closed_candles:
-                            state.m15_snapshot = strategy_engine.evaluate_m15(
-                                candles_m15=m15_closed_candles,
-                                h1=state.h1_snapshot,
-                                minimal_tick_buffer=state.asset.minimal_tick_buffer,
-                                now=now,
-                                previous=state.m15_snapshot,
-                            )
-
-                    m5_closed_candles = closed_candles(state.cache.get(config.timeframes.m5, []))
-                    if state.h1_snapshot is None or state.m15_snapshot is None or not m5_closed_candles:
-                        extra_reasons.append("PIPELINE_INSUFFICIENT_DATA")
-                    else:
-                        decision, m5_snapshot = strategy_engine.evaluate_m5(
-                            epic=epic,
-                            candles_m5=m5_closed_candles,
-                            current_spread=spread,
-                            spread_history=market_data.spread_history(epic),
-                            news_blocked=news_blocked,
-                            h1=state.h1_snapshot,
-                            m15=state.m15_snapshot,
-                            entry_state=state.entry_state,
-                        )
-                        state.m5_snapshot = m5_snapshot
-                        state.m5_snapshot.entry_state = state.entry_state
-
-                        if decision.signal is None:
-                            final_decision = "MANAGE" if state.entry_state == "FILLED" else "NO_SIGNAL"
-                            journal.log_decision(create_decision_record(decision, epic, None, news_blocked))
-                        else:
-                            final_decision = "PLACE_LIMIT_PENDING_CHECKS"
-                            if not state.asset.trade_enabled:
-                                decision.reason_codes.append("OBSERVE_ONLY_ASSET")
-                                journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                final_decision = "NO_SIGNAL"
-                            elif pending_asset:
-                                decision.reason_codes.append("PENDING_EXISTS")
-                                journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                final_decision = "WAIT_LIMIT_FILL"
-                            else:
-                                safe_mode_multiplier = (
-                                    config.strategy_runtime.neutral_bias_risk_multiplier
-                                    if state.h1_snapshot is not None and state.h1_snapshot.safe_mode
-                                    else 1.0
-                                )
-                                effective_risk_per_trade = risk_engine.effective_risk_per_trade(
-                                    risk_multiplier=safe_mode_multiplier,
-                                    equity=config.risk.equity,
-                                )
-                                global_stats = journal.get_daily_stats(day, epic="GLOBAL")
-                                cooldown = journal.get_risk_state(f"ASSET:{epic}").cooldown_until
-                                open_all = position_manager.get_open_positions()
-                                risk_check = risk_engine.can_open_new_trade_multi(
-                                    now=now,
-                                    asset_epic=epic,
-                                    asset_stats=asset_stats,
-                                    global_stats=global_stats,
-                                    asset_open_positions=open_asset,
-                                    all_open_positions=open_all,
-                                    new_trade_risk_amount=config.risk.equity * effective_risk_per_trade,
-                                    cooldown_until=cooldown,
-                                    equity=config.risk.equity,
-                                )
-                                if not risk_check.allowed:
-                                    decision.reason_codes.extend([c for c in risk_check.reason_codes if c not in decision.reason_codes])
-                                    decision.payload["risk"] = risk_check.metadata
-                                    journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                    final_decision = "NO_SIGNAL"
-                                else:
-                                    if not _apply_rr_profile_to_signal(
-                                        decision.signal,
-                                        tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
-                                        tp1_fraction=float(config.backtest_tuning.tp1_fraction),
-                                        tp_profile_mode=str(config.backtest_tuning.tp_profile_mode),
-                                    ):
-                                        decision.reason_codes.append("ORDER_INVALID_RISK")
-                                        journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                        final_decision = "NO_SIGNAL"
-                                        continue
-                                    risk_distance = abs(float(decision.signal.entry_price) - float(decision.signal.stop_price))
-                                    risk_cash_plan = compute_risk_cash_plan(
-                                        risk=config.risk,
-                                        equity=config.risk.equity,
-                                        effective_risk_per_trade=effective_risk_per_trade,
-                                    )
-                                    raw_size = (float(risk_cash_plan.target_risk_cash) / risk_distance) if risk_distance > 0 else 0.0
-                                    spread_points_now = (
-                                        price_to_points(float(spread), point_size=float(state.asset.point_size))
-                                        if spread is not None
-                                        else None
-                                    )
-                                    open_margin = _estimated_open_margin(positions=open_all, config=config)
-                                    free_margin = max(0.0, float(config.risk.equity) - float(open_margin))
-                                    spread_limit_points = config.backtest_tuning.spread_limit_points
-                                    feasibility = validate_order(
-                                        raw_size=raw_size,
-                                        entry_price=float(decision.signal.entry_price),
-                                        stop_price=float(decision.signal.stop_price),
-                                        take_profit=float(decision.signal.take_profit),
-                                        min_size=float(state.asset.min_size),
-                                        size_step=float(state.asset.size_step),
-                                        max_risk_cash=float(risk_cash_plan.max_risk_cash),
-                                        equity=float(config.risk.equity),
-                                        open_positions_count=len(open_asset),
-                                        max_positions=int(config.risk.max_positions),
-                                        spread=(float(spread_points_now) if spread_points_now is not None else None),
-                                        spread_limit=(float(spread_limit_points) if spread_limit_points is not None else None),
-                                        min_stop_distance=float(state.asset.minimal_tick_buffer),
-                                        free_margin=free_margin,
-                                        margin_requirement_pct=float(config.backtest_tuning.broker_margin_requirement_pct),
-                                        max_leverage=float(config.backtest_tuning.broker_leverage),
-                                        margin_safety_factor=1.0,
-                                        allow_min_size_override_if_within_risk=bool(config.risk.allow_min_size_override_if_within_risk),
-                                        cooldown_blocked=bool(cooldown is not None and now < cooldown),
-                                        news_blocked=bool(news_blocked),
-                                    )
-                                    if safe_mode_multiplier < 1.0:
-                                        decision.payload["safe_mode_risk_multiplier"] = safe_mode_multiplier
-                                    decision.payload["feasibility"] = feasibility.details
-                                    if not feasibility.ok:
-                                        reject_code = feasibility.reason.value if feasibility.reason is not None else "ORDER_FEASIBILITY_REJECT"
-                                        if reject_code not in decision.reason_codes:
-                                            decision.reason_codes.append(reject_code)
-                                        journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                        final_decision = "NO_SIGNAL"
-                                        continue
-                                    size = float(feasibility.details.get("rounded_size", 0.0))
-                                    if size <= 0:
-                                        decision.reason_codes.append("SIZE_TOO_SMALL")
-                                        journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                        final_decision = "NO_SIGNAL"
-                                    else:
-                                        key = f"{epic}:{decision.signal.side}:{decision.signal.entry_price:.5f}:{decision.signal.expires_at.isoformat()}"
-                                        order = order_executor.place_limit_order(decision.signal, size=size, epic=epic, currency=state.asset.currency, idempotency_key=key)
-                                        journal.increment_daily_trades(day, epic=epic)
-                                        journal.increment_daily_trades(day, epic="GLOBAL")
-                                        decision.reason_codes.append("ORDER_PLACED")
-                                        journal.log_decision(create_decision_record(decision, epic, decision.signal.side, news_blocked))
-                                        state.entry_state = "ORDER_PLACED"
-                                        if state.m5_snapshot is not None:
-                                            state.m5_snapshot.entry_state = "ORDER_PLACED"
-                                        LOGGER.info("Placed LIMIT %s %s order id=%s size=%.4f", epic, decision.signal.side, order.order_id, order.size)
-                                        alerts.send(
-                                            event="ORDER_PLACED",
-                                            level="info",
-                                            message=f"{epic} {decision.signal.side} id={order.order_id} size={order.size:.4f}",
-                                            dedupe_key=f"placed-{order.order_id}",
-                                        )
-                                        final_decision = "PLACE_LIMIT"
-                elif not m5_new:
-                    extra_reasons.append("M5_WAIT_NEW_CLOSE")
-                    if state.entry_state == "ORDER_PLACED":
-                        final_decision = "WAIT_LIMIT_FILL"
-
-                reason_codes: list[str] = []
-                if decision is not None:
-                    reason_codes.extend(decision.reason_codes)
-                else:
-                    if state.h1_snapshot is not None:
-                        reason_codes.extend(state.h1_snapshot.reason_codes)
-                    else:
-                        reason_codes.append("H1_PENDING_INIT")
-                    if state.m15_snapshot is not None:
-                        reason_codes.extend(state.m15_snapshot.reason_codes)
-                    else:
-                        reason_codes.append("M15_PENDING_INIT")
-                    if state.m5_snapshot is not None:
-                        reason_codes.extend(state.m5_snapshot.reason_codes)
-                reason_codes.extend(extra_reasons)
-                reason_codes = map_reason_codes(reason_codes)
-
-                trace = _build_trace(
-                    state=state,
-                    now=now,
-                    h1_last_closed=h1_closed,
-                    h1_new_close=h1_new,
-                    m15_last_closed=m15_closed,
-                    m15_new_close=m15_new,
-                    m5_last_closed=m5_closed,
-                    m5_new_close=m5_new,
-                    final_decision=final_decision,
-                    reasons=reason_codes,
-                )
-                if decision is not None and decision.signal is not None:
-                    daily_summary.signal_candidates += 1
-                if trace.final_decision != "PLACE_LIMIT":
-                    for blocker in trace.reasons:
-                        daily_summary.blockers[blocker] += 1
-                state.last_reason_codes = trace.reasons
-                signature = _trace_signature(trace)
-                should_log = h1_new or m15_new or m5_new or (signature != state.last_trace_signature)
-                if should_log and config.monitoring.log_decision_reasons:
-                    if args.state_log == "json":
-                        LOGGER.info("%s", trace_to_json(trace, config.timezone))
-                    else:
-                        LOGGER.info("%s", format_trace_text(trace, config.timezone))
-                state.last_trace_signature = signature
-
-            mono = time.monotonic()
-            if (mono - last_heartbeat) >= config.execution.heartbeat_seconds:
-                pending = len(order_executor.get_pending_orders())
-                opened = len(position_manager.get_open_positions())
-                pnl = journal.get_daily_stats(day, epic="GLOBAL").pnl
-                retries = 0
-                http_429 = 0
-                requests_total = 0
-                if client is not None:
-                    metrics = client.metrics_snapshot()
-                    retries = metrics.get("total_retries", 0) - daily_summary.api_retries_start
-                    http_429 = metrics.get("http_429_count", 0) - daily_summary.api_429_start
-                    requests_total = metrics.get("total_requests", 0) - daily_summary.api_requests_start
-                LOGGER.info(
-                    "Heartbeat cycle=%d open_positions=%d pending_orders=%d daily_pnl=%.2f top_blockers=%s api_requests=%d retries=%d http429=%d",
-                    cycle,
-                    opened,
-                    pending,
-                    pnl,
-                    daily_summary.top_blockers(),
-                    requests_total,
-                    retries,
-                    http_429,
-                )
-                last_heartbeat = mono
-
-            if (mono - last_dashboard) >= config.monitoring.dashboard_interval_seconds:
-                dashboard_writer.write(
-                    {
-                        "mode": "paper" if paper_mode else "dry-run",
-                        "trading_day": day,
-                        "global_daily_pnl": round(journal.get_daily_stats(day, epic="GLOBAL").pnl, 4),
-                        "open_positions": len(position_manager.get_open_positions()),
-                        "pending_orders": len(order_executor.get_pending_orders()),
-                        "assets": {
-                            epic: {
-                                "trade_enabled": st.asset.trade_enabled,
-                                "stale_data": st.stale_data,
-                                "last_reasons": st.last_reason_codes,
-                            }
-                            for epic, st in states.items()
-                        },
-                    }
-                )
-                last_dashboard = mono
-
-        except CapitalAPIError as exc:
-            LOGGER.error("Capital API error: %s", exc)
-            alerts.send(event="CAPITAL_API_ERROR", level="error", message=str(exc), dedupe_key=f"api-{type(exc).__name__}")
+            conn.close()
+            LOGGER.debug("SQLite connection closed.")
         except Exception:
-            LOGGER.exception("Unhandled cycle error")
-            alerts.send(event="UNHANDLED_RUNTIME_ERROR", level="error", message="Unhandled exception in main loop", dedupe_key="runtime-unhandled")
-
-        stop_event.wait(config.execution.loop_seconds)
-
-    _log_daily_summary(summary=daily_summary, client=client)
-    LOGGER.info("Bot stopped.")
+            LOGGER.debug("SQLite connection already closed or failed to close.")
 
 
 if __name__ == "__main__":

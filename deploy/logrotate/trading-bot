@@ -1,0 +1,9 @@
+/opt/trading-bot/logs/*.log /opt/trading-bot/logs/*.jsonl {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -310,12 +310,28 @@ def simulate_shadow_outcome(
 
 
 class ShadowObserver:
-    """Collects shadow candidates and writes them to JSONL."""
+    """Collects shadow candidates and writes them to JSONL.
+
+    Supports the context-manager protocol so callers can use::
+
+        with ShadowObserver(path) as obs:
+            obs.record(candidate)
+    """
 
     def __init__(self, output_path: Path | None = None) -> None:
         self._records: list[ShadowCandidate] = []
         self._output_path = output_path
         self._file = None
+
+    # -- context-manager protocol ------------------------------------------
+
+    def __enter__(self) -> "ShadowObserver":
+        return self
+
+    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> None:
+        self.close()
+
+    # -- public API --------------------------------------------------------
 
     def record(self, candidate: ShadowCandidate) -> None:
         self._records.append(candidate)
@@ -324,6 +340,7 @@ class ShadowObserver:
             self._file = self._output_path.open("a", encoding="utf-8")
         if self._file:
             self._file.write(json.dumps(asdict(candidate), default=str) + "\n")
+            self._file.flush()
 
     def flush(self) -> None:
         if self._file:

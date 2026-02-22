@@ -58,6 +58,10 @@ assets:
     min_size: 0.1
     size_step: 0.1
     trade_enabled: true
+market_hours:
+  default_profile: "WEEKDAYS"
+  symbol_profiles:
+    BTCUSD: "ALWAYS"
 timeframes:
   h1: "H1"
   m15: "M15"
@@ -106,13 +110,65 @@ daily_gate:
   pre_minutes: 30
   post_minutes: 30
   allowed_strategies: []
+research:
+  objective_mode: "pnl_dd_cap"
+  dd_cap_pct: 25.0
+  dd_cap_basis: "both"
+  min_trades_oos: 120
+  symbols: ["XAUUSD", "BTCUSD"]
+  max_workers: 3
+  seed: 42
+  optimize:
+    enabled: false
+    runtime_budget: deep
+    split_ratio_is: 0.70
+    min_days_is: 30
+    min_days_oos: 30
+    objective_mode: "risk_adjusted_pnl_dd"
+    dd_cap_basis: "both"
+    max_workers: 3
+    seed: 42
+    top_gate_keep: 10
+    top_final_keep: 20
+  search_space:
+    gate:
+      trend_thr: [0.0004, 0.0006, 0.0008, 0.0010, 0.0012, 0.0015, 0.0020, 0.0025, 0.0030]
+      trend_vol_news_thr: [0.0006, 0.0010, 0.0015]
+      trend_vol_news_pre_post: [[15, 15], [30, 30], [45, 45], [60, 60]]
+      trend_vol_news_vol_max: [0.015, 0.020, 0.025]
+      trend_vol_news_max_spread_mult: [1.0, 1.5]
+    risk_profiles:
+      - {name: "RISK_01", risk_per_trade: 0.003, max_trades_per_day: 2, max_total_risk_pct: 0.010, daily_stop_pct: 0.010}
+      - {name: "RISK_02", risk_per_trade: 0.003, max_trades_per_day: 3, max_total_risk_pct: 0.010, daily_stop_pct: 0.010}
+      - {name: "RISK_03", risk_per_trade: 0.003, max_trades_per_day: 4, max_total_risk_pct: 0.015, daily_stop_pct: 0.010}
+      - {name: "RISK_04", risk_per_trade: 0.005, max_trades_per_day: 2, max_total_risk_pct: 0.010, daily_stop_pct: 0.010}
+      - {name: "RISK_05", risk_per_trade: 0.005, max_trades_per_day: 3, max_total_risk_pct: 0.015, daily_stop_pct: 0.015}
+      - {name: "RISK_06", risk_per_trade: 0.005, max_trades_per_day: 4, max_total_risk_pct: 0.020, daily_stop_pct: 0.015}
+      - {name: "RISK_07", risk_per_trade: 0.0075, max_trades_per_day: 2, max_total_risk_pct: 0.015, daily_stop_pct: 0.010}
+      - {name: "RISK_08", risk_per_trade: 0.0075, max_trades_per_day: 3, max_total_risk_pct: 0.020, daily_stop_pct: 0.015}
+      - {name: "RISK_09", risk_per_trade: 0.0075, max_trades_per_day: 4, max_total_risk_pct: 0.020, daily_stop_pct: 0.020}
+      - {name: "RISK_10", risk_per_trade: 0.010, max_trades_per_day: 3, max_total_risk_pct: 0.015, daily_stop_pct: 0.015}
+      - {name: "RISK_11", risk_per_trade: 0.010, max_trades_per_day: 4, max_total_risk_pct: 0.020, daily_stop_pct: 0.020}
+      - {name: "RISK_12", risk_per_trade: 0.010, max_trades_per_day: 6, max_total_risk_pct: 0.020, daily_stop_pct: 0.020}
+diagnostics:
+  decision_trace_enabled: false
+  decision_trace_path: "logs/decision_trace.jsonl"
+  decision_trace_auto_enable_backtest: false
+backtest_runtime:
+  feature_cache_enabled: true
+  feature_cache_dir: "runs/cache/features"
+  parallel_workers: 3
+  deterministic: true
 risk:
   equity: 10000
   risk_per_trade: 0.005
   risk_mode: percent
   min_risk_cash_per_trade: 0.3
-  max_risk_cash_per_trade: 1.0
-  allow_min_size_override_if_within_risk: false
+  # In percent mode, target risk = equity × risk_per_trade = $50.
+  # max_risk_cash_per_trade acts as a hard-dollar cap; null → no cap (percent governs).
+  # Old value 1.0 was misconfigured — $1 cap makes sizing impossible.
+  max_risk_cash_per_trade: null
+  allow_min_size_override_if_within_risk: true
   max_trades_per_day: 3
   daily_stop_pct: 0.015
   max_positions: 1
@@ -146,6 +202,15 @@ calendar:
   dummy_file: "news_data/events.json"
   http_timeout_seconds: 10
   http_cache_ttl_seconds: 300
+ops:
+  heartbeat_stale_seconds: 900
+  watchdog_interval_seconds: 60
+  alert_cooldown_seconds: 300
+  required_services:
+    - "bot-paper-fx.service"
+    - "bot-paper-btc.service"
+  backup_retention_days: 14
+  backup_verify_on_create: true
 watchlist:
   epics:
     - "BTCUSD"
@@ -217,7 +282,9 @@ backtest_tuning:
   overnight_swap_time_utc: "23:00"
   overnight_swap_long_pct: -0.016
   overnight_swap_short_pct: 0.0076
-  spread_limit_points: 6.0
+  # 6.0 was calibrated for point_size=0.1; after correction to 0.01 → multiply by 10.
+  # $1.00 / 0.01 = 100 pts gives headroom above p90 spread (~65 pts).
+  spread_limit_points: 100.0
   no_overnight: true
   rollover_block_minutes_before: 30
   rollover_block_minutes_after: 30
@@ -511,6 +578,46 @@ scalp:
   miss_move_atr: 1.0
   be_after_r: 1.0
   time_stop_minutes: 120
+monte_carlo:
+  enabled: true
+  num_simulations: 1000
+  ruin_dd_threshold: 0.50
+  sampling_mode: iid_bootstrap  # iid_bootstrap | moving_block_bootstrap
+  block_size: 8
+  equity_mode_backtest: initial
+  equity_mode_adaptive: current
+  ruin_equity_floor_pct: null
+  ruin_equity_floor_abs: null
+  count_breakeven_as_loss: false
+  seed: null
+  max_paths_plotted: 200
+  adaptive:
+    enabled: true
+    min_trades: 5
+    resim_interval: 2
+    num_simulations: 500
+    num_simulations_online: 250
+    chart_interval: 3
+    ruin_weight: 0.35
+    dd_weight: 0.25
+    pf_weight: 0.25
+    wr_weight: 0.15
+    full_risk_health: 0.70
+    min_risk_health: 0.35
+    floor_multiplier: 0.25
+    health_ema_alpha: 0.25
+    max_step_up: 0.05
+    max_step_down: 0.10
+  live_window:
+    enabled: true
+    refresh_seconds: 1.0
+    window_title: "IGNACY BOT — Monte Carlo Live"
+    show_stats_overlay: true
+    max_fps: 2
+    open_on_start: false
+    viewer_mode: "terminal"
+    png_path: "reports/live/monte_carlo.png"
+    json_path: "reports/live/monte_carlo.json"
 portfolio:
   max_open_positions_total: 2
   max_per_symbol: 1

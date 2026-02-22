@@ -12,6 +12,7 @@ from typing import Any
 
 from bot.config import AppConfig, AssetConfig
 from bot.data.candles import Candle
+from bot.diagnostics.decision_trace import DecisionTraceWriter
 from bot.execution.feasibility import RejectReason, validate_order
 from bot.execution.fx import FxConverter
 from bot.execution.order_validation import (
@@ -47,6 +48,10 @@ from bot.strategy.router import StrategyRoute, StrategyRouter
 from bot.strategy.scalp_ict_pa import ScalpIctPriceActionStrategy
 from bot.strategy.schedule import is_schedule_open
 from bot.strategy.state_machine import StrategyEngine
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from bot.backtest.monte_carlo import MCAdaptiveModel
 from bot.strategy.trend_pullback_m15 import TrendPullbackM15Strategy
 
 LOGGER = logging.getLogger(__name__)
@@ -203,11 +208,11 @@ class BacktestReport:
             "commission_cost_sum": self.commission_cost_sum,
             "swap_cost_sum": self.swap_cost_sum,
             "fx_cost_sum": self.fx_cost_sum,
-            "total_pnl_net": self.total_pnl_net or self.total_pnl,
-            "total_pnl_gross": self.total_pnl_gross or self.total_pnl,
-            "expectancy_net": self.expectancy_net or self.expectancy,
-            "profit_factor_net": self.profit_factor_net or self.profit_factor,
-            "max_drawdown_net": self.max_drawdown_net or self.max_drawdown,
+            "total_pnl_net": self.total_pnl_net,
+            "total_pnl_gross": self.total_pnl_gross,
+            "expectancy_net": self.expectancy_net,
+            "profit_factor_net": self.profit_factor_net,
+            "max_drawdown_net": self.max_drawdown_net,
             "account_currency": self.account_currency,
             "instrument_currency": self.instrument_currency,
             "fx_conversion_fee_rate_used": self.fx_conversion_fee_rate_used,
@@ -362,18 +367,60 @@ def load_candles_csv(path: str | Path) -> list[Candle]:
         required = {"timestamp", "open", "high", "low", "close"}
         if not required.issubset(set(reader.fieldnames or [])):
             raise ValueError("CSV must include: timestamp,open,high,low,close")
-        for row in reader:
+        bad_ohlc = 0
+        for line_no, row in enumerate(reader, start=2):
+            o = float(row["open"])
+            h = float(row["high"])
+            l = float(row["low"])
+            c = float(row["close"])
+            if h < l or h < 0 or l < 0 or o < l or o > h or c < l or c > h:
+                bad_ohlc += 1
             candles.append(
                 Candle(
                     timestamp=_parse_dt(str(row["timestamp"])),
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
+                    open=o,
+                    high=h,
+                    low=l,
+                    close=c,
                     volume=float(row.get("volume") or 0.0),
                 )
             )
-    return sorted(candles, key=lambda c: c.timestamp)
+    if not candles:
+        raise ValueError(f"CSV file is empty: {csv_path}")
+    candles.sort(key=lambda c: c.timestamp)
+    # Warn about data quality issues (don't raise — allow partial bad data)
+    if bad_ohlc > 0:
+        import logging as _csv_log
+        _csv_log.getLogger(__name__).warning(
+            "CSV %s: %d/%d rows with bad OHLC (high < low or negative prices)",
+            csv_path.name, bad_ohlc, len(candles),
+        )
+    # Detect & remove duplicate timestamps
+    seen_ts: set[datetime] = set()
+    deduped: list[Candle] = []
+    for c in candles:
+        if c.timestamp not in seen_ts:
+            seen_ts.add(c.timestamp)
+            deduped.append(c)
+    if len(deduped) < len(candles):
+        import logging as _csv_log
+        _csv_log.getLogger(__name__).warning(
+            "CSV %s: removed %d duplicate-timestamp rows",
+            csv_path.name, len(candles) - len(deduped),
+        )
+    # Timestamp gap analysis
+    if len(deduped) >= 2:
+        gaps = 0
+        for i in range(1, len(deduped)):
+            if deduped[i].timestamp <= deduped[i - 1].timestamp:
+                gaps += 1
+        if gaps > 0:
+            import logging as _csv_log
+            _csv_log.getLogger(__name__).warning(
+                "CSV %s: %d non-monotonic timestamps after sort (possible data issue)",
+                csv_path.name, gaps,
+            )
+    return deduped
 
 
 def _bucket_time(dt: datetime, minutes: int) -> datetime:
@@ -567,6 +614,10 @@ def _trade_r_multiple(
     """Compute R-multiple using the trade's own initial risk (entry-stop × size)."""
     r_denom_instr = float(position.initial_risk) * float(position.initial_size)
     if r_denom_instr <= 0:
+        LOGGER.warning(
+            "R-multiple denominator <= 0 (risk=%.6f, size=%.6f) — returning 0.0",
+            position.initial_risk, position.initial_size,
+        )
         return 0.0
     r_denom, _ = _convert_cash_to_account(
         amount=r_denom_instr,
@@ -576,7 +627,13 @@ def _trade_r_multiple(
         account_currency=account_currency,
         fx_apply_to=fx_apply_to,
     )
-    return (total_pnl / r_denom) if r_denom > 0 else 0.0
+    if r_denom <= 0:
+        LOGGER.warning(
+            "R-multiple FX-converted denominator <= 0 (instr=%.6f, converted=%.6f) — returning 0.0",
+            r_denom_instr, r_denom,
+        )
+        return 0.0
+    return total_pnl / r_denom
 
 
 def _default_observe_evaluation(*, symbol: str, reason: str) -> StrategyEvaluation:
@@ -985,6 +1042,8 @@ def _adjust_thresholds_dynamic(
     return trade_threshold, small_min, small_max, reasons
 
 
+# TODO(dedup): _compute_v2_score is duplicated in main.py with minor drift;
+#   consider merging into bot.strategy.scoring once signatures stabilise.
 def _compute_v2_score(
     *,
     strategy_name: str,
@@ -1176,6 +1235,8 @@ def _compute_v2_score(
     return evaluation
 
 
+# TODO(dedup): _evaluate_hard_gates is duplicated in main.py with minor drift;
+#   consider merging into bot.strategy.gating once signatures stabilise.
 def _evaluate_hard_gates(
     *,
     route_params: dict[str, object],
@@ -1605,6 +1666,144 @@ def _collect_execution_fail_sample(
     )
 
 
+def _build_decision_trace_record(
+    *,
+    ts: datetime,
+    symbol: str,
+    strategy: str,
+    evaluation: "StrategyEvaluation",
+    order_request: Any | None,
+    spread_points: float,
+    fate: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a single decision-trace JSONL record for a candidate that reached
+    the order-evaluation stage (i.e. had order_request != None)."""
+    meta = evaluation.metadata if isinstance(evaluation.metadata, dict) else {}
+    layers = evaluation.score_layers or {}
+    penalties = evaluation.penalties or {}
+    entry = float(order_request.entry_price) if order_request is not None else None
+    stop = float(order_request.stop_price) if order_request is not None else None
+    tp = float(order_request.take_profit) if order_request is not None else None
+    side = str(order_request.side) if order_request is not None else str(meta.get("side", ""))
+    return {
+        "ts_utc": ts.isoformat(),
+        "symbol": symbol,
+        "strategy": strategy,
+        "side": side,
+        "score_total": round(float(evaluation.score_total), 4) if evaluation.score_total is not None else None,
+        "action": str(evaluation.action.value) if evaluation.action else "OBSERVE",
+        "entry": entry,
+        "stop": stop,
+        "tp": tp,
+        "spread_points": round(spread_points, 2),
+        "expected_rr": meta.get("expected_rr"),
+        "layers": {k: round(float(v), 2) for k, v in layers.items()},
+        "penalties": {k: round(float(v), 2) for k, v in penalties.items()},
+        "reasons_blocking": list(evaluation.reasons_blocking) if evaluation.reasons_blocking else [],
+        "fate": fate,
+        "detail": detail or {},
+    }
+
+
+def _write_decision_trace(path: Path | None, records: list[dict[str, Any]]) -> None:
+    if path is None or not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+
+
+def _emit_decision(
+    dtw: DecisionTraceWriter,
+    *,
+    ts: datetime,
+    symbol: str,
+    tf: str = "5m",
+    candidates: int = 0,
+    signal: str | None = None,
+    features_ok: bool = True,
+    missing: list[str] | None = None,
+    score: float | None = None,
+    threshold: float | None = None,
+    evaluation: Any | None = None,
+    reject_reason: str | None = None,
+    spread_points: float | None = None,
+    session_ok: bool = True,
+    size_raw: float | None = None,
+    size_final: float | None = None,
+    min_lot: float = 0.01,
+    lot_step: float = 0.01,
+    margin_capped: bool = False,
+    cooldown_active: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Emit one decision event via the live-flushing writer."""
+    if not dtw.active:
+        return
+    breakdown: list[dict[str, Any]] = []
+    if evaluation is not None:
+        layers = getattr(evaluation, "score_layers", None) or {}
+        penalties = getattr(evaluation, "penalties", None) or {}
+        for k, v in layers.items():
+            breakdown.append({"k": str(k), "v": round(float(v), 2)})
+        for k, v in penalties.items():
+            breakdown.append({"k": f"penalty_{k}", "v": round(float(v), 2)})
+    dtw.decision(
+        ts=ts,
+        symbol=symbol,
+        tf=tf,
+        candidates=candidates,
+        signal=signal,
+        features_ok=features_ok,
+        missing=missing,
+        score=score,
+        threshold=threshold,
+        score_breakdown=breakdown or None,
+        reject_reason=reject_reason,
+        spread_points=spread_points,
+        session_ok=session_ok,
+        size_raw=size_raw,
+        size_final=size_final,
+        min_lot=min_lot,
+        lot_step=lot_step,
+        margin_capped=margin_capped,
+        cooldown_active=cooldown_active,
+        extra=extra,
+    )
+
+
+def _emit_fill(
+    dtw: DecisionTraceWriter,
+    *,
+    ts: datetime,
+    symbol: str,
+    side: str,
+    pnl: float = 0.0,
+    equity_after: float = 0.0,
+    reason_close: str = "",
+    holding_min: float = 0.0,
+    spread_cost: float = 0.0,
+    swap_cost: float = 0.0,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    if not dtw.active:
+        return
+    dtw.fill(
+        ts=ts,
+        symbol=symbol,
+        side=side,
+        pnl=pnl,
+        equity_after=equity_after,
+        reason_close=reason_close,
+        holding_min=holding_min,
+        spread_cost=spread_cost,
+        swap_cost=swap_cost,
+        extra=extra,
+    )
+
+
 def _write_execution_fail_debug(path: Path | None, samples: list[_ExecutionFailSample]) -> None:
     if path is None or not samples:
         return
@@ -1835,6 +2034,32 @@ def _trade_r_quality_metrics(trades: list[BacktestTrade]) -> tuple[float, float,
     return avg_win_r, avg_loss_r, payoff_r
 
 
+def _net_quality_metrics(
+    trades: list[BacktestTrade], equity_start: float
+) -> tuple[float, float, float]:
+    """Return (expectancy_net, profit_factor_net, max_drawdown_net) using pnl_net."""
+    if not trades:
+        return 0.0, 0.0, 0.0
+    total_pnl_net = sum(float(t.pnl_net) for t in trades)
+    expectancy_net = total_pnl_net / len(trades)
+    net_wins = [float(t.pnl_net) for t in trades if t.pnl_net > 0]
+    net_losses = [abs(float(t.pnl_net)) for t in trades if t.pnl_net < 0]
+    gross_profit_net = sum(net_wins)
+    gross_loss_net = sum(net_losses)
+    profit_factor_net = (gross_profit_net / gross_loss_net) if gross_loss_net > 0 else 0.0
+    equity = equity_start
+    peak = equity
+    max_dd_net = 0.0
+    for t in trades:
+        equity += float(t.pnl_net)
+        if equity > peak:
+            peak = equity
+        dd = peak - equity
+        if dd > max_dd_net:
+            max_dd_net = dd
+    return expectancy_net, profit_factor_net, max_dd_net
+
+
 def _exit_reason_distribution(trades: list[BacktestTrade]) -> dict[str, int]:
     out: Counter[str] = Counter()
     for trade in trades:
@@ -1911,30 +2136,27 @@ def _normalize_tp_by_r(
     return tp, target_r
 
 
-def _tp2_r_for_target_total_r(
-    *,
-    target_total_r: float,
-    tp1_trigger_r: float,
-    tp1_fraction: float,
-    mode: str = "strict_tp_price",
-) -> float:
-    """
-    Compute TP2 R so that with partial TP1 the total trade payoff stays on target.
+from bot.strategy.tp_profile import tp2_r_for_target_total_r as _tp2_r_for_target_total_r  # noqa: E402
 
-    Example:
-    - TP1 at 1R with 50% size, target total=2R  -> TP2 must be 3R
-    - TP1 at 1R with 50% size, target total=3R  -> TP2 must be 5R
-    """
-    total_r = max(0.1, float(target_total_r))
-    mode_norm = str(mode).strip().lower()
-    if mode_norm == "strict_tp_price":
-        return total_r
-    frac = max(0.0, min(0.99, float(tp1_fraction)))
-    trigger_r = max(0.0, float(tp1_trigger_r))
-    if frac <= 0.0:
-        return total_r
-    tp2_r = (total_r - (frac * trigger_r)) / max(1e-9, 1.0 - frac)
-    return max(total_r, tp2_r)
+
+def _resolve_tp_target_r(
+    *,
+    is_a_plus: bool,
+    score: float | None,
+    tuning: object,
+) -> tuple[float, str]:
+    """Return (target_total_r, profile_label) based on score gradient or a_plus fallback."""
+    if getattr(tuning, "tp_gradient_enabled", False) and score is not None:
+        high_score = float(getattr(tuning, "tp_gradient_tier_high_score", 75.0))
+        mid_score = float(getattr(tuning, "tp_gradient_tier_mid_score", 62.0))
+        if score >= high_score:
+            return float(getattr(tuning, "tp_gradient_tier_high_r", 3.0)), "GRADIENT_HIGH"
+        if score >= mid_score:
+            return float(getattr(tuning, "tp_gradient_tier_mid_r", 2.5)), "GRADIENT_MID"
+        return float(getattr(tuning, "tp_gradient_tier_low_r", 2.0)), "GRADIENT_LOW"
+    if is_a_plus:
+        return float(tuning.tp_target_a_plus_r), "A_PLUS_3R"
+    return float(tuning.tp_target_min_r), "STANDARD_2R"
 
 
 def _expected_rr(
@@ -2124,6 +2346,8 @@ def aggregate_backtest_reports(
         if drawdown > max_drawdown:
             max_drawdown = drawdown
 
+    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(all_trades, float(config.risk.equity))
+
     decision_counts: Counter[str] = Counter()
     blockers: Counter[str] = Counter()
     gate_blocks: Counter[str] = Counter()
@@ -2200,6 +2424,7 @@ def aggregate_backtest_reports(
         instrument_currencies.update([str(getattr(report, "instrument_currency", asset.instrument_currency or asset.currency)).upper()])
         fx_fee_rate_values.append(float(getattr(report, "fx_conversion_fee_rate_used", config.fx_conversion_fee_rate)))
 
+    _agg_spread = _spread_point_stats(spread_points_samples)
     return BacktestReport(
         epic=asset.epic,
         trades=trade_count,
@@ -2257,9 +2482,9 @@ def aggregate_backtest_reports(
         fx_cost_sum=fx_cost_sum,
         total_pnl_net=sum(float(t.pnl_net) for t in all_trades) if all_trades else total_pnl,
         total_pnl_gross=sum(float(t.pnl_gross) for t in all_trades) if all_trades else total_pnl,
-        expectancy_net=expectancy,
-        profit_factor_net=profit_factor,
-        max_drawdown_net=max_drawdown,
+        expectancy_net=expectancy_net,
+        profit_factor_net=profit_factor_net,
+        max_drawdown_net=max_drawdown_net,
         account_currency=account_currencies.most_common(1)[0][0] if account_currencies else str(config.account_currency).upper(),
         instrument_currency=instrument_currencies.most_common(1)[0][0]
         if instrument_currencies
@@ -2267,9 +2492,9 @@ def aggregate_backtest_reports(
         fx_conversion_fee_rate_used=(
             round(sum(fx_fee_rate_values) / len(fx_fee_rate_values), 8) if fx_fee_rate_values else float(config.fx_conversion_fee_rate)
         ),
-        avg_spread_points=_spread_point_stats(spread_points_samples)[0],
-        median_spread_points=_spread_point_stats(spread_points_samples)[1],
-        p90_spread_points=_spread_point_stats(spread_points_samples)[2],
+        avg_spread_points=_agg_spread[0],
+        median_spread_points=_agg_spread[1],
+        p90_spread_points=_agg_spread[2],
         forced_closes_count=forced_closes_count,
         min_size_overrides_count=min_size_overrides_count,
         margin_capped_count=margin_capped_count,
@@ -2308,16 +2533,29 @@ def run_backtest_multi_strategy(
     execution_debug_path: str | Path | None = None,
     no_price_debug_path: str | Path | None = None,
     reaction_timeout_debug_path: str | Path | None = None,
+    decision_trace_path: str | Path | None = None,
     data_context: dict[str, Any] | None = None,
     trade_start_utc: datetime | None = None,
     flatten_at_chunk_end: bool = False,
     daily_gate: DailyGateProvider | None = None,
     daily_gate_prepared: bool = False,
+    mc_model: "MCAdaptiveModel | None" = None,
 ) -> BacktestReport:
     variant_cfg = variant or BacktestVariant()
     debug_path = Path(execution_debug_path) if execution_debug_path is not None else None
     no_price_path = Path(no_price_debug_path) if no_price_debug_path is not None else None
     reaction_timeout_path = Path(reaction_timeout_debug_path) if reaction_timeout_debug_path is not None else None
+    _decision_trace_file = Path(decision_trace_path) if decision_trace_path is not None else None
+    _decision_trace_records: list[dict[str, Any]] = []
+    # --- live-flushing JSONL writer (new schema) ---
+    _diag_trace_path = decision_trace_path
+    if _diag_trace_path is None and hasattr(config, "diagnostics") and config.diagnostics.decision_trace_enabled:
+        _diag_trace_path = config.diagnostics.decision_trace_path
+    _dtw = DecisionTraceWriter(
+        _diag_trace_path,
+        enabled=(_diag_trace_path is not None),
+    )
+    _dtw.open()
     backtest_context: dict[str, Any] = dict(data_context or {})
     trade_start = trade_start_utc.astimezone(timezone.utc) if trade_start_utc is not None else None
     segment_id = str(backtest_context.get("segment_index", "1"))
@@ -2384,6 +2622,9 @@ def run_backtest_multi_strategy(
     equity = config.risk.equity
     peak_equity = equity
     max_drawdown = 0.0
+    _dd_halt_pct = float(config.backtest_tuning.max_drawdown_halt_pct)
+    _dd_halt_abs = (equity * _dd_halt_pct / 100.0) if _dd_halt_pct > 0 else 0.0
+    _dd_halted = False
     trades: list[BacktestTrade] = []
     pending: _PendingOrder | None = None
     open_pos: _OpenPosition | None = None
@@ -2512,6 +2753,10 @@ def run_backtest_multi_strategy(
     start_idx = max(config.indicators.ema_period_h1 + 10, 250)
     spread_window = max(1, int(config.spread_filter.window)) + 1
     spread_history_window: deque[float] = deque(maxlen=spread_window)
+    # Slice trimming limits (same as run_backtest)
+    _SLICE_KEEP_M5 = max(config.indicators.ema_period_h1 * 12, start_idx * 3, 2000)
+    _SLICE_KEEP_M15 = max(config.indicators.ema_period_h1 * 4, 800)
+    _SLICE_KEEP_H1 = max(config.indicators.ema_period_h1 + 100, 500)
     slice_m5_live = _append_live_placeholder(candles_m5[: start_idx + 1], 5)
     slice_m15_live: list[Candle] = []
     slice_h1_live: list[Candle] = []
@@ -2521,6 +2766,8 @@ def run_backtest_multi_strategy(
         if i > start_idx:
             slice_m5_live[-1] = candle
             slice_m5_live.append(_live_placeholder_from(candle, 5))
+            if len(slice_m5_live) > _SLICE_KEEP_M5 * 2:
+                slice_m5_live = slice_m5_live[-_SLICE_KEEP_M5:]
         spread_now = _spread_for(i)
         slippage_now = _slippage_for(i)
         spread_points_now = _spread_points_for(spread_now)
@@ -2644,6 +2891,13 @@ def run_backtest_multi_strategy(
                     margin_capped=pending.margin_capped,
                 )
                 trades_filled += 1
+                _emit_fill(
+                    _dtw, ts=candle.timestamp, symbol=asset.epic,
+                    side=open_pos.side, pnl=0.0, equity_after=equity,
+                    reason_close="OPEN",
+                    spread_cost=entry_spread_cost, swap_cost=0.0,
+                    extra={"entry_price": round(entry_fill, 4), "size": float(open_pos.size)},
+                )
                 pending = None
 
         if open_pos is not None:
@@ -2732,10 +2986,26 @@ def run_backtest_multi_strategy(
                         )
                     )
                     forced_closes_count += 1
+                    _holding = (candle.timestamp - open_pos.opened_at).total_seconds() / 60.0
+                    _emit_fill(
+                        _dtw, ts=candle.timestamp, symbol=asset.epic,
+                        side=open_pos.side, pnl=round(total_pnl, 4),
+                        equity_after=round(equity, 2),
+                        reason_close="FORCED_ROLLOVER",
+                        holding_min=round(_holding, 1),
+                        spread_cost=round(open_pos.spread_cost_total, 4),
+                        swap_cost=round(open_pos.swap_cost_total, 4),
+                    )
+                    if mc_model is not None:
+                        mc_model.add_trade(_pnl_eq)
+                        mc_model.update(equity)
                     open_pos = None
                     peak_equity = max(peak_equity, equity)
                     drawdown = peak_equity - equity
                     max_drawdown = max(max_drawdown, drawdown)
+                    if _dd_halt_abs > 0 and max_drawdown >= _dd_halt_abs:
+                        _dd_halted = True
+                        break
                     continue
             _apply_overnight_swap_if_due(
                 position=open_pos,
@@ -2840,10 +3110,29 @@ def run_backtest_multi_strategy(
                         margin_capped=open_pos.margin_capped,
                     )
                 )
+                _holding = (candle.timestamp - open_pos.opened_at).total_seconds() / 60.0
+                _emit_fill(
+                    _dtw, ts=candle.timestamp, symbol=asset.epic,
+                    side=open_pos.side, pnl=round(total_pnl, 4),
+                    equity_after=round(equity, 2),
+                    reason_close=reason,
+                    holding_min=round(_holding, 1),
+                    spread_cost=round(open_pos.spread_cost_total, 4),
+                    swap_cost=round(open_pos.swap_cost_total, 4),
+                )
+                if mc_model is not None:
+                    mc_model.add_trade(_pnl_eq)
+                    mc_model.update(equity)
                 open_pos = None
                 peak_equity = max(peak_equity, equity)
                 drawdown = peak_equity - equity
                 max_drawdown = max(max_drawdown, drawdown)
+                if _dd_halt_abs > 0 and max_drawdown >= _dd_halt_abs:
+                    _dd_halted = True
+                    break
+
+        if _dd_halted:
+            break
 
         if open_pos is not None or pending is not None:
             continue
@@ -2896,6 +3185,12 @@ def run_backtest_multi_strategy(
                     latest_h1 = candles_h1[idx_h1]
                     slice_h1_live[-1] = latest_h1
                     slice_h1_live.append(_live_placeholder_from(latest_h1, 60))
+
+        # Periodic trim to bound memory on multi-year runs
+        if len(slice_m15_live) > _SLICE_KEEP_M15 * 2:
+            slice_m15_live = slice_m15_live[-_SLICE_KEEP_M15:]
+        if len(slice_h1_live) > _SLICE_KEEP_H1 * 2:
+            slice_h1_live = slice_h1_live[-_SLICE_KEEP_H1:]
 
         m15_closed_ts = candles_m15[m15_ptr].timestamp if m15_ptr >= 0 else None
         h1_closed_ts = candles_h1[h1_ptr].timestamp if h1_ptr >= 0 else None
@@ -3335,6 +3630,22 @@ def run_backtest_multi_strategy(
                             data_context=backtest_context,
                         )
             decision_counts["NO_SIGNAL"] += 1
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                features_ok=("PIPELINE_NOT_READY_MISSING_FEATURES" not in reasons),
+                missing=(
+                    list(best_outcome.evaluation.metadata.get("missing_features", []))
+                    if isinstance(best_outcome.evaluation.metadata, dict) else []
+                ),
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason=reasons[0] if reasons else "NO_SIGNAL",
+                spread_points=spread_points_now,
+                session_ok=True,
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            )
             continue
 
         order_request = best_outcome.order_request
@@ -3356,11 +3667,44 @@ def run_backtest_multi_strategy(
                 for reason in list(dict.fromkeys(gate_reasons)):
                     blockers[reason] += 1
                     blocked_by_gate_reasons[reason] += 1
+                if _decision_trace_file is not None:
+                    _decision_trace_records.append(_build_decision_trace_record(
+                        ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                        evaluation=best_outcome.evaluation, order_request=order_request,
+                        spread_points=spread_points_now, fate="DAILY_GATE",
+                        detail={"gate_reasons": gate_reasons},
+                    ))
+                _emit_decision(
+                    _dtw, ts=t, symbol=asset.epic, candidates=1,
+                    signal=best_outcome.strategy_name,
+                    score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                    threshold=trade_thr_base,
+                    evaluation=best_outcome.evaluation,
+                    reject_reason="DAILY_GATE",
+                    spread_points=spread_points_now, session_ok=True,
+                    min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+                )
                 decision_counts["NO_SIGNAL"] += 1
                 continue
 
         risk_dist = abs(float(order_request.entry_price) - float(order_request.stop_price))
         if risk_dist <= 0:
+            if _decision_trace_file is not None:
+                _decision_trace_records.append(_build_decision_trace_record(
+                    ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                    evaluation=best_outcome.evaluation, order_request=order_request,
+                    spread_points=spread_points_now, fate="ORDER_INVALID_RISK",
+                ))
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason="ORDER_INVALID_RISK",
+                spread_points=spread_points_now,
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            )
             blockers["ORDER_INVALID_RISK"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
@@ -3396,17 +3740,39 @@ def run_backtest_multi_strategy(
         if structure_target is not None:
             best_outcome.evaluation.metadata["expected_rr_target_structure"] = float(structure_target)
         if expected_rr_value < expected_rr_min:
+            if _decision_trace_file is not None:
+                _decision_trace_records.append(_build_decision_trace_record(
+                    ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                    evaluation=best_outcome.evaluation, order_request=order_request,
+                    spread_points=spread_points_now, fate="EXPECTED_RR_TOO_LOW",
+                    detail={"expected_rr": round(expected_rr_value, 4), "min": expected_rr_min},
+                ))
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason="EXPECTED_RR_TOO_LOW",
+                spread_points=spread_points_now,
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            )
             blockers["EXPECTED_RR_TOO_LOW"] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
 
         is_a_plus = bool(getattr(order_request, "a_plus", False))
-        if is_a_plus:
-            target_total_r = float(config.backtest_tuning.tp_target_a_plus_r)
-            best_outcome.evaluation.metadata["tp_target_profile"] = "A_PLUS_3R"
-        else:
-            target_total_r = float(config.backtest_tuning.tp_target_min_r)
-            best_outcome.evaluation.metadata["tp_target_profile"] = "STANDARD_2R"
+        _gradient_score: float | None = None
+        try:
+            _gradient_score = float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None
+        except (TypeError, ValueError, AttributeError):
+            pass
+        target_total_r, _tp_profile = _resolve_tp_target_r(
+            is_a_plus=is_a_plus,
+            score=_gradient_score,
+            tuning=config.backtest_tuning,
+        )
+        best_outcome.evaluation.metadata["tp_target_profile"] = _tp_profile
         target_min_r = _tp2_r_for_target_total_r(
             target_total_r=target_total_r,
             tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
@@ -3430,6 +3796,23 @@ def run_backtest_multi_strategy(
 
         spread_limit_points = config.backtest_tuning.spread_limit_points
         if spread_limit_points is not None and spread_points_now > float(spread_limit_points):
+            if _decision_trace_file is not None:
+                _decision_trace_records.append(_build_decision_trace_record(
+                    ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                    evaluation=best_outcome.evaluation, order_request=order_request,
+                    spread_points=spread_points_now, fate="SPREAD_TOO_WIDE",
+                    detail={"spread_pts": round(spread_points_now, 2), "limit_pts": float(spread_limit_points)},
+                ))
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason="SPREAD_TOO_WIDE",
+                spread_points=spread_points_now,
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            )
             rejected_by_reason[RejectReason.SPREAD_TOO_WIDE.value] += 1
             blockers[RejectReason.SPREAD_TOO_WIDE.value] += 1
             decision_counts["NO_SIGNAL"] += 1
@@ -3446,6 +3829,24 @@ def run_backtest_multi_strategy(
             spread_points=spread_points_now,
             min_edge_to_cost_ratio=float(config.backtest_tuning.min_edge_to_cost_ratio),
         ):
+            if _decision_trace_file is not None:
+                _decision_trace_records.append(_build_decision_trace_record(
+                    ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                    evaluation=best_outcome.evaluation, order_request=order_request,
+                    spread_points=spread_points_now, fate="EDGE_TOO_SMALL",
+                    detail={"move_pts": round(expected_move_points, 2),
+                            "required_pts": round(float(config.backtest_tuning.min_edge_to_cost_ratio) * spread_points_now, 2)},
+                ))
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason="EDGE_TOO_SMALL",
+                spread_points=spread_points_now,
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            )
             rejected_by_reason[RejectReason.EDGE_TOO_SMALL.value] += 1
             blockers[RejectReason.EDGE_TOO_SMALL.value] += 1
             decision_counts["NO_SIGNAL"] += 1
@@ -3457,6 +3858,8 @@ def run_backtest_multi_strategy(
             route_risk=best_route.risk,
             config=config,
         )
+        if mc_model is not None:
+            risk_multiplier *= mc_model.risk_multiplier
         effective_risk_per_trade = risk_engine.effective_risk_per_trade(
             risk_multiplier=risk_multiplier,
             equity=equity,
@@ -3495,6 +3898,28 @@ def run_backtest_multi_strategy(
         )
         if not feasibility.ok:
             reject = feasibility.reason.value if feasibility.reason is not None else "UNKNOWN_REJECT"
+            if _decision_trace_file is not None:
+                _decision_trace_records.append(_build_decision_trace_record(
+                    ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                    evaluation=best_outcome.evaluation, order_request=order_request,
+                    spread_points=spread_points_now, fate=reject,
+                    detail={k: v for k, v in feasibility.details.items()
+                            if k in ("raw_size", "rounded_size", "min_size", "risk_cash_rounded",
+                                     "max_risk_cash", "required_margin", "free_margin")},
+                ))
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason=reject,
+                spread_points=spread_points_now,
+                size_raw=raw_size,
+                size_final=float(feasibility.details.get("rounded_size", 0)),
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+                margin_capped=bool(feasibility.details.get("margin_capped", False)),
+            )
             rejected_by_reason[reject] += 1
             blockers[reject] += 1
             decision_counts["NO_SIGNAL"] += 1
@@ -3505,12 +3930,50 @@ def run_backtest_multi_strategy(
         if bool(feasibility.details.get("margin_capped", False)):
             margin_capped_count += 1
         if size <= 0:
+            if _decision_trace_file is not None:
+                _decision_trace_records.append(_build_decision_trace_record(
+                    ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                    evaluation=best_outcome.evaluation, order_request=order_request,
+                    spread_points=spread_points_now, fate="SIZE_INVALID",
+                ))
+            _emit_decision(
+                _dtw, ts=t, symbol=asset.epic, candidates=1,
+                signal=best_outcome.strategy_name,
+                score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+                threshold=trade_thr_base,
+                evaluation=best_outcome.evaluation,
+                reject_reason="SIZE_INVALID",
+                spread_points=spread_points_now,
+                size_raw=raw_size, size_final=0.0,
+                min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            )
             blockers["SIZE_MARGIN_LIMIT"] += 1
             blockers["SIZE_INVALID"] += 1
             blockers["INSUFFICIENT_EQUITY"] += 1
             rejected_by_reason[RejectReason.SIZE_TOO_SMALL.value] += 1
             decision_counts["NO_SIGNAL"] += 1
             continue
+
+        if _decision_trace_file is not None:
+            _decision_trace_records.append(_build_decision_trace_record(
+                ts=t, symbol=asset.epic, strategy=best_outcome.strategy_name,
+                evaluation=best_outcome.evaluation, order_request=order_request,
+                spread_points=spread_points_now, fate="ACCEPTED",
+                detail={"size": size, "risk_cash": round(risk_distance * size, 2)},
+            ))
+
+        _emit_decision(
+            _dtw, ts=t, symbol=asset.epic, candidates=1,
+            signal=best_outcome.strategy_name,
+            score=float(best_outcome.evaluation.score_total) if best_outcome.evaluation.score_total is not None else None,
+            threshold=trade_thr_base,
+            evaluation=best_outcome.evaluation,
+            reject_reason=None,
+            spread_points=spread_points_now,
+            size_raw=raw_size, size_final=size,
+            min_lot=float(asset.min_size), lot_step=float(asset.size_step),
+            margin_capped=bool(feasibility.details.get("margin_capped", False)),
+        )
 
         pending = _PendingOrder(
             side=order_request.side,
@@ -3539,6 +4002,7 @@ def run_backtest_multi_strategy(
     _write_execution_fail_debug(debug_path, execution_fail_samples)
     _write_no_price_debug(no_price_path, no_price_samples)
     _write_reaction_timeout_debug(reaction_timeout_path, reaction_timeout_samples)
+    _write_decision_trace(_decision_trace_file, _decision_trace_records)
 
     wait_metrics: dict[str, float] = {}
     for wait_type, durations in wait_durations.items():
@@ -3626,7 +4090,23 @@ def run_backtest_multi_strategy(
         peak_equity = max(peak_equity, equity)
         drawdown = peak_equity - equity
         max_drawdown = max(max_drawdown, drawdown)
+        _holding_chunk = (last_candle.timestamp - open_pos.opened_at).total_seconds() / 60.0
+        _emit_fill(
+            _dtw, ts=last_candle.timestamp, symbol=asset.epic,
+            side=open_pos.side, pnl=round(total_pnl, 4),
+            equity_after=round(equity, 2),
+            reason_close="FORCED_CHUNK_END",
+            holding_min=round(_holding_chunk, 1),
+            spread_cost=round(open_pos.spread_cost_total, 4),
+            swap_cost=round(open_pos.swap_cost_total, 4),
+        )
+        if mc_model is not None:
+            mc_model.add_trade(_pnl_eq)
+            mc_model.update(equity)
         open_pos = None
+
+    # Close the live-flush writer
+    _dtw.close()
 
     wins = sum(1 for trade in trades if trade.pnl > 0)
     losses = sum(1 for trade in trades if trade.pnl <= 0)
@@ -3644,7 +4124,7 @@ def run_backtest_multi_strategy(
     swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
     fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
     avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
-    avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
+    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(trades, float(config.risk.equity))
 
     # ── ScoreV3 / shadow observer finalization ──
     _score_v3_summary: dict[str, Any] = {}
@@ -3679,7 +4159,7 @@ def run_backtest_multi_strategy(
         avg_r=avg_r,
         max_drawdown=max_drawdown,
         time_in_market_bars=time_in_market_bars,
-        equity_end=config.risk.equity + total_pnl,
+        equity_end=equity,
         trade_log=trades,
         avg_win=avg_win,
         avg_loss=avg_loss,
@@ -3725,9 +4205,9 @@ def run_backtest_multi_strategy(
         fx_cost_sum=fx_cost_sum,
         total_pnl_net=sum(float(t.pnl_net) for t in trades) if trades else total_pnl,
         total_pnl_gross=sum(float(t.pnl_gross) for t in trades) if trades else total_pnl,
-        expectancy_net=expectancy,
-        profit_factor_net=profit_factor,
-        max_drawdown_net=max_drawdown,
+        expectancy_net=expectancy_net,
+        profit_factor_net=profit_factor_net,
+        max_drawdown_net=max_drawdown_net,
         account_currency=account_currency,
         instrument_currency=instrument_currency,
         fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
@@ -3751,6 +4231,7 @@ def run_backtest(
     slippage_points: float = 0.0,
     slippage_atr_multiplier: float = 0.0,
     daily_gate: DailyGateProvider | None = None,
+    mc_model: "MCAdaptiveModel | None" = None,
 ) -> BacktestReport:
     strategy_engine = StrategyEngine(config)
     risk_engine = RiskEngine(config.risk)
@@ -3781,6 +4262,9 @@ def run_backtest(
     equity = config.risk.equity
     peak_equity = equity
     max_drawdown = 0.0
+    _dd_halt_pct = float(config.backtest_tuning.max_drawdown_halt_pct)
+    _dd_halt_abs = (equity * _dd_halt_pct / 100.0) if _dd_halt_pct > 0 else 0.0
+    _dd_halted = False
     trades: list[BacktestTrade] = []
     pending_orders: list[_PendingOrder] = []
     open_positions: list[_OpenPosition] = []
@@ -3869,6 +4353,11 @@ def run_backtest(
     start_idx = max(config.indicators.ema_period_h1 + 10, 250)
     spread_window = max(1, int(config.spread_filter.window)) + 1
     spread_history_window: deque[float] = deque(maxlen=spread_window)
+    # Keep enough history for the longest indicator window + generous buffer.
+    # Periodically trim the front of slices to cap memory on multi-year runs.
+    _SLICE_KEEP_M5 = max(config.indicators.ema_period_h1 * 12, start_idx * 3, 2000)
+    _SLICE_KEEP_M15 = max(config.indicators.ema_period_h1 * 4, 800)
+    _SLICE_KEEP_H1 = max(config.indicators.ema_period_h1 + 100, 500)
     slice_m5: list[Candle] = list(candles_m5[:start_idx])
     slice_m15: list[Candle] = []
     slice_h1: list[Candle] = []
@@ -3881,6 +4370,8 @@ def run_backtest(
         spread_history_window.append(spread_now)
         spread_history = list(spread_history_window)
         slice_m5.append(candle)
+        if len(slice_m5) > _SLICE_KEEP_M5 * 2:
+            slice_m5 = slice_m5[-_SLICE_KEEP_M5:]
         day_key = candle.timestamp.date().isoformat()
         daily_trades.setdefault(day_key, 0)
         daily_pnl.setdefault(day_key, 0.0)
@@ -4055,6 +4546,9 @@ def run_backtest(
                     )
                     forced_closes_count += 1
                     funnel.trades_closed += 1
+                    if mc_model is not None:
+                        mc_model.add_trade(_pnl_eq)
+                        mc_model.update(equity)
                     _pos_remove.append(_pi)
                     continue
             _apply_overnight_swap_if_due(
@@ -4166,6 +4660,9 @@ def run_backtest(
                     )
                 )
                 funnel.trades_closed += 1
+                if mc_model is not None:
+                    mc_model.add_trade(_pnl_eq)
+                    mc_model.update(equity)
                 _pos_remove.append(_pi)
                 continue
         for _ri in reversed(_pos_remove):
@@ -4173,6 +4670,9 @@ def run_backtest(
         peak_equity = max(peak_equity, equity)
         drawdown = peak_equity - equity
         max_drawdown = max(max_drawdown, drawdown)
+        if _dd_halt_abs > 0 and max_drawdown >= _dd_halt_abs:
+            _dd_halted = True
+            break
         funnel.sample_concurrent(len(open_positions))
 
         # ---- check entry slots ----
@@ -4218,9 +4718,13 @@ def run_backtest(
         while (m15_ptr + 1) < len(candles_m15) and candles_m15[m15_ptr + 1].timestamp <= t:
             m15_ptr += 1
             slice_m15.append(candles_m15[m15_ptr])
+        if len(slice_m15) > _SLICE_KEEP_M15 * 2:
+            slice_m15 = slice_m15[-_SLICE_KEEP_M15:]
         while (h1_ptr + 1) < len(candles_h1) and candles_h1[h1_ptr + 1].timestamp <= t:
             h1_ptr += 1
             slice_h1.append(candles_h1[h1_ptr])
+        if len(slice_h1) > _SLICE_KEEP_H1 * 2:
+            slice_h1 = slice_h1[-_SLICE_KEEP_H1:]
         if m15_ptr <= 20 or h1_ptr <= 50:
             continue
 
@@ -4282,10 +4786,11 @@ def run_backtest(
         if expected_rr_value < float(config.backtest_tuning.expected_rr_min):
             continue
         is_a_plus = bool(getattr(signal, "a_plus", False))
-        if is_a_plus:
-            target_total_r = float(config.backtest_tuning.tp_target_a_plus_r)
-        else:
-            target_total_r = float(config.backtest_tuning.tp_target_min_r)
+        target_total_r, _ = _resolve_tp_target_r(
+            is_a_plus=is_a_plus,
+            score=None,
+            tuning=config.backtest_tuning,
+        )
         target_min_r = _tp2_r_for_target_total_r(
             target_total_r=target_total_r,
             tp1_trigger_r=float(config.backtest_tuning.tp1_trigger_r),
@@ -4331,6 +4836,8 @@ def run_backtest(
             funnel.record_block("TIER_OBSERVE")
             continue
         _tier_mult = max(0.01, _tier.size_mult)
+        if mc_model is not None:
+            _tier_mult *= mc_model.risk_multiplier
         effective_risk_per_trade = risk_engine.effective_risk_per_trade(
             risk_multiplier=_tier_mult,
             equity=equity,
@@ -4422,6 +4929,7 @@ def run_backtest(
     swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
     fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
     avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
+    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(trades, float(config.risk.equity))
 
     return BacktestReport(
         epic=asset.epic,
@@ -4434,7 +4942,7 @@ def run_backtest(
         avg_r=avg_r,
         max_drawdown=max_drawdown,
         time_in_market_bars=time_in_market_bars,
-        equity_end=config.risk.equity + total_pnl,
+        equity_end=equity,
         trade_log=trades,
         avg_win=avg_win,
         avg_loss=avg_loss,
@@ -4465,9 +4973,9 @@ def run_backtest(
         fx_cost_sum=fx_cost_sum,
         total_pnl_net=sum(float(t.pnl_net) for t in trades) if trades else total_pnl,
         total_pnl_gross=sum(float(t.pnl_gross) for t in trades) if trades else total_pnl,
-        expectancy_net=expectancy,
-        profit_factor_net=profit_factor,
-        max_drawdown_net=max_drawdown,
+        expectancy_net=expectancy_net,
+        profit_factor_net=profit_factor_net,
+        max_drawdown_net=max_drawdown_net,
         account_currency=account_currency,
         instrument_currency=instrument_currency,
         fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
@@ -4550,6 +5058,8 @@ def run_walk_forward(
     if chunk < 260:
         raise ValueError("Not enough candles for walk-forward splits")
 
+    roll_equity = bool(config.backtest_tuning.wf_roll_equity_forward)
+    split_config = config
     reports: list[BacktestReport] = []
     for split in range(wf_splits):
         start = split * chunk
@@ -4557,17 +5067,20 @@ def run_walk_forward(
         part = candles_m5[start:end]
         if len(part) < 260:
             continue
-        reports.append(
-            run_backtest(
-                config=config,
-                asset=asset,
-                candles_m5=part,
-                assumed_spread=assumed_spread,
-                slippage_points=slippage_points,
-                slippage_atr_multiplier=slippage_atr_multiplier,
-                daily_gate=daily_gate,
-            )
+        rpt = run_backtest(
+            config=split_config,
+            asset=asset,
+            candles_m5=part,
+            assumed_spread=assumed_spread,
+            slippage_points=slippage_points,
+            slippage_atr_multiplier=slippage_atr_multiplier,
+            daily_gate=daily_gate,
         )
+        reports.append(rpt)
+        if roll_equity and rpt.equity_end > 0:
+            split_config = split_config.model_copy(
+                update={"risk": split_config.risk.model_copy(update={"equity": rpt.equity_end})},
+            )
     if not reports:
         raise ValueError("No valid walk-forward splits produced")
 
@@ -4601,6 +5114,8 @@ def run_walk_forward_multi_strategy(
     if chunk < 260:
         raise ValueError("Not enough candles for walk-forward splits")
 
+    roll_equity = bool(config.backtest_tuning.wf_roll_equity_forward)
+    split_config = config
     reports: list[BacktestReport] = []
     for split in range(wf_splits):
         start = split * chunk
@@ -4608,22 +5123,25 @@ def run_walk_forward_multi_strategy(
         part = candles_m5[start:end]
         if len(part) < 260:
             continue
-        reports.append(
-            run_backtest_multi_strategy(
-                config=config,
-                asset=asset,
-                candles_m5=part,
-                assumed_spread=assumed_spread,
-                slippage_points=slippage_points,
-                slippage_atr_multiplier=slippage_atr_multiplier,
-                variant=variant,
-                execution_debug_path=execution_debug_path,
-                no_price_debug_path=no_price_debug_path,
-                reaction_timeout_debug_path=reaction_timeout_debug_path,
-                data_context=data_context,
-                daily_gate=daily_gate,
-            )
+        rpt = run_backtest_multi_strategy(
+            config=split_config,
+            asset=asset,
+            candles_m5=part,
+            assumed_spread=assumed_spread,
+            slippage_points=slippage_points,
+            slippage_atr_multiplier=slippage_atr_multiplier,
+            variant=variant,
+            execution_debug_path=execution_debug_path,
+            no_price_debug_path=no_price_debug_path,
+            reaction_timeout_debug_path=reaction_timeout_debug_path,
+            data_context=data_context,
+            daily_gate=daily_gate,
         )
+        reports.append(rpt)
+        if roll_equity and rpt.equity_end > 0:
+            split_config = split_config.model_copy(
+                update={"risk": split_config.risk.model_copy(update={"equity": rpt.equity_end})},
+            )
     if not reports:
         raise ValueError("No valid walk-forward splits produced")
 

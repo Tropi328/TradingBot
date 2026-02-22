@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .html import build_html_report
-from .metrics import compute_drawdown_series, compute_metrics
+from .metrics import compute_anomaly_flags, compute_drawdown_series, compute_metrics
 from .plots import generate_plots
 
 LOGGER = logging.getLogger(__name__)
@@ -53,7 +53,15 @@ _HEADLINE_KEYS = [
     "equity_start",
     "equity_end",
     "max_drawdown",
+    "max_drawdown_pct_peak",
+    "max_drawdown_pct_initial",
     "max_drawdown_pct",
+    "anomaly_flags",
+    "oos_pass",
+    "constraint_dd_cap_pass_peak",
+    "constraint_dd_cap_pass_initial",
+    "constraint_dd_cap_pass",
+    "objective_value",
 ]
 
 
@@ -113,7 +121,11 @@ class BacktestReporter:
                 start_ts=run.meta.start,
             )
         equity_series = compute_drawdown_series(equity)
-        metrics = compute_metrics(trades, equity_series)
+        metrics = compute_metrics(trades, equity_series, initial_equity=float(run.meta.initial_equity))
+        source_report = run.extra.get("source_report") if isinstance(run.extra, dict) else None
+        if isinstance(source_report, dict):
+            _merge_source_report_metrics(metrics, source_report)
+        metrics["anomaly_flags"] = compute_anomaly_flags(metrics)
 
         artifacts: dict[str, Any] = {"charts": {}}
         if "csv" in format_set:
@@ -156,6 +168,50 @@ class BacktestReporter:
 
         self.last_output_dir = outdir
         return metrics
+
+
+def _merge_source_report_metrics(metrics: dict[str, Any], source_report: dict[str, Any]) -> None:
+    blocked = source_report.get("blocked_by_reason")
+    if not isinstance(blocked, dict):
+        blocked = source_report.get("rejected_by_reason")
+    if not isinstance(blocked, dict):
+        blocked = {}
+
+    cost_breakdown = source_report.get("cost_breakdown_net")
+    if not isinstance(cost_breakdown, dict):
+        cost_breakdown = {
+            "spread_cost_sum": _to_float(source_report.get("spread_cost_sum"), 0.0),
+            "slippage_cost_sum": _to_float(source_report.get("slippage_cost_sum"), 0.0),
+            "commission_cost_sum": _to_float(source_report.get("commission_cost_sum"), 0.0),
+            "swap_cost_sum": _to_float(source_report.get("swap_cost_sum"), 0.0),
+            "fx_cost_sum": _to_float(source_report.get("fx_cost_sum"), 0.0),
+        }
+
+    metrics["blocked_by_reason"] = dict(blocked)
+    metrics["cost_breakdown_net"] = dict(cost_breakdown)
+    metrics["oos_pass"] = source_report.get("oos_pass")
+    metrics["constraint_dd_cap_pass_peak"] = source_report.get("constraint_dd_cap_pass_peak")
+    metrics["constraint_dd_cap_pass_initial"] = source_report.get("constraint_dd_cap_pass_initial")
+    metrics["constraint_dd_cap_pass"] = source_report.get("constraint_dd_cap_pass")
+    metrics["objective_value"] = source_report.get("objective_value")
+
+    if "max_drawdown_pct_peak" in source_report:
+        metrics["max_drawdown_pct_peak"] = _to_float(source_report.get("max_drawdown_pct_peak"), metrics.get("max_drawdown_pct_peak", 0.0))
+    raw_dd = source_report.get("max_drawdown_pct")
+    if "max_drawdown_pct_initial" in source_report:
+        metrics["max_drawdown_pct_initial"] = _to_float(
+            source_report.get("max_drawdown_pct_initial"),
+            metrics.get("max_drawdown_pct_initial", 0.0),
+        )
+    elif raw_dd is not None:
+        # Legacy source reports expose a single dd% field; map it to initial-based.
+        metrics["max_drawdown_pct_initial"] = _to_float(raw_dd, metrics.get("max_drawdown_pct_initial", 0.0))
+
+    metrics["max_drawdown_pct"] = _to_float(metrics.get("max_drawdown_pct_peak"), metrics.get("max_drawdown_pct", 0.0))
+
+    for spread_key in ("avg_spread_points", "median_spread_points", "p90_spread_points"):
+        if spread_key in source_report:
+            metrics[spread_key] = _to_float(source_report.get(spread_key), metrics.get(spread_key, 0.0))
 
 
 def _normalize_formats(formats: tuple[str, ...] | list[str] | set[str] | str) -> set[str]:

@@ -501,6 +501,23 @@ scalp:
   miss_move_atr: 1.0
   be_after_r: 1.0
   time_stop_minutes: 120
+monte_carlo:
+  adaptive:
+    enabled: true
+    min_trades: 5
+    resim_interval: 2
+    num_simulations: 500
+    chart_interval: 3
+  live_window:
+    enabled: true
+    refresh_seconds: 1.0
+    window_title: 'IGNACY BOT — Monte Carlo Live'
+    show_stats_overlay: true
+    max_fps: 2
+    open_on_start: true
+    viewer_mode: 'process'
+    png_path: 'reports/live/monte_carlo.png'
+    json_path: 'reports/live/monte_carlo.json'
 portfolio:
   max_open_positions_total: 4
   max_per_symbol: 2

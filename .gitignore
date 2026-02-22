@@ -33,11 +33,20 @@ dist/
 
 # Logs/runtime artifacts
 *.log
+*.jsonl
 runtime_dashboard.json
 *.pid
 *.tmp
 backtest_err.log
 tmp_bt_report.csv
+logs/
+runtime/
+state/
+backups/
+
+# Deploy env (keep templates only)
+deploy/env/*.env
+!deploy/env/*.env.example
 
 # Backtest/optimization outputs
 reports/

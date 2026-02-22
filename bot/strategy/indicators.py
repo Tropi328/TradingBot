@@ -26,22 +26,29 @@ def ema(values: list[float], period: int) -> list[float | None]:
 
 @dataclass(slots=True)
 class _AtrCacheEntry:
-    candles_obj: list[Candle]
     tr_values: list[float]
     atr_values: list[float | None]
     prev_close: float
     ema_prev: float | None
 
 
-_ATR_CACHE: OrderedDict[tuple[int, int], _AtrCacheEntry] = OrderedDict()
+_ATR_CACHE: OrderedDict[tuple, _AtrCacheEntry] = OrderedDict()
 _ATR_CACHE_MAX_ENTRIES = 32
 
 
-def _atr_cache_store(key: tuple[int, int], entry: _AtrCacheEntry) -> None:
+def _atr_cache_store(key: tuple, entry: _AtrCacheEntry) -> None:
     _ATR_CACHE[key] = entry
     _ATR_CACHE.move_to_end(key)
     while len(_ATR_CACHE) > _ATR_CACHE_MAX_ENTRIES:
         _ATR_CACHE.popitem(last=False)
+
+
+def _atr_cache_key(candles: list[Candle], period: int) -> tuple:
+    """Content-based cache key that is immune to id() reuse after GC."""
+    n = len(candles)
+    ts0 = candles[0].timestamp if n else None
+    tsN = candles[-1].timestamp if n else None
+    return (n, ts0, tsN, int(period))
 
 
 def atr(candles: list[Candle], period: int) -> list[float | None]:
@@ -50,9 +57,9 @@ def atr(candles: list[Candle], period: int) -> list[float | None]:
     if not candles:
         return []
 
-    key = (id(candles), int(period))
+    key = _atr_cache_key(candles, period)
     cached = _ATR_CACHE.get(key)
-    if cached is not None and cached.candles_obj is candles:
+    if cached is not None:
         cached_len = len(cached.tr_values)
         if len(candles) == cached_len:
             _ATR_CACHE.move_to_end(key)
@@ -107,7 +114,6 @@ def atr(candles: list[Candle], period: int) -> list[float | None]:
     _atr_cache_store(
         key,
         _AtrCacheEntry(
-            candles_obj=candles,
             tr_values=tr_values,
             atr_values=atr_values,
             prev_close=prev_close,

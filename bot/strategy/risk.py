@@ -25,7 +25,12 @@ class RiskEngine:
         if not self.risk.low_equity_mode_enabled:
             return False
         eq = self._resolved_equity(equity)
-        return eq <= self.risk.low_equity_threshold
+        # Relative threshold: use pct of initial equity if configured
+        if self.risk.low_equity_threshold_pct > 0:
+            threshold = float(self.risk.equity) * float(self.risk.low_equity_threshold_pct)
+        else:
+            threshold = float(self.risk.low_equity_threshold)
+        return eq <= threshold
 
     def effective_risk_per_trade(self, *, risk_multiplier: float = 1.0, equity: float | None = None) -> float:
         base = max(0.0, float(self.risk.risk_per_trade) * max(0.0, float(risk_multiplier)))

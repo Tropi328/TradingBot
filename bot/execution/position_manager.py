@@ -1,31 +1,79 @@
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 from bot.data.capital_client import CapitalAPIError, CapitalClient
 from bot.execution.sizing import r_multiple
+from bot.execution.utils import strip_mode_prefix as _strip_mode_prefix
 from bot.storage.journal import Journal
 from bot.storage.models import ClosedPositionEvent, PositionRecord
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _strip_mode_prefix(identifier: str) -> str:
-    if "-" not in identifier:
-        return identifier
-    prefix, rest = identifier.split("-", 1)
-    if prefix in {"DRY", "PAPER"} and rest:
-        return rest
-    return identifier
+# ---------------------------------------------------------------------------
+# Multi-TP runtime config (frozen for speed)
+# ---------------------------------------------------------------------------
+@dataclass(slots=True, frozen=True)
+class TPLevel:
+    name: str
+    trigger_r: float
+    close_fraction: float
+    move_sl_to_be: bool
+
+
+@dataclass(slots=True, frozen=True)
+class MultiTPProfile:
+    """Runtime multi-TP profile — built once from config."""
+    enabled: bool = False
+    levels: tuple[TPLevel, ...] = ()
+    be_offset_r: float = 0.05
+    be_delay_bars: int = 4
+    trailing_enabled: bool = True
+    trailing_swing_window: int = 12
+    trailing_buffer_r: float = 0.12
+
+
+def build_multi_tp_profile(config: Any) -> MultiTPProfile:
+    """Convert MultiTPConfig pydantic model → frozen dataclass."""
+    if config is None or not getattr(config, "enabled", False):
+        return MultiTPProfile(enabled=False)
+    levels: list[TPLevel] = []
+    for lv in getattr(config, "levels", []):
+        levels.append(TPLevel(
+            name=lv.name,
+            trigger_r=lv.trigger_r,
+            close_fraction=lv.close_fraction,
+            move_sl_to_be=lv.move_sl_to_be,
+        ))
+    # Sort by trigger_r ascending
+    levels.sort(key=lambda x: x.trigger_r)
+    return MultiTPProfile(
+        enabled=True,
+        levels=tuple(levels),
+        be_offset_r=getattr(config, "be_offset_r", 0.05),
+        be_delay_bars=getattr(config, "be_delay_bars", 4),
+        trailing_enabled=getattr(config, "trailing_enabled", True),
+        trailing_swing_window=getattr(config, "trailing_swing_window", 12),
+        trailing_buffer_r=getattr(config, "trailing_buffer_r", 0.12),
+    )
+
+
+# _strip_mode_prefix imported from bot.execution.utils
 
 
 class PositionManager:
-    def __init__(self, *, client: CapitalClient | None, journal: Journal, dry_run: bool):
+    def __init__(self, *, client: CapitalClient | None, journal: Journal, dry_run: bool,
+                 multi_tp: MultiTPProfile | None = None):
         self.client = client
         self.journal = journal
         self.dry_run = dry_run
         self.mode_prefix = "DRY" if dry_run else "PAPER"
+        self.multi_tp = multi_tp or MultiTPProfile()
 
     def get_open_positions(self, epic: str | None = None) -> list[PositionRecord]:
         prefix = f"{self.mode_prefix}-"
@@ -86,6 +134,8 @@ class PositionManager:
                     epic=local.epic,
                     pnl=local.pnl,
                     closed_at=now,
+                    side=local.side,
+                    exit_type=str(local.metadata.get("exit_type", "MANUAL")),
                 )
             )
         return closed_events
@@ -110,32 +160,161 @@ class PositionManager:
                 current_price=current_price,
             )
 
-            half_size = round(position.size * 0.5, 8)
-            already_scaled = position.partial_closed_size >= half_size and half_size > 0
-
-            if current_r >= 1.0 and not already_scaled:
-                self._move_sl_to_be_and_partial(position, half_size)
+            # ── Multi-TP path ──────────────────────────
+            if self.multi_tp.enabled:
+                self._apply_multi_tp(position, current_r, current_price, now)
+            else:
+                # ── Legacy single-TP path ──────────────
+                half_size = round(position.size * 0.5, 8)
+                already_scaled = position.partial_closed_size >= half_size and half_size > 0
+                if current_r >= 1.0 and not already_scaled:
+                    self._move_sl_to_be_and_partial(position, half_size)
 
             closed, pnl = self._simulate_close_if_hit(position, current_price, now)
             if closed:
+                _exit_type = str(position.metadata.get("exit_type", ""))
                 closed_events.append(
                     ClosedPositionEvent(
                         deal_id=position.deal_id,
                         epic=position.epic,
                         pnl=pnl,
                         closed_at=now,
+                        side=position.side,
+                        exit_type=_exit_type,
                     )
                 )
 
         return closed_events
 
+    # ── Multi-TP management ──────────────────────────────
+    def _apply_multi_tp(
+        self,
+        position: PositionRecord,
+        current_r: float,
+        current_price: float,
+        now: datetime,
+    ) -> None:
+        """Apply multi-level take-profit, BE movement, and trailing stop."""
+        meta = dict(position.metadata)
+        tp_levels_hit: list[str] = meta.get("tp_levels_hit", [])
+        initial_size = float(meta.get("initial_size", position.size + position.partial_closed_size))
+        tp1_hit = bool(meta.get("tp1_hit", False))
+        be_moved = bool(meta.get("be_moved", False))
+        tp1_hit_at_bar = meta.get("tp1_hit_at_bar", None)
+        bars_since_open = int(meta.get("bars_managed", 0)) + 1
+        meta["bars_managed"] = bars_since_open
+
+        profile = self.multi_tp
+
+        for level in profile.levels:
+            if level.name in tp_levels_hit:
+                continue
+            if current_r >= level.trigger_r:
+                # Close fraction of remaining size
+                close_size = round(position.size * level.close_fraction, 8)
+                if close_size > 0 and position.size > close_size:
+                    position.partial_closed_size += close_size
+                    position.size = round(position.size - close_size, 8)
+                    tp_levels_hit.append(level.name)
+                    LOGGER.info(
+                        "Multi-TP %s hit for %s at %.2fR — closed %.4f (remaining %.4f)",
+                        level.name, position.deal_id, current_r, close_size, position.size,
+                    )
+                    if level.move_sl_to_be and not be_moved:
+                        tp1_hit = True
+                        tp1_hit_at_bar = bars_since_open
+                elif level.close_fraction >= 1.0:
+                    # Full close at this level
+                    tp_levels_hit.append(level.name)
+                    LOGGER.info(
+                        "Multi-TP %s hit for %s — full close signal at %.2fR",
+                        level.name, position.deal_id, current_r,
+                    )
+
+        # BE movement (after TP1, with delay)
+        if tp1_hit and not be_moved and tp1_hit_at_bar is not None:
+            elapsed_bars = bars_since_open - int(tp1_hit_at_bar)
+            if elapsed_bars >= profile.be_delay_bars:
+                risk_dist = abs(position.entry_price - float(meta.get("initial_stop", position.stop_price)))
+                cost_offset = self._get_cost_offset(meta)
+                if position.side == "LONG":
+                    be_price = position.entry_price + max(cost_offset, risk_dist * profile.be_offset_r)
+                    if be_price > position.stop_price:
+                        position.stop_price = be_price
+                        be_moved = True
+                else:
+                    be_price = position.entry_price - max(cost_offset, risk_dist * profile.be_offset_r)
+                    if be_price < position.stop_price:
+                        position.stop_price = be_price
+                        be_moved = True
+                if be_moved:
+                    meta["be_moved"] = True
+                    meta["be_price"] = position.stop_price
+                    LOGGER.info("Multi-TP BE moved for %s to %.5f", position.deal_id, position.stop_price)
+
+        # Trailing stop (after BE moved)
+        if profile.trailing_enabled and be_moved and position.size > 0:
+            risk_dist = abs(position.entry_price - float(meta.get("initial_stop", position.stop_price)))
+            buffer_value = risk_dist * profile.trailing_buffer_r
+            if position.side == "LONG":
+                trail_stop = current_price - buffer_value
+                if trail_stop > position.stop_price:
+                    position.stop_price = trail_stop
+                    meta["trailing_stop"] = trail_stop
+            else:
+                trail_stop = current_price + buffer_value
+                if trail_stop < position.stop_price:
+                    position.stop_price = trail_stop
+                    meta["trailing_stop"] = trail_stop
+
+        meta["tp_levels_hit"] = tp_levels_hit
+        meta["tp1_hit"] = tp1_hit
+        meta["tp1_hit_at_bar"] = tp1_hit_at_bar
+        meta["initial_size"] = initial_size
+        position.metadata = meta
+        self.journal.upsert_position(position)
+
+    @staticmethod
+    def _get_cost_offset(meta: dict) -> float:
+        """Read cost offset from position metadata."""
+        spread = 0.0
+        buf = 0.0
+        try:
+            spread = float(meta.get("spread_at_entry", 0.0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            buf = float(meta.get("be_buffer_ticks", 0.0))
+        except (TypeError, ValueError):
+            pass
+        return spread + buf
+
     def _move_sl_to_be_and_partial(self, position: PositionRecord, half_size: float) -> None:
         LOGGER.info("Position %s reached +1R: moving SL->BE and partial close", position.deal_id)
-        position.stop_price = position.entry_price
+        # Cost-aware BE: SL = entry + spread + slippage + buffer (covers costs)
+        be_price = position.entry_price
+        meta = dict(position.metadata)
+        spread_at_entry = 0.0
+        be_buffer = 0.0
+        try:
+            spread_at_entry = float(meta.get("spread_at_entry", 0.0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            be_buffer = float(meta.get("be_buffer_ticks", 0.0))
+        except (TypeError, ValueError):
+            pass
+        cost_offset = spread_at_entry + be_buffer
+        if position.side == "LONG":
+            be_price = position.entry_price + cost_offset
+        else:
+            be_price = position.entry_price - cost_offset
+        position.stop_price = be_price
         position.partial_closed_size = max(position.partial_closed_size, half_size)
-        metadata = dict(position.metadata)
-        metadata["be_moved"] = True
-        position.metadata = metadata
+        meta["be_moved"] = True
+        meta["be_price"] = be_price
+        meta["be_cost_offset"] = cost_offset
+        position.metadata = meta
 
         if not self.dry_run and self.client is not None:
             try:
@@ -171,8 +350,23 @@ class PositionManager:
             pnl = (exit_price - position.entry_price) * position.size
         else:
             pnl = (position.entry_price - exit_price) * position.size
-        position.pnl = pnl
+
+        # Subtract estimated roundtrip cost for DRY mode realism
+        rtc = 0.0
+        try:
+            rtc = float(position.metadata.get("estimated_roundtrip_cost", 0.0))
+        except (TypeError, ValueError):
+            pass
+        net_pnl = pnl - rtc
+
+        position.pnl = net_pnl
         position.status = "CLOSED"
         position.closed_at = now
+        meta = dict(position.metadata)
+        meta["gross_pnl"] = pnl
+        meta["net_pnl"] = net_pnl
+        meta["roundtrip_cost"] = rtc
+        meta["exit_type"] = "STOP" if stop_hit else "TP"
+        position.metadata = meta
         self.journal.upsert_position(position)
-        return True, pnl
+        return True, net_pnl
