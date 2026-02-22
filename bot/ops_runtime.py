@@ -157,6 +157,8 @@ def run_ops_healthcheck(
         "latest_dir": None,
         "latest_age_seconds": None,
         "manifest_exists": False,
+        "manifest_path": None,
+        "manifest_integrity_ok": None,
     }
 
     for service_name in config.ops.required_services:
@@ -241,7 +243,40 @@ def run_ops_healthcheck(
         backups_payload["latest_dir"] = str(latest_backup)
         backups_payload["latest_age_seconds"] = age_seconds
         manifest_path = latest_backup / "manifest.json"
+        backups_payload["manifest_path"] = str(manifest_path)
         backups_payload["manifest_exists"] = manifest_path.exists()
+        if not manifest_path.exists():
+            errors.append(
+                {
+                    "code": ERROR_BACKUP_STALE,
+                    "message": "Latest backup missing manifest.json",
+                    "latest_dir": str(latest_backup),
+                    "manifest_path": str(manifest_path),
+                }
+            )
+        else:
+            manifest_payload = _read_json(manifest_path, None)
+            if not isinstance(manifest_payload, dict):
+                errors.append(
+                    {
+                        "code": ERROR_BACKUP_STALE,
+                        "message": "Latest backup manifest is invalid JSON",
+                        "manifest_path": str(manifest_path),
+                    }
+                )
+            else:
+                raw_integrity_ok = manifest_payload.get("integrity_ok")
+                integrity_ok = bool(raw_integrity_ok is True)
+                backups_payload["manifest_integrity_ok"] = integrity_ok
+                if not integrity_ok:
+                    errors.append(
+                        {
+                            "code": ERROR_BACKUP_STALE,
+                            "message": "Latest backup manifest integrity_ok is not true",
+                            "manifest_path": str(manifest_path),
+                            "integrity_ok": raw_integrity_ok,
+                        }
+                    )
         if age_seconds > 24 * 3600:
             errors.append(
                 {
@@ -310,6 +345,8 @@ def run_deploy_preflight(
     script_paths = [
         root / "deploy" / "scripts" / "heartbeat.sh",
         root / "deploy" / "scripts" / "watchdog.sh",
+        root / "deploy" / "scripts" / "soak_report.sh",
+        root / "deploy" / "scripts" / "soak_closeout.sh",
         root / "deploy" / "scripts" / "backup_state.sh",
         root / "deploy" / "scripts" / "restore_state.sh",
     ]

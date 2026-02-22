@@ -9,12 +9,17 @@ This runbook covers the Oracle Free Tier paper environment:
 - Daily soak report via `bot-soak-report.timer` (06:05 UTC)
 
 ## Current release SHA
-- Current release SHA: `654f5b0`
+- Release freeze rule: on Day 0 record active SHA from `main`.
 - Record active release SHA before rollout:
 ```bash
 git rev-parse --short HEAD
 ```
 - Write it in ops notes and incident log for traceability.
+- Last verified cloud-soak release SHA (2026-02-22): `715b44d`
+- Day 0 test pack:
+```bash
+python -m pytest tests/test_ops_watchdog.py tests/test_ops_soak_report.py tests/test_ops_soak_closeout.py tests/test_deploy_smoke.py tests/test_ops_healthcheck.py tests/test_ops_backup_restore.py tests/test_market_hours.py -q
+```
 
 ## 1. Start / Stop / Restart
 
@@ -81,6 +86,31 @@ python tools/ops_soak_report.py --root /opt/trading-bot --config config.yaml --s
 4. Save report output to incident/ops notes.
 5. Ensure latest file exists in:
    - `/opt/trading-bot/runtime/soak_reports/YYYY-MM-DD.json`
+
+## 2B. 7-day execution window (2026-02-23 -> 2026-03-01)
+1. Day 1 (2026-02-23): rollout + baseline snapshot.
+2. Days 2-6 (2026-02-24..2026-02-28): daily soak report + healthcheck review.
+3. Day 3 (2026-02-25): controlled single-service failure drill (restart SLA <10s).
+4. Day 4 (2026-02-26): verify-only restore drill.
+5. Day 5 (2026-02-27): full restore drill on a test copy.
+6. Day 7 (2026-03-01): generate closeout report and record GO/NO-GO.
+
+Day 1 baseline artifact:
+```bash
+python tools/ops_soak_report.py --root /opt/trading-bot --config config.yaml --since-hours 24 --json > /opt/trading-bot/runtime/soak_reports/2026-02-23_baseline.json
+```
+
+Closeout command:
+```bash
+python tools/ops_soak_closeout.py \
+  --root /opt/trading-bot \
+  --since-days 7 \
+  --end-date 2026-03-01 \
+  --verify-only-drill-done \
+  --full-restore-drill-done \
+  --json \
+  --output /opt/trading-bot/reports/ops/soak_closeout_2026-03-01.json
+```
 
 ## 3. If a service is `inactive` or `failed`
 1. Check status:

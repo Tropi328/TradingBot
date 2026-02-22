@@ -147,6 +147,9 @@ def build_soak_report(
         "heartbeat_age_seconds": heartbeat_age_seconds,
         "last_backup_age_seconds": backups.get("latest_age_seconds"),
         "latest_backup_dir": backups.get("latest_dir"),
+        "latest_backup_manifest_exists": backups.get("manifest_exists"),
+        "latest_backup_manifest_path": backups.get("manifest_path"),
+        "latest_backup_integrity_ok": backups.get("manifest_integrity_ok"),
         "watchdog_exists": watchdog_exists,
         "watchdog_in_window": watchdog_in_window,
         "watchdog_age_seconds": watchdog_age_seconds,
@@ -166,6 +169,11 @@ def _format_text(report: dict[str, Any]) -> str:
         f"service_states={report.get('service_states')}",
         f"heartbeat_age_seconds={report.get('heartbeat_age_seconds')}",
         f"last_backup_age_seconds={report.get('last_backup_age_seconds')}",
+        (
+            "latest_backup_manifest="
+            f"exists:{report.get('latest_backup_manifest_exists')} "
+            f"integrity_ok:{report.get('latest_backup_integrity_ok')}"
+        ),
         (
             "watchdog="
             f"exists:{report.get('watchdog_exists')} "

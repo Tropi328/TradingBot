@@ -25,6 +25,7 @@ def test_deploy_required_files_exist() -> None:
         root / "deploy" / "systemd" / "bot-soak-report.timer",
         root / "deploy" / "scripts" / "heartbeat.sh",
         root / "deploy" / "scripts" / "soak_report.sh",
+        root / "deploy" / "scripts" / "soak_closeout.sh",
         root / "deploy" / "scripts" / "backup_state.sh",
         root / "deploy" / "scripts" / "restore_state.sh",
         root / "deploy" / "env" / "paper_fx.env.example",
@@ -66,6 +67,8 @@ def test_preflight_health_logic_smoke(tmp_path: Path) -> None:
     (tmp_path / "deploy" / "env" / "paper_btc.env").write_text("A=1\n", encoding="utf-8")
     (tmp_path / "deploy" / "scripts" / "heartbeat.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (tmp_path / "deploy" / "scripts" / "watchdog.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (tmp_path / "deploy" / "scripts" / "soak_report.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (tmp_path / "deploy" / "scripts" / "soak_closeout.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (tmp_path / "deploy" / "scripts" / "backup_state.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (tmp_path / "deploy" / "scripts" / "restore_state.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
 
@@ -117,3 +120,52 @@ def test_ops_soak_report_smoke_format_and_exit_code(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0
     assert "status=ok" in proc.stdout
+
+
+def test_ops_soak_closeout_smoke_format_and_exit_code(tmp_path: Path) -> None:
+    soak_dir = tmp_path / "runtime" / "soak_reports"
+    backups_dir = tmp_path / "backups"
+    soak_dir.mkdir(parents=True, exist_ok=True)
+    backups_dir.mkdir(parents=True, exist_ok=True)
+
+    for day in (
+        "2026-02-23",
+        "2026-02-24",
+        "2026-02-25",
+        "2026-02-26",
+        "2026-02-27",
+        "2026-02-28",
+        "2026-03-01",
+    ):
+        (soak_dir / f"{day}.json").write_text(
+            json.dumps({"status": "ok", "critical_issues": []}),
+            encoding="utf-8",
+        )
+        stamp = day.replace("-", "") + "-060500"
+        day_backup = backups_dir / stamp
+        day_backup.mkdir(parents=True, exist_ok=True)
+        (day_backup / "manifest.json").write_text(
+            json.dumps({"files": [], "integrity_check": {}, "integrity_ok": True}),
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_repo_root() / "tools" / "ops_soak_closeout.py"),
+            "--root",
+            str(tmp_path),
+            "--since-days",
+            "7",
+            "--end-date",
+            "2026-03-01",
+            "--verify-only-drill-done",
+            "--full-restore-drill-done",
+        ],
+        cwd=_repo_root(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "decision=GO" in proc.stdout

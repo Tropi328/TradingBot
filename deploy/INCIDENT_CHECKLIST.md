@@ -45,3 +45,5 @@
   - `E_HEARTBEAT_STALE`
   - `E_DB_WRITE_FAIL`
   - `E_BACKUP_STALE`
+- Day 7 closeout artifact:
+  - `python tools/ops_soak_closeout.py --root /opt/trading-bot --since-days 7 --end-date 2026-03-01 --verify-only-drill-done --full-restore-drill-done --json --output /opt/trading-bot/reports/ops/soak_closeout_2026-03-01.json`

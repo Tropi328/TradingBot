@@ -61,3 +61,21 @@ def test_ops_healthcheck_heartbeat_stale(tmp_path: Path) -> None:
     )
     assert payload["status"] == "fail"
     assert ERROR_HEARTBEAT_STALE in payload["error_codes"]
+
+
+def test_ops_healthcheck_backup_manifest_integrity_fail(tmp_path: Path) -> None:
+    _prepare_healthy_runtime(tmp_path)
+    config = AppConfig()
+    (tmp_path / "backups" / "latest" / "manifest.json").write_text(
+        json.dumps({"files": [], "integrity_check": {}, "integrity_ok": False}),
+        encoding="utf-8",
+    )
+
+    payload = run_ops_healthcheck(
+        root=tmp_path,
+        config=config,
+        service_state_fn=lambda _name: "active",
+        now_epoch=1700000000,
+    )
+    assert payload["status"] == "fail"
+    assert "E_BACKUP_STALE" in payload["error_codes"]

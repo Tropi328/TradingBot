@@ -76,6 +76,7 @@ def test_ops_soak_report_ok_exit_zero(tmp_path: Path) -> None:
     proc = _run_soak(tmp_path, "--since-hours", "24")
     assert proc.returncode == 0
     assert "status=ok" in proc.stdout
+    assert "latest_backup_manifest=exists:True integrity_ok:True" in proc.stdout
 
 
 def test_ops_soak_report_critical_code_exit_one(tmp_path: Path) -> None:
@@ -98,4 +99,27 @@ def test_ops_soak_report_missing_heartbeat_backup_reason(tmp_path: Path) -> None
     payload = json.loads(proc.stdout)
     assert payload["status"] == "fail"
     assert "healthcheck:E_HEARTBEAT_STALE" in payload["critical_issues"]
+    assert "healthcheck:E_BACKUP_STALE" in payload["critical_issues"]
+
+
+def test_ops_soak_report_integrity_failure_is_critical(tmp_path: Path) -> None:
+    _write_min_config(tmp_path / "config.yaml")
+    (tmp_path / "runtime").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "backups" / "latest").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "runtime" / "heartbeat.json").write_text(
+        json.dumps({"timestamp_utc": "2026-02-22T00:00:00Z", "status": "ok", "fail_count": 0}),
+        encoding="utf-8",
+    )
+    (tmp_path / "backups" / "latest" / "manifest.json").write_text(
+        json.dumps({"files": [], "integrity_check": {}, "integrity_ok": False}),
+        encoding="utf-8",
+    )
+    _create_db(tmp_path / "state" / "bot_state_paper_fx.db")
+    _create_db(tmp_path / "state" / "bot_state_paper_btc.db")
+
+    proc = _run_soak(tmp_path, "--since-hours", "24", "--json")
+    assert proc.returncode == 1
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "fail"
+    assert payload["latest_backup_integrity_ok"] is False
     assert "healthcheck:E_BACKUP_STALE" in payload["critical_issues"]

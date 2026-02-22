@@ -260,6 +260,7 @@ This repo now includes a ready-to-use `deploy/` package for Oracle Free Tier VPS
 - `deploy/scripts/backup_state.sh`
 - `deploy/scripts/restore_state.sh`
 - `deploy/scripts/soak_report.sh`
+- `deploy/scripts/soak_closeout.sh`
 - `deploy/env/paper_fx.env.example`
 - `deploy/env/paper_btc.env.example`
 - `deploy/logrotate/trading-bot`
@@ -321,6 +322,8 @@ Profiles:
   `python tools/ops_healthcheck.py --root /opt/trading-bot --config config.yaml`
 - Daily soak report:
   `python tools/ops_soak_report.py --root /opt/trading-bot --config config.yaml --since-hours 24`
+- 7-day closeout (GO/NO-GO):
+  `python tools/ops_soak_closeout.py --root /opt/trading-bot --since-days 7 --end-date 2026-03-01 --verify-only-drill-done --full-restore-drill-done --json --output /opt/trading-bot/reports/ops/soak_closeout_2026-03-01.json`
 - Watchdog one-shot:
   `python tools/ops_watchdog.py --root /opt/trading-bot --config config.yaml --json`
 
@@ -329,6 +332,7 @@ Runtime artifacts:
 - `runtime/watchdog.json`
 - `runtime/soak_reports/YYYY-MM-DD.json`
 - `backups/<timestamp>/manifest.json`
+- `reports/ops/soak_closeout_YYYY-MM-DD.json`
 
 ### Security baseline
 - SSH keys only, disable password login in `sshd_config`.
