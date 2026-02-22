@@ -15,7 +15,7 @@ This runbook covers the Oracle Free Tier paper environment:
 git rev-parse --short HEAD
 ```
 - Write it in ops notes and incident log for traceability.
-- Last verified cloud-soak release SHA (2026-02-22): `715b44d`
+- Last verified cloud-soak release SHA (2026-02-22): `f90f7f2`
 - Day 0 test pack:
 ```bash
 python -m pytest tests/test_ops_watchdog.py tests/test_ops_soak_report.py tests/test_ops_soak_closeout.py tests/test_deploy_smoke.py tests/test_ops_healthcheck.py tests/test_ops_backup_restore.py tests/test_market_hours.py -q
