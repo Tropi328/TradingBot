@@ -1,0 +1,13 @@
+[Unit]
+Description=Trading Bot daily soak report (paper ops)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tradingbot
+Group=tradingbot
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=-/opt/trading-bot/deploy/env/paper_fx.env
+EnvironmentFile=-/opt/trading-bot/deploy/env/paper_btc.env
+ExecStart=/opt/trading-bot/deploy/scripts/soak_report.sh

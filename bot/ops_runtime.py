@@ -724,6 +724,17 @@ def run_watchdog(
         notifications.append(message)
 
     heartbeat_age = health.get("heartbeat", {}).get("age_seconds")
+    services = health.get("services", {})
+    if not isinstance(services, dict):
+        services = {}
+    healthcheck_error_codes = health.get("error_codes", [])
+    if not isinstance(healthcheck_error_codes, list):
+        healthcheck_error_codes = []
+    backups = health.get("backups", {})
+    if not isinstance(backups, dict):
+        backups = {}
+    last_backup_age_seconds = backups.get("latest_age_seconds")
+
     payload = {
         "timestamp_utc": _utc_now_iso(),
         "status": "ok" if not issues else "alert",
@@ -731,6 +742,9 @@ def run_watchdog(
         "issue_fingerprints": issues,
         "recovered_issues": recovered,
         "watchdog_interval_seconds": int(config.ops.watchdog_interval_seconds),
+        "service_states": services,
+        "healthcheck_error_codes": healthcheck_error_codes,
+        "last_backup_age_seconds": last_backup_age_seconds,
         "heartbeat_age": heartbeat_age,
         "heartbeat_age_seconds": heartbeat_age,
         "notifications": notifications,

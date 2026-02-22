@@ -254,10 +254,12 @@ This repo now includes a ready-to-use `deploy/` package for Oracle Free Tier VPS
 - `deploy/systemd/bot-heartbeat.*` (anti-idle every 5 min)
 - `deploy/systemd/bot-watchdog.*` (service + heartbeat checks every 1 min)
 - `deploy/systemd/bot-backup.*` (daily backups)
+- `deploy/systemd/bot-soak-report.*` (daily ops soak report, 06:05 UTC)
 - `deploy/scripts/heartbeat.sh`
 - `deploy/scripts/watchdog.sh`
 - `deploy/scripts/backup_state.sh`
 - `deploy/scripts/restore_state.sh`
+- `deploy/scripts/soak_report.sh`
 - `deploy/env/paper_fx.env.example`
 - `deploy/env/paper_btc.env.example`
 - `deploy/logrotate/trading-bot`
@@ -300,6 +302,7 @@ Profiles:
    - `sudo systemctl enable --now bot-heartbeat.timer`
    - `sudo systemctl enable --now bot-watchdog.timer`
    - `sudo systemctl enable --now bot-backup.timer`
+   - `sudo systemctl enable --now bot-soak-report.timer`
 7. Install logrotate:
    `sudo cp deploy/logrotate/trading-bot /etc/logrotate.d/trading-bot`
 
@@ -316,12 +319,15 @@ Profiles:
   `python tools/deploy_preflight.py --root /opt/trading-bot --config config.yaml`
 - Healthcheck tool:
   `python tools/ops_healthcheck.py --root /opt/trading-bot --config config.yaml`
+- Daily soak report:
+  `python tools/ops_soak_report.py --root /opt/trading-bot --config config.yaml --since-hours 24`
 - Watchdog one-shot:
   `python tools/ops_watchdog.py --root /opt/trading-bot --config config.yaml --json`
 
 Runtime artifacts:
 - `runtime/heartbeat.json`
 - `runtime/watchdog.json`
+- `runtime/soak_reports/YYYY-MM-DD.json`
 - `backups/<timestamp>/manifest.json`
 
 ### Security baseline

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Trading Bot soak report daily at 06:05 UTC
+
+[Timer]
+OnCalendar=*-*-* 06:05:00 UTC
+Persistent=true
+Unit=bot-soak-report.service
+
+[Install]
+WantedBy=timers.target

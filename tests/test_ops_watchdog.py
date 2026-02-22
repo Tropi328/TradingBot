@@ -49,6 +49,9 @@ def test_alert_dedup_and_recovery(tmp_path: Path) -> None:
     )
     assert run1["status"] == "alert"
     assert len(run1["notifications"]) == 1
+    assert run1["service_states"]["bot-paper-fx.service"] == "inactive"
+    assert "E_SERVICE_DOWN" in run1["healthcheck_error_codes"]
+    assert isinstance(run1["last_backup_age_seconds"], (int, float))
 
     run2 = run_watchdog(
         root=tmp_path,
@@ -71,6 +74,7 @@ def test_alert_dedup_and_recovery(tmp_path: Path) -> None:
     assert run3["status"] == "ok"
     assert len(run3["notifications"]) == 1
     assert "recovery" in run3["notifications"][0].lower()
+    assert run3["service_states"]["bot-paper-fx.service"] == "active"
 
 
 def test_dual_db_isolation(tmp_path: Path) -> None:
