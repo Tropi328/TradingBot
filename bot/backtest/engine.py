@@ -48,6 +48,12 @@ from bot.strategy.decision_core import (
     resolve_orderflow_mode as _resolve_orderflow_mode_core,
     risk_multiplier_for as _risk_multiplier_for_core,
 )
+from bot.strategy.route_pipeline_core import (
+    RoutePipelineContext,
+    RoutePipelineHooks,
+    RoutePipelineProfile,
+    evaluate_and_finalize_route,
+)
 from bot.strategy.indicators import atr
 from bot.strategy.index_existing import IndexExistingStrategy
 from bot.strategy.risk_budget import PortfolioRiskBudget
@@ -2843,158 +2849,24 @@ def run_backtest_multi_strategy(
         best_outcome: StrategyOutcome | None = None
         best_route: StrategyRoute | None = None
         best_rank = float("-inf")
-        for route in routes:
-            strategy = strategy_plugins.get(route.strategy)
-            if strategy is None:
-                unknown = StrategyOutcome(
-                    symbol=asset.epic,
-                    strategy_name=route.strategy,
-                    bias=BiasState(
-                        symbol=asset.epic,
-                        strategy_name=route.strategy,
-                        direction="NEUTRAL",
-                        timeframe=config.timeframes.m5,
-                        updated_at=t,
-                        metadata={},
-                    ),
-                    candidate=None,
-                    evaluation=_default_observe_evaluation(symbol=asset.epic, reason=f"UNKNOWN_STRATEGY_{route.strategy}"),
-                    order_request=None,
-                    reason_codes=[f"UNKNOWN_STRATEGY_{route.strategy}"],
-                    payload={},
-                )
-                rank = -1000.0
-                if _is_better_outcome(current=unknown, current_rank=rank, best=best_outcome, best_rank=best_rank):
-                    best_outcome = unknown
-                    best_route = route
-                    best_rank = rank
-                continue
-
-            bundle = StrategyDataBundle(
-                symbol=asset.epic,
-                now=t,
-                candles_h1=slice_h1,
-                candles_m15=slice_m15,
-                candles_m5=slice_m5,
-                spread=spread_now,
-                spread_history=spread_history,
-                news_blocked=False,
-                entry_state="WAIT",
-                h1_new_close=h1_new_close,
-                m15_new_close=m15_new_close,
-                m5_new_close=True,
-                quote=quote,
-                extra={
-                    "minimal_tick_buffer": asset.minimal_tick_buffer,
-                    "strategy_params": route.params,
-                    "strategy_risk": route.risk,
-                    "origin_strategy": route.strategy,
-                    "suppress_missed_opportunity_logs": True,
-                },
-            )
-            strategy.preprocess(asset.epic, bundle)
-            bias = strategy.compute_bias(asset.epic, bundle)
-            if gate_required_side == "FLAT":
-                gate_reason = "DAILY_GATE_FLAT"
-                gated_eval = _default_observe_evaluation(symbol=asset.epic, reason=gate_reason)
-                gated_outcome = StrategyOutcome(
-                    symbol=asset.epic,
-                    strategy_name=route.strategy,
-                    bias=bias,
-                    candidate=None,
-                    evaluation=gated_eval,
-                    order_request=None,
-                    reason_codes=[gate_reason],
-                    payload={"score_total": gated_eval.score_total, "route_priority": route.priority},
-                )
-                rank = -850.0 + (route.priority * 0.01)
-                if _is_better_outcome(current=gated_outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
-                    best_outcome = gated_outcome
-                    best_route = route
-                    best_rank = rank
-                continue
-            if gate_required_side in {"LONG", "SHORT"}:
-                bias_dir = str(getattr(bias, "direction", "NEUTRAL")).upper()
-                side_mismatch = (gate_required_side == "LONG" and bias_dir == "SHORT") or (
-                    gate_required_side == "SHORT" and bias_dir == "LONG"
-                )
-                if side_mismatch:
-                    gate_reason = "DAILY_GATE_LONG_ONLY" if gate_required_side == "LONG" else "DAILY_GATE_SHORT_ONLY"
-                    gated_eval = _default_observe_evaluation(symbol=asset.epic, reason=gate_reason)
-                    gated_outcome = StrategyOutcome(
-                        symbol=asset.epic,
-                        strategy_name=route.strategy,
-                        bias=bias,
-                        candidate=None,
-                        evaluation=gated_eval,
-                        order_request=None,
-                        reason_codes=[gate_reason],
-                        payload={"score_total": gated_eval.score_total, "route_priority": route.priority},
-                    )
-                    rank = -840.0 + (route.priority * 0.01)
-                    if _is_better_outcome(current=gated_outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
-                        best_outcome = gated_outcome
-                        best_route = route
-                        best_rank = rank
-                    continue
-            raw_candidates = strategy.detect_candidates(asset.epic, bundle)
-            candidates = candidate_queue.put_many(
-                symbol=asset.epic,
-                strategy=route.strategy,
-                candidates=raw_candidates,
-                now=t,
-            )
-            candidate, evaluation = _pick_best_candidate(
-                strategy=strategy,
-                symbol=asset.epic,
-                candidates=candidates,
-                data=bundle,
-            )
-            schedule_cfg = route.params.get("schedule")
-            schedule_open = True
-            if isinstance(schedule_cfg, dict):
-                schedule_open = is_schedule_open(t, schedule_cfg, config.timezone)
-            mode_override = _resolve_orderflow_mode(
-                symbol=asset.epic,
-                route_params=route.params,
-                default_mode=orderflow_default_mode,
-                full_symbols=orderflow_full_symbols,
-            )
-            route_of = route.params.get("orderflow")
-            window = orderflow_default_window
-            if isinstance(route_of, dict):
-                try:
-                    window = max(8, int(route_of.get("window", orderflow_default_window)))
-                except (TypeError, ValueError):
-                    window = orderflow_default_window
-            atr_for_of = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-            atr_for_of_float: float | None
-            try:
-                atr_for_of_float = float(atr_for_of) if atr_for_of is not None else None
-            except (TypeError, ValueError):
-                atr_for_of_float = None
-            orderflow_snapshot = orderflow_provider.get_snapshot(
-                symbol=asset.epic,
-                tf=config.timeframes.m5,
-                window=window,
-                candles=slice_m5,
-                spread=spread_now,
-                quote=quote,
-                atr_value=atr_for_of_float,
-                extra=bundle.extra,
-                mode_override=mode_override,
-            )
-            evaluation.snapshot.setdefault("spread", spread_now)
-            evaluation.snapshot.setdefault("close", candle.close)
-            evaluation.metadata["spread"] = spread_now
-            evaluation.metadata["close"] = candle.close
-            evaluation.metadata["price_mode"] = str(backtest_context.get("price_mode_requested") or "unknown")
-            evaluation.metadata["timeframe"] = str(backtest_context.get("timeframe") or config.timeframes.m5)
-            evaluation.metadata["spread_mode"] = spread_mode
-            evaluation.metadata["assumed_spread_used"] = assumed_spread_used
-            evaluation.metadata["data_context"] = backtest_context
+        def _backtest_pre_score(
+            *,
+            context: RoutePipelineContext,
+            candidate: SetupCandidate | None,
+            evaluation: StrategyEvaluation,
+        ) -> StrategyEvaluation:
+            del candidate
+            evaluation.snapshot.setdefault('spread', spread_now)
+            evaluation.snapshot.setdefault('close', candle.close)
+            evaluation.metadata['spread'] = spread_now
+            evaluation.metadata['close'] = candle.close
+            evaluation.metadata['price_mode'] = str(backtest_context.get('price_mode_requested') or 'unknown')
+            evaluation.metadata['timeframe'] = str(backtest_context.get('timeframe') or config.timeframes.m5)
+            evaluation.metadata['spread_mode'] = spread_mode
+            evaluation.metadata['assumed_spread_used'] = assumed_spread_used
+            evaluation.metadata['data_context'] = backtest_context
             bars_since_segment_start = max(0, i - segment_start_index)
-            evaluation.metadata["bars_since_segment_start"] = bars_since_segment_start
+            evaluation.metadata['bars_since_segment_start'] = bars_since_segment_start
             atr_runtime = atr_values[i] if 0 <= i < len(atr_values) else None
             if bars_since_segment_start >= feature_warmup_bars and atr_runtime is not None:
                 try:
@@ -3002,51 +2874,67 @@ def run_backtest_multi_strategy(
                 except (TypeError, ValueError):
                     atr_runtime_f = None
                 if atr_runtime_f is not None and atr_runtime_f > 0:
-                    evaluation.metadata.setdefault("atr_m5", atr_runtime_f)
-                    evaluation.snapshot.setdefault("atr_m5", atr_runtime_f)
-            trigger_value = evaluation.metadata.get("trigger_confirmations")
+                    evaluation.metadata.setdefault('atr_m5', atr_runtime_f)
+                    evaluation.snapshot.setdefault('atr_m5', atr_runtime_f)
+            trigger_value = evaluation.metadata.get('trigger_confirmations')
             if trigger_value is None:
-                alt_trigger = evaluation.metadata.get("confirmations")
+                alt_trigger = evaluation.metadata.get('confirmations')
                 if alt_trigger is None:
-                    alt_trigger = evaluation.snapshot.get("trigger_confirmations")
+                    alt_trigger = evaluation.snapshot.get('trigger_confirmations')
                 try:
                     trigger_int = int(alt_trigger) if alt_trigger is not None else 0
                 except (TypeError, ValueError):
                     trigger_int = 0
-                evaluation.metadata["trigger_confirmations"] = max(0, trigger_int)
+                evaluation.metadata['trigger_confirmations'] = max(0, trigger_int)
             if quote is not None:
-                evaluation.metadata["quote"] = quote
-                evaluation.metadata["bid"] = quote[0]
-                evaluation.metadata["ask"] = quote[1]
-            evaluation = _apply_soft_reason_penalties(
+                evaluation.metadata['quote'] = quote
+                evaluation.metadata['bid'] = quote[0]
+                evaluation.metadata['ask'] = quote[1]
+            return _apply_soft_reason_penalties(
                 evaluation=evaluation,
                 config=config,
-                route_params=route.params,
+                route_params=context.route_params,
                 enabled=variant_cfg.soft_reason_penalties,
             )
-            evaluation = _compute_v2_score(
-                strategy_name=route.strategy,
+
+        def _backtest_compute_score(
+            *,
+            context: RoutePipelineContext,
+            bias: BiasState,
+            candidate: SetupCandidate | None,
+            evaluation: StrategyEvaluation,
+            schedule_open: bool,
+            orderflow_snapshot: OrderflowSnapshot | None,
+        ) -> StrategyEvaluation:
+            return _compute_v2_score(
+                strategy_name=context.strategy_name,
                 bias=bias,
-                route_params=route.params,
+                route_params=context.route_params,
                 config=config,
                 evaluation=evaluation,
-                news_blocked=False,
+                news_blocked=context.news_blocked,
                 schedule_open=schedule_open,
                 orderflow_snapshot=orderflow_snapshot,
                 setup_side=candidate.side if candidate is not None else None,
-                orderflow_settings=orderflow_settings,
+                orderflow_settings=context.orderflow_settings,
             )
+
+        def _backtest_normalize_and_gate(
+            *,
+            context: RoutePipelineContext,
+            candidate: SetupCandidate | None,
+            evaluation: StrategyEvaluation,
+        ) -> StrategyEvaluation:
+            nonlocal missing_feature_debug_logged
             if score_v3_engine is not None:
-                # ScoreV3 replaces V2 threshold normalization
-                # Only pass last 500 ATR values (avoid O(n) copy per bar)
-                _atr_hist_slice = atr_values[max(0, i - 499) : i + 1] if atr_values else None
+                atr_hist_slice = atr_values[max(0, i - 499) : i + 1] if atr_values else None
                 evaluation = apply_score_v3(
                     score_v3_engine,
                     evaluation,
-                    bias,
+                    context.runtime.get('bias'),
                     candle=candle,
-                    atr_m5=evaluation.metadata.get("atr_m5"),
-                    atr_history=_atr_hist_slice,
+                    atr_m5=evaluation.metadata.get('atr_m5'),
+                    atr_history=atr_hist_slice,
                     spread=spread_now,
                     assumed_spread=float(assumed_spread_used),
                 )
@@ -3057,13 +2945,13 @@ def run_backtest_multi_strategy(
                     trade_threshold=trade_thr_base,
                     small_min=small_min_base,
                     small_max=small_max_base,
-                    route_params=route.params,
+                    route_params=context.route_params,
                     evaluation=evaluation,
                     config=config,
                     enabled=variant_cfg.dynamic_threshold_bump,
                 )
                 if dynamic_reasons:
-                    evaluation.metadata["dynamic_threshold_reasons"] = dynamic_reasons
+                    evaluation.metadata['dynamic_threshold_reasons'] = dynamic_reasons
                 _ = _normalize_action_for_score(
                     evaluation=evaluation,
                     config=config,
@@ -3071,34 +2959,35 @@ def run_backtest_multi_strategy(
                     small_min=small_min,
                     small_max=small_max,
                 )
+            bars_since_segment_start = max(0, i - segment_start_index)
             if candidate is None or bars_since_segment_start < feature_warmup_bars:
-                missing_features = []
-                evaluation.metadata["is_ready"] = True
+                missing_features: list[str] = []
+                evaluation.metadata['is_ready'] = True
             else:
                 missing_features = _missing_execution_features(
-                    route_params=route.params,
+                    route_params=context.route_params,
                     evaluation=evaluation,
                 )
                 if missing_features and missing_feature_debug_logged < 10:
                     missing_feature_debug_logged += 1
                     LOGGER.info(
-                        "Missing features | ts=%s segment=%s bars_since_segment_start=%d missing=%s",
+                        'Missing features | ts=%s segment=%s bars_since_segment_start=%d missing=%s',
                         t.isoformat(),
                         segment_id,
                         bars_since_segment_start,
-                        ",".join(str(item) for item in missing_features),
+                        ','.join(str(item) for item in missing_features),
                     )
             if missing_features:
-                gate_reasons = ["PIPELINE_NOT_READY_MISSING_FEATURES"]
+                gate_reasons = ['PIPELINE_NOT_READY_MISSING_FEATURES']
             else:
                 gate_reasons = _quality_gate_reasons(
-                    route_params=route.params,
+                    route_params=context.route_params,
                     evaluation=evaluation,
                     now=t,
                     timezone_name=config.timezone,
                 )
             reaction_reasons = _apply_reaction_gate_with_timeout(
-                strategy_key=f"{asset.epic}:{route.strategy}",
+                strategy_key=f"{asset.epic}:{context.strategy_name}",
                 bar_index=i,
                 now=t,
                 evaluation=evaluation,
@@ -3120,33 +3009,162 @@ def run_backtest_multi_strategy(
                     if code not in evaluation.reasons_blocking:
                         evaluation.reasons_blocking.append(code)
                 evaluation.action = DecisionAction.OBSERVE
-            evaluation = _apply_orderflow_small_soft_gate(
-                route_params=route.params,
+            return evaluation
+
+        def _backtest_apply_orderflow_soft_gate(
+            *,
+            context: RoutePipelineContext,
+            candidate: SetupCandidate | None,
+            evaluation: StrategyEvaluation,
+        ) -> StrategyEvaluation:
+            del candidate
+            return _apply_orderflow_small_soft_gate(
+                route_params=context.route_params,
                 evaluation=evaluation,
-                orderflow_settings=orderflow_settings,
+                orderflow_settings=context.orderflow_settings,
             )
-            signal_request = (
-                strategy.generate_order(asset.epic, evaluation, candidate, bundle)
-                if candidate is not None and evaluation.action in {DecisionAction.TRADE, DecisionAction.SMALL}
-                else None
-            )
-            outcome = StrategyOutcome(
-                symbol=asset.epic,
-                strategy_name=route.strategy,
-                bias=bias,
-                candidate=candidate,
-                evaluation=evaluation,
-                order_request=signal_request,
-                reason_codes=list(dict.fromkeys(evaluation.reasons_blocking)),
-                payload={"score_total": evaluation.score_total, "route_priority": route.priority},
-            )
-            soft_reasons = evaluation.metadata.get("soft_reasons")
+
+        def _backtest_build_payload(
+            *,
+            context: RoutePipelineContext,
+            candidate: SetupCandidate | None,
+            evaluation: StrategyEvaluation,
+        ) -> dict[str, object]:
+            del candidate
+            return {
+                'score_total': evaluation.score_total,
+                'route_priority': context.route_priority,
+            }
+
+        def _backtest_on_outcome(context: RoutePipelineContext, outcome: StrategyOutcome) -> None:
+            soft_reasons = outcome.evaluation.metadata.get('soft_reasons')
             if isinstance(soft_reasons, list):
                 for soft_reason in soft_reasons:
                     code = f"SOFT_REASON_{str(soft_reason).upper()}"
                     if code not in outcome.reason_codes:
                         outcome.reason_codes.append(code)
-            rank = rank_score(evaluation) + (route.priority * 0.01)
+
+        backtest_hooks = RoutePipelineHooks(
+            default_observe_evaluation=_default_observe_evaluation,
+            pick_best_candidate=_pick_best_candidate,
+            compute_score=_backtest_compute_score,
+            normalize_and_gate=_backtest_normalize_and_gate,
+            apply_orderflow_small_soft_gate=_backtest_apply_orderflow_soft_gate,
+            build_payload=_backtest_build_payload,
+            pre_score=_backtest_pre_score,
+            build_reason_codes=lambda _ctx, evaluation: list(dict.fromkeys(evaluation.reasons_blocking)),
+            on_outcome=_backtest_on_outcome,
+            unknown_rank=lambda _ctx, _evaluation: -1000.0,
+            rank=lambda context, evaluation: rank_score(evaluation) + (context.route_priority * 0.01),
+            build_unknown_payload=lambda _context: {},
+        )
+
+        for route in routes:
+            strategy = strategy_plugins.get(route.strategy)
+            bundle = StrategyDataBundle(
+                symbol=asset.epic,
+                now=t,
+                candles_h1=slice_h1,
+                candles_m15=slice_m15,
+                candles_m5=slice_m5,
+                spread=spread_now,
+                spread_history=spread_history,
+                news_blocked=False,
+                entry_state='WAIT',
+                h1_new_close=h1_new_close,
+                m15_new_close=m15_new_close,
+                m5_new_close=True,
+                quote=quote,
+                extra={
+                    'minimal_tick_buffer': asset.minimal_tick_buffer,
+                    'strategy_params': route.params,
+                    'strategy_risk': route.risk,
+                    'origin_strategy': route.strategy,
+                    'suppress_missed_opportunity_logs': True,
+                },
+            )
+            bias_for_gate: BiasState | None = None
+            preprocessed = False
+            if strategy is not None:
+                strategy.preprocess(asset.epic, bundle)
+                bias_for_gate = strategy.compute_bias(asset.epic, bundle)
+                preprocessed = True
+            if gate_required_side == 'FLAT' and bias_for_gate is not None:
+                gate_reason = 'DAILY_GATE_FLAT'
+                gated_eval = _default_observe_evaluation(symbol=asset.epic, reason=gate_reason)
+                gated_outcome = StrategyOutcome(
+                    symbol=asset.epic,
+                    strategy_name=route.strategy,
+                    bias=bias_for_gate,
+                    candidate=None,
+                    evaluation=gated_eval,
+                    order_request=None,
+                    reason_codes=[gate_reason],
+                    payload={'score_total': gated_eval.score_total, 'route_priority': route.priority},
+                )
+                rank = -850.0 + (route.priority * 0.01)
+                if _is_better_outcome(current=gated_outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
+                    best_outcome = gated_outcome
+                    best_route = route
+                    best_rank = rank
+                continue
+            if gate_required_side in {'LONG', 'SHORT'} and bias_for_gate is not None:
+                bias_dir = str(getattr(bias_for_gate, 'direction', 'NEUTRAL')).upper()
+                side_mismatch = (gate_required_side == 'LONG' and bias_dir == 'SHORT') or (
+                    gate_required_side == 'SHORT' and bias_dir == 'LONG'
+                )
+                if side_mismatch:
+                    gate_reason = 'DAILY_GATE_LONG_ONLY' if gate_required_side == 'LONG' else 'DAILY_GATE_SHORT_ONLY'
+                    gated_eval = _default_observe_evaluation(symbol=asset.epic, reason=gate_reason)
+                    gated_outcome = StrategyOutcome(
+                        symbol=asset.epic,
+                        strategy_name=route.strategy,
+                        bias=bias_for_gate,
+                        candidate=None,
+                        evaluation=gated_eval,
+                        order_request=None,
+                        reason_codes=[gate_reason],
+                        payload={'score_total': gated_eval.score_total, 'route_priority': route.priority},
+                    )
+                    rank = -840.0 + (route.priority * 0.01)
+                    if _is_better_outcome(current=gated_outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
+                        best_outcome = gated_outcome
+                        best_route = route
+                        best_rank = rank
+                    continue
+            route_context = RoutePipelineContext(
+                profile=RoutePipelineProfile.BACKTEST,
+                symbol=asset.epic,
+                now=t,
+                timezone_name=config.timezone,
+                timeframe=config.timeframes.m5,
+                strategy_name=route.strategy,
+                route_priority=route.priority,
+                route_params=route.params,
+                route_risk=route.risk,
+                strategy=strategy,
+                bundle=bundle,
+                news_blocked=False,
+                spread=spread_now,
+                quote=quote,
+                orderflow_provider=orderflow_provider,
+                orderflow_default_mode=orderflow_default_mode,
+                orderflow_default_window=orderflow_default_window,
+                orderflow_full_symbols=orderflow_full_symbols,
+                orderflow_settings=orderflow_settings,
+                runtime={
+                    'preprocessed': preprocessed,
+                    'precomputed_bias': bias_for_gate,
+                    'bias': bias_for_gate,
+                },
+            )
+            route_result = evaluate_and_finalize_route(
+                context=route_context,
+                candidate_queue=candidate_queue,
+                hooks=backtest_hooks,
+            )
+            outcome = route_result.outcome
+            rank = route_result.rank
             if _is_better_outcome(current=outcome, current_rank=rank, best=best_outcome, best_rank=best_rank):
                 best_outcome = outcome
                 best_route = route
@@ -4777,3 +4795,4 @@ def run_walk_forward_multi_strategy(
         reports=reports,
     )
     return WalkForwardReport(epic=asset.epic, splits=reports, aggregate=aggregate)
+

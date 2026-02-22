@@ -139,6 +139,12 @@ from bot.strategy.decision_core import (
     resolve_orderflow_mode as _resolve_orderflow_mode_core,
     risk_multiplier_for as _risk_multiplier_for_core,
 )
+from bot.strategy.route_pipeline_core import (
+    RoutePipelineContext,
+    RoutePipelineHooks,
+    RoutePipelineProfile,
+    evaluate_and_finalize_route,
+)
 from bot.strategy.index_existing import IndexExistingStrategy
 from bot.strategy.orb_h4_retest import OrbH4RetestStrategy
 from bot.strategy.portfolio_supervisor import EntryProposal, PortfolioSupervisor
@@ -4687,200 +4693,194 @@ def run_multi_strategy_loop(
                 best_rank = float("-inf")
                 route_summaries: list[dict[str, object]] = []
 
-                for route in routes:
-                    strategy = strategy_plugins.get(route.strategy)
-                    if strategy is None:
-                        evaluation = _default_observe_evaluation(
-                            symbol=epic,
-                            reason=f"UNKNOWN_STRATEGY_{route.strategy}",
+                def _main_compute_score(
+                    *,
+                    context: RoutePipelineContext,
+                    bias: BiasState,
+                    candidate: SetupCandidate | None,
+                    evaluation: StrategyEvaluation,
+                    schedule_open: bool,
+                    orderflow_snapshot: OrderflowSnapshot | None,
+                ) -> StrategyEvaluation:
+                    return _compute_v2_score(
+                        symbol=context.symbol,
+                        strategy_name=context.strategy_name,
+                        bias=bias,
+                        route_params=context.route_params,
+                        evaluation=evaluation,
+                        news_blocked=context.news_blocked,
+                        schedule_open=schedule_open,
+                        orderflow_snapshot=orderflow_snapshot,
+                        setup_side=candidate.side if candidate is not None else None,
+                        orderflow_settings=context.orderflow_settings,
+                    )
+
+                def _main_normalize_and_gate(
+                    *,
+                    context: RoutePipelineContext,
+                    candidate: SetupCandidate | None,
+                    evaluation: StrategyEvaluation,
+                ) -> StrategyEvaluation:
+                    del candidate
+                    _ = _normalize_action_for_score(
+                        evaluation=evaluation,
+                        config=config,
+                        session_threshold_adjust=session_match.threshold_adjust,
+                    )
+                    gate_reasons = _quality_gate_reasons(
+                        symbol=context.symbol,
+                        route_params=context.route_params,
+                        evaluation=evaluation,
+                        now=context.now,
+                        timezone_name=context.timezone_name,
+                    )
+                    sg_result: SoftGateResult | None = None
+                    if adaptive_cfg is not None and adaptive_cfg.soft_gates_enabled and gate_reasons:
+                        sg_result = apply_soft_gates(
+                            gate_reasons,
+                            soft_gates_enabled=True,
+                            soft_gate_penalty=adaptive_cfg.soft_gate_penalty,
                         )
-                        outcome = StrategyOutcome(
-                            symbol=epic,
-                            strategy_name=route.strategy,
-                            bias=BiasState(epic, route.strategy, "NEUTRAL", config.timeframes.m5, now, {}),
-                            candidate=None,
-                            evaluation=evaluation,
-                            order_request=None,
-                            reason_codes=[f"UNKNOWN_STRATEGY_{route.strategy}"],
-                            payload={"strategy_name": route.strategy},
-                        )
-                        rank_value = rank_score(evaluation)
-                    else:
-                        bundle = StrategyDataBundle(
-                            symbol=epic,
-                            now=now,
-                            candles_h1=state.cache.get(config.timeframes.h1, []),
-                            candles_m15=state.cache.get(config.timeframes.m15, []),
-                            candles_m5=state.cache.get(config.timeframes.m5, []),
-                            spread=spread,
-                            spread_history=market_data.spread_history(epic),
-                            news_blocked=news_blocked,
-                            entry_state=state.entry_state,
-                            h1_new_close=h1_new,
-                            m15_new_close=m15_new,
-                            m5_new_close=m5_new,
-                            quote=q,
-                            extra={
-                                "minimal_tick_buffer": state.asset.minimal_tick_buffer,
-                                "strategy_params": route.params,
-                                "strategy_risk": route.risk,
-                                "origin_strategy": route.strategy,
-                            },
-                        )
-                        strategy.preprocess(epic, bundle)
-                        bias = strategy.compute_bias(epic, bundle)
-                        raw_candidates = strategy.detect_candidates(epic, bundle)
-                        candidates = candidate_queue.put_many(
-                            symbol=epic,
-                            strategy=route.strategy,
-                            candidates=raw_candidates,
-                            now=now,
-                        )
-                        candidate, evaluation = _pick_best_candidate(
-                            strategy=strategy,
-                            symbol=epic,
-                            candidates=candidates,
-                            data=bundle,
-                        )
-                        schedule_cfg = route.params.get("schedule")
-                        schedule_open = True
-                        if isinstance(schedule_cfg, dict):
-                            schedule_open = is_schedule_open(now, schedule_cfg, config.timezone)
-                        mode_override = _resolve_orderflow_mode(
-                            symbol=epic,
-                            route_params=route.params,
-                            default_mode=orderflow_default_mode,
-                            full_symbols=orderflow_full_symbols,
-                        )
-                        route_of = route.params.get("orderflow")
-                        window = orderflow_default_window
-                        if isinstance(route_of, dict):
-                            try:
-                                window = max(8, int(route_of.get("window", orderflow_default_window)))
-                            except (TypeError, ValueError):
-                                window = orderflow_default_window
-                        atr_for_of = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-                        atr_for_of_float: float | None
-                        try:
-                            atr_for_of_float = float(atr_for_of) if atr_for_of is not None else None
-                        except (TypeError, ValueError):
-                            atr_for_of_float = None
-                        orderflow_snapshot = orderflow_provider.get_snapshot(
-                            symbol=epic,
-                            tf=config.timeframes.m5,
-                            window=window,
-                            candles=state.cache.get(config.timeframes.m5, []),
-                            spread=spread,
-                            quote=q,
-                            atr_value=atr_for_of_float,
-                            extra=bundle.extra,
-                            mode_override=mode_override,
-                        )
-                        evaluation = _compute_v2_score(
-                            symbol=epic,
-                            strategy_name=route.strategy,
-                            bias=bias,
-                            route_params=route.params,
-                            evaluation=evaluation,
-                            news_blocked=news_blocked,
-                            schedule_open=schedule_open,
-                            orderflow_snapshot=orderflow_snapshot,
-                            setup_side=candidate.side if candidate is not None else None,
-                            orderflow_settings=orderflow_settings,
-                        )
-                        _ = _normalize_action_for_score(
-                            evaluation=evaluation, config=config,
-                            session_threshold_adjust=session_match.threshold_adjust,
-                        )
-                        gate_reasons = _quality_gate_reasons(
-                            symbol=epic,
-                            route_params=route.params,
-                            evaluation=evaluation,
-                            now=now,
-                            timezone_name=config.timezone,
-                        )
-                        # ── Soft-gate conversion ─────────────────
-                        _sg_result: SoftGateResult | None = None
-                        if adaptive_cfg is not None and adaptive_cfg.soft_gates_enabled and gate_reasons:
-                            _sg_result = apply_soft_gates(
-                                gate_reasons,
-                                soft_gates_enabled=True,
-                                soft_gate_penalty=adaptive_cfg.soft_gate_penalty,
-                            )
-                            evaluation.metadata["soft_gate_converted"] = _sg_result.converted_gates
-                            evaluation.metadata["soft_gate_penalty"] = _sg_result.total_penalty
-                            # Only hard reasons block; soft ones become penalties
-                            if _sg_result.hard_reasons:
-                                evaluation.action = DecisionAction.OBSERVE
-                                for code in _sg_result.hard_reasons:
-                                    if code not in evaluation.reasons_blocking:
-                                        evaluation.reasons_blocking.append(code)
-                            # Re-normalize with adaptive threshold + soft penalty
-                            if not _sg_result.hard_reasons:
-                                evaluation.reasons_blocking.clear()
-                                _ = _normalize_action_for_score(
-                                    evaluation=evaluation,
-                                    config=config,
-                                    adaptive_cfg=adaptive_cfg,
-                                    soft_gate_result=_sg_result,
-                                    session_threshold_adjust=session_match.threshold_adjust,
-                                )
-                        elif gate_reasons:
+                        evaluation.metadata['soft_gate_converted'] = sg_result.converted_gates
+                        evaluation.metadata['soft_gate_penalty'] = sg_result.total_penalty
+                        if sg_result.hard_reasons:
                             evaluation.action = DecisionAction.OBSERVE
-                            for code in gate_reasons:
+                            for code in sg_result.hard_reasons:
                                 if code not in evaluation.reasons_blocking:
                                     evaluation.reasons_blocking.append(code)
-                        elif adaptive_cfg is not None and adaptive_cfg.enabled:
-                            # No gates hit → still re-normalize with adaptive threshold
+                        if not sg_result.hard_reasons:
                             evaluation.reasons_blocking.clear()
                             _ = _normalize_action_for_score(
                                 evaluation=evaluation,
                                 config=config,
                                 adaptive_cfg=adaptive_cfg,
+                                soft_gate_result=sg_result,
                                 session_threshold_adjust=session_match.threshold_adjust,
                             )
-                        evaluation = _apply_orderflow_small_soft_gate(
-                            route_params=route.params,
+                    elif gate_reasons:
+                        evaluation.action = DecisionAction.OBSERVE
+                        for code in gate_reasons:
+                            if code not in evaluation.reasons_blocking:
+                                evaluation.reasons_blocking.append(code)
+                    elif adaptive_cfg is not None and adaptive_cfg.enabled:
+                        evaluation.reasons_blocking.clear()
+                        _ = _normalize_action_for_score(
                             evaluation=evaluation,
-                            orderflow_settings=orderflow_settings,
+                            config=config,
+                            adaptive_cfg=adaptive_cfg,
+                            session_threshold_adjust=session_match.threshold_adjust,
                         )
+                    return evaluation
 
-                        signal_request = (
-                            strategy.generate_order(epic, evaluation, candidate, bundle)
-                            if candidate is not None and evaluation.action in {DecisionAction.TRADE, DecisionAction.SMALL}
-                            else None
-                        )
-                        outcome = StrategyOutcome(
-                            symbol=epic,
-                            strategy_name=route.strategy,
-                            bias=bias,
-                            candidate=candidate,
-                            evaluation=evaluation,
-                            order_request=signal_request,
-                            reason_codes=list(evaluation.reasons_blocking),
-                            payload={
-                                "strategy_name": route.strategy,
-                                "score_total": evaluation.score_total,
-                                "score_breakdown": evaluation.score_breakdown,
-                                "snapshot": evaluation.snapshot,
-                                "candidate_id": candidate.candidate_id if candidate is not None else None,
-                                **evaluation.metadata,
-                            },
-                        )
-                        soft_reasons = evaluation.metadata.get("soft_reasons")
-                        if isinstance(soft_reasons, list):
-                            for soft_reason in soft_reasons:
-                                code = f"SOFT_REASON_{str(soft_reason).upper()}"
+                def _main_apply_orderflow_soft_gate(
+                    *,
+                    context: RoutePipelineContext,
+                    candidate: SetupCandidate | None,
+                    evaluation: StrategyEvaluation,
+                ) -> StrategyEvaluation:
+                    del candidate
+                    return _apply_orderflow_small_soft_gate(
+                        route_params=context.route_params,
+                        evaluation=evaluation,
+                        orderflow_settings=context.orderflow_settings,
+                    )
+
+                def _main_build_payload(
+                    *,
+                    context: RoutePipelineContext,
+                    candidate: SetupCandidate | None,
+                    evaluation: StrategyEvaluation,
+                ) -> dict[str, object]:
+                    return {
+                        'strategy_name': context.strategy_name,
+                        'score_total': evaluation.score_total,
+                        'score_breakdown': evaluation.score_breakdown,
+                        'snapshot': evaluation.snapshot,
+                        'candidate_id': candidate.candidate_id if candidate is not None else None,
+                        **evaluation.metadata,
+                    }
+
+                def _main_on_outcome(context: RoutePipelineContext, outcome: StrategyOutcome) -> None:
+                    soft_reasons = outcome.evaluation.metadata.get('soft_reasons')
+                    if isinstance(soft_reasons, list):
+                        for soft_reason in soft_reasons:
+                            code = f"SOFT_REASON_{str(soft_reason).upper()}"
+                            if code not in outcome.reason_codes:
+                                outcome.reason_codes.append(code)
+                    strategy_local = context.strategy
+                    if isinstance(strategy_local, IndexExistingStrategy):
+                        state.h1_snapshot, state.m15_snapshot, state.m5_snapshot = strategy_local.last_snapshots(context.symbol)
+                        legacy = strategy_local.last_legacy_decision(context.symbol)
+                        if legacy is not None:
+                            for code in legacy.reason_codes:
                                 if code not in outcome.reason_codes:
                                     outcome.reason_codes.append(code)
-                        if isinstance(strategy, IndexExistingStrategy):
-                            state.h1_snapshot, state.m15_snapshot, state.m5_snapshot = strategy.last_snapshots(epic)
-                            legacy = strategy.last_legacy_decision(epic)
-                            if legacy is not None:
-                                for code in legacy.reason_codes:
-                                    if code not in outcome.reason_codes:
-                                        outcome.reason_codes.append(code)
-                        rank_value = rank_score(evaluation) + (route.priority * 0.01)
+
+                main_hooks = RoutePipelineHooks(
+                    default_observe_evaluation=_default_observe_evaluation,
+                    pick_best_candidate=_pick_best_candidate,
+                    compute_score=_main_compute_score,
+                    normalize_and_gate=_main_normalize_and_gate,
+                    apply_orderflow_small_soft_gate=_main_apply_orderflow_soft_gate,
+                    build_payload=_main_build_payload,
+                    build_reason_codes=lambda _ctx, evaluation: list(evaluation.reasons_blocking),
+                    on_outcome=_main_on_outcome,
+                    unknown_rank=lambda _ctx, evaluation: rank_score(evaluation),
+                    rank=lambda context, evaluation: rank_score(evaluation) + (context.route_priority * 0.01),
+                    build_unknown_payload=lambda context: {'strategy_name': context.strategy_name},
+                )
+
+                for route in routes:
+                    strategy = strategy_plugins.get(route.strategy)
+                    bundle = StrategyDataBundle(
+                        symbol=epic,
+                        now=now,
+                        candles_h1=state.cache.get(config.timeframes.h1, []),
+                        candles_m15=state.cache.get(config.timeframes.m15, []),
+                        candles_m5=state.cache.get(config.timeframes.m5, []),
+                        spread=spread,
+                        spread_history=market_data.spread_history(epic),
+                        news_blocked=news_blocked,
+                        entry_state=state.entry_state,
+                        h1_new_close=h1_new,
+                        m15_new_close=m15_new,
+                        m5_new_close=m5_new,
+                        quote=q,
+                        extra={
+                            'minimal_tick_buffer': state.asset.minimal_tick_buffer,
+                            'strategy_params': route.params,
+                            'strategy_risk': route.risk,
+                            'origin_strategy': route.strategy,
+                        },
+                    )
+                    route_context = RoutePipelineContext(
+                        profile=RoutePipelineProfile.MAIN,
+                        symbol=epic,
+                        now=now,
+                        timezone_name=config.timezone,
+                        timeframe=config.timeframes.m5,
+                        strategy_name=route.strategy,
+                        route_priority=route.priority,
+                        route_params=route.params,
+                        route_risk=route.risk,
+                        strategy=strategy,
+                        bundle=bundle,
+                        news_blocked=news_blocked,
+                        spread=spread,
+                        quote=q,
+                        orderflow_provider=orderflow_provider,
+                        orderflow_default_mode=orderflow_default_mode,
+                        orderflow_default_window=orderflow_default_window,
+                        orderflow_full_symbols=orderflow_full_symbols,
+                        orderflow_settings=orderflow_settings,
+                    )
+                    route_result = evaluate_and_finalize_route(
+                        context=route_context,
+                        candidate_queue=candidate_queue,
+                        hooks=main_hooks,
+                    )
+                    outcome = route_result.outcome
+                    rank_value = route_result.rank
 
                     # --- SignalCandidate logging (telemetry) ---
                     if sc_logger is not None:
@@ -5733,3 +5733,4 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
