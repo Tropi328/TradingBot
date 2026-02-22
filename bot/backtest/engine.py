@@ -33,6 +33,21 @@ from bot.strategy.contracts import (
     StrategyOutcome,
     StrategyPlugin,
 )
+from bot.strategy.decision_core import (
+    BACKTEST_HARD_GATE_POLICY,
+    BACKTEST_SCORE_POLICY,
+    apply_orderflow_small_soft_gate as _apply_orderflow_small_soft_gate_core,
+    clamp_value as _clamp_core,
+    compute_v2_score_core,
+    default_observe_evaluation as _default_observe_evaluation_core,
+    evaluate_hard_gates_core,
+    normalize_action_fixed_threshold,
+    orderflow_param as _orderflow_param_core,
+    pick_best_candidate as _pick_best_candidate_core,
+    quality_gate_reasons_core,
+    resolve_orderflow_mode as _resolve_orderflow_mode_core,
+    risk_multiplier_for as _risk_multiplier_for_core,
+)
 from bot.strategy.indicators import atr
 from bot.strategy.index_existing import IndexExistingStrategy
 from bot.strategy.risk_budget import PortfolioRiskBudget
@@ -637,13 +652,7 @@ def _trade_r_multiple(
 
 
 def _default_observe_evaluation(*, symbol: str, reason: str) -> StrategyEvaluation:
-    return StrategyEvaluation(
-        action=DecisionAction.OBSERVE,
-        score_total=0.0,
-        reasons_blocking=[reason],
-        would_enter_if=["VALID_CANDIDATE"],
-        snapshot={"symbol": symbol},
-    )
+    return _default_observe_evaluation_core(symbol=symbol, reason=reason)
 
 
 def _pick_best_candidate(
@@ -653,20 +662,12 @@ def _pick_best_candidate(
     candidates: list[SetupCandidate],
     data: StrategyDataBundle,
 ) -> tuple[SetupCandidate | None, StrategyEvaluation]:
-    if not candidates:
-        return None, _default_observe_evaluation(symbol=symbol, reason="NO_CANDIDATE")
-    best_candidate = candidates[0]
-    best_eval = strategy.evaluate_candidate(symbol, best_candidate, data)
-    for candidate in candidates[1:]:
-        current = strategy.evaluate_candidate(symbol, candidate, data)
-        current_score = current.score_total if current.score_total is not None else -1.0
-        best_score = best_eval.score_total if best_eval.score_total is not None else -1.0
-        if current.action == DecisionAction.TRADE and best_eval.action != DecisionAction.TRADE:
-            best_candidate, best_eval = candidate, current
-            continue
-        if current.action == best_eval.action and current_score > best_score:
-            best_candidate, best_eval = candidate, current
-    return best_candidate, best_eval
+    return _pick_best_candidate_core(
+        strategy=strategy,
+        symbol=symbol,
+        candidates=candidates,
+        data=data,
+    )
 
 
 def _normalize_action_for_score(
@@ -677,29 +678,17 @@ def _normalize_action_for_score(
     small_min: float | None = None,
     small_max: float | None = None,
 ) -> StrategyEvaluation:
-    if evaluation.score_total is None:
-        return evaluation
-    if evaluation.reasons_blocking:
-        evaluation.action = DecisionAction.OBSERVE
-        return evaluation
-    if trade_threshold is None or small_min is None or small_max is None:
-        trade_threshold = float(config.decision_policy.trade_score_threshold)
-        small_min = float(config.decision_policy.small_score_min)
-        small_max = float(config.decision_policy.small_score_max)
-    score = float(evaluation.score_total)
-    if score >= trade_threshold:
-        evaluation.action = DecisionAction.TRADE
-    elif small_min <= score <= small_max:
-        evaluation.action = DecisionAction.SMALL
-    else:
-        evaluation.action = DecisionAction.OBSERVE
-        if "SCORE_BELOW_MIN" not in evaluation.reasons_blocking:
-            evaluation.reasons_blocking.append("SCORE_BELOW_MIN")
-    return evaluation
+    return normalize_action_fixed_threshold(
+        evaluation=evaluation,
+        config=config,
+        trade_threshold=trade_threshold,
+        small_min=small_min,
+        small_max=small_max,
+    )
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
-    return max(min_value, min(max_value, value))
+    return _clamp_core(value, min_value, max_value)
 
 
 def _quantile_from_sorted(values: list[float], q: float) -> float:
@@ -881,15 +870,12 @@ def _apply_overnight_swap_if_due(
 
 
 def _resolve_orderflow_mode(*, symbol: str, route_params: dict[str, object], default_mode: str, full_symbols: set[str]) -> str:
-    params = route_params.get("orderflow")
-    if isinstance(params, dict):
-        mode = str(params.get("mode", "")).strip().upper()
-        if mode in {"LITE", "FULL"}:
-            return mode
-    if symbol.strip().upper() in full_symbols:
-        return "FULL"
-    mode = default_mode.strip().upper()
-    return mode if mode in {"LITE", "FULL"} else "LITE"
+    return _resolve_orderflow_mode_core(
+        symbol=symbol,
+        route_params=route_params,
+        default_mode=default_mode,
+        full_symbols=full_symbols,
+    )
 
 
 def _orderflow_param(
@@ -899,19 +885,12 @@ def _orderflow_param(
     key: str,
     default: float,
 ) -> float:
-    params = route_params.get("orderflow")
-    if isinstance(params, dict):
-        try:
-            if key in params:
-                return float(params[key])
-        except (TypeError, ValueError):
-            pass
-    if settings is not None and key in settings:
-        try:
-            return float(settings[key])
-        except (TypeError, ValueError):
-            return default
-    return default
+    return _orderflow_param_core(
+        route_params=route_params,
+        settings=settings,
+        key=key,
+        default=default,
+    )
 
 
 def _soft_reason_penalty_map(
@@ -1042,8 +1021,6 @@ def _adjust_thresholds_dynamic(
     return trade_threshold, small_min, small_max, reasons
 
 
-# TODO(dedup): _compute_v2_score is duplicated in main.py with minor drift;
-#   consider merging into bot.strategy.scoring once signatures stabilise.
 def _compute_v2_score(
     *,
     strategy_name: str,
@@ -1057,186 +1034,21 @@ def _compute_v2_score(
     setup_side: str | None = None,
     orderflow_settings: dict[str, float] | None = None,
 ) -> StrategyEvaluation:
-    raw = dict(evaluation.score_breakdown)
-    evaluation.metadata["raw_score_breakdown"] = raw
-
-    bias_raw = float(max(raw.get("bias", 0.0), raw.get("trend_strength", 0.0), raw.get("breakout_quality", 0.0)))
-    sweep_raw = float(max(raw.get("sweep", 0.0), raw.get("liquidity_setup", 0.0), raw.get("retest_quality", 0.0)))
-    mss_raw = float(max(raw.get("mss", 0.0), raw.get("confirmation_strength", 0.0), raw.get("trigger_quality", 0.0)))
-    displacement_raw = float(max(raw.get("displacement", 0.0), raw.get("trigger_quality", 0.0), raw.get("confirmation_strength", 0.0)))
-    fvg_raw = float(max(raw.get("fvg", 0.0), raw.get("mitigation_quality", 0.0), raw.get("retest_quality", 0.0)))
-
-    bias_regime = _clamp((bias_raw / 20.0) * 15.0, 0.0, 15.0)
-    location_score = 10.0
-    pd_eq = evaluation.metadata.get("h1_pd_eq", evaluation.snapshot.get("h1_pd_eq"))
-    h1_close = evaluation.metadata.get("h1_close", evaluation.snapshot.get("h1_close"))
-    side = str(setup_side or evaluation.metadata.get("side", "")).upper()
-    if pd_eq is not None and h1_close is not None and side in {"LONG", "SHORT"}:
-        try:
-            eq_float = float(pd_eq)
-            close_float = float(h1_close)
-            if side == "LONG":
-                location_score = 15.0 if close_float < eq_float else 6.0
-            else:
-                location_score = 15.0 if close_float > eq_float else 6.0
-        except (TypeError, ValueError):
-            location_score = 10.0
-    if strategy_name == "INDEX_EXISTING":
-        location_score = 12.0 if not evaluation.reasons_blocking else 6.0
-    liquidity_score = _clamp((sweep_raw / 20.0) * 15.0, 0.0, 15.0)
-    edge_score = _clamp(bias_regime + location_score + liquidity_score, 0.0, 45.0)
-
-    mitigation_quality = _clamp((fvg_raw / 15.0) * 15.0, 0.0, 15.0)
-    trigger_confirmations = int(evaluation.metadata.get("trigger_confirmations", 0))
-    reaction_confirmed = _clamp((trigger_confirmations / 3.0) * 15.0, 0.0, 15.0)
-    trigger_clean = _clamp(((mss_raw / 20.0) * 5.0) + ((displacement_raw / 20.0) * 5.0), 0.0, 10.0)
-    trigger_score = _clamp(mitigation_quality + reaction_confirmed + trigger_clean, 0.0, 40.0)
-
-    atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-    spread_value = evaluation.snapshot.get("spread", evaluation.metadata.get("spread"))
-    spread_mode = str(evaluation.metadata.get("spread_mode", "REAL_BIDASK")).upper()
-    spread_ratio = None
-    if atr_value is not None and spread_value is not None:
-        try:
-            atr_float = float(atr_value)
-            spread_float = float(spread_value)
-            if atr_float > 0:
-                spread_ratio = spread_float / atr_float
-        except (TypeError, ValueError):
-            spread_ratio = None
-    max_spread_ratio = 0.15
-    gates_cfg = route_params.get("quality_gates")
-    if isinstance(gates_cfg, dict):
-        max_spread_ratio = float(gates_cfg.get("spread_ratio_max", 0.15))
-    if spread_ratio is None:
-        spread_ratio_score = 3.0
-        slippage_risk_score = 2.0
-    elif spread_ratio <= max_spread_ratio:
-        spread_ratio_score = 8.0
-        slippage_risk_score = 4.0
-    elif spread_ratio <= max_spread_ratio * 1.25:
-        spread_ratio_score = 4.0
-        slippage_risk_score = 2.0
-    else:
-        spread_ratio_score = 0.0
-        slippage_risk_score = 0.0
-    market_state_score = 3.0 if schedule_open else 0.0
-    execution_score = _clamp(spread_ratio_score + slippage_risk_score + market_state_score, 0.0, 15.0)
-
-    of_trigger_bonus = 0.0
-    of_execution_bonus = 0.0
-    of_divergence_penalty = 0.0
-    if orderflow_snapshot is not None:
-        of_dict = orderflow_snapshot.to_dict()
-        evaluation.metadata["orderflow_snapshot"] = of_dict
-        evaluation.snapshot["orderflow"] = of_dict
-
-        confidence = float(orderflow_snapshot.confidence)
-        chop_score = float(orderflow_snapshot.metrics.chop_score)
-        of_spread_ratio = float(orderflow_snapshot.metrics.spread_ratio)
-        of_pressure = float(orderflow_snapshot.pressure)
-        of_direction = str(orderflow_snapshot.direction).upper()
-
-        trigger_bonus_cap = _orderflow_param(
-            route_params=route_params,
-            settings=orderflow_settings,
-            key="trigger_bonus_max",
-            default=10.0,
-        )
-        execution_bonus_cap = _orderflow_param(
-            route_params=route_params,
-            settings=orderflow_settings,
-            key="execution_bonus_max",
-            default=5.0,
-        )
-        divergence_penalty_min = _orderflow_param(
-            route_params=route_params,
-            settings=orderflow_settings,
-            key="divergence_penalty_min",
-            default=6.0,
-        )
-        divergence_penalty_max = _orderflow_param(
-            route_params=route_params,
-            settings=orderflow_settings,
-            key="divergence_penalty_max",
-            default=10.0,
-        )
-        if divergence_penalty_min > divergence_penalty_max:
-            divergence_penalty_min, divergence_penalty_max = divergence_penalty_max, divergence_penalty_min
-
-        flow_alignment = _clamp(abs(of_pressure), 0.0, 1.0)
-        of_trigger_bonus = _clamp(
-            confidence * (1.0 - chop_score) * (0.5 + (0.5 * flow_alignment)) * trigger_bonus_cap,
-            0.0,
-            trigger_bonus_cap,
-        )
-        execution_quality = _clamp(1.0 - (of_spread_ratio / max(max_spread_ratio, 1e-9)), 0.0, 1.0)
-        of_execution_bonus = _clamp(confidence * execution_quality * execution_bonus_cap, 0.0, execution_bonus_cap)
-
-        if side in {"LONG", "SHORT"} and of_direction in {"LONG", "SHORT"} and of_direction != side:
-            of_divergence_penalty = _clamp(
-                divergence_penalty_min + ((divergence_penalty_max - divergence_penalty_min) * flow_alignment),
-                divergence_penalty_min,
-                divergence_penalty_max,
-            )
-
-    penalties: dict[str, float] = {}
-    if bias.direction == "NEUTRAL":
-        penalties["NEUTRAL_BIAS"] = 5.0
-    if bool(evaluation.metadata.get("near_adr_exhausted")):
-        penalties["NEAR_ADR_EXHAUSTED"] = 6.0
-    if bool(evaluation.metadata.get("news_medium_window")):
-        penalties["NEWS_MEDIUM_WINDOW"] = 8.0
-    if bool(evaluation.metadata.get("correlation_exposure")):
-        penalties["CORRELATION_EXPOSURE"] = 6.0
-    if bool(evaluation.metadata.get("late_retest")):
-        penalties["LATE_RETEST"] = 5.0
-    if news_blocked:
-        penalties["NEWS_MEDIUM_WINDOW"] = max(penalties.get("NEWS_MEDIUM_WINDOW", 0.0), 8.0)
-    if of_divergence_penalty > 0:
-        penalties["OF_DIVERGENCE"] = max(penalties.get("OF_DIVERGENCE", 0.0), of_divergence_penalty)
-    if spread_mode == "ASSUMED_OHLC" and spread_ratio is not None and spread_ratio > max_spread_ratio:
-        soft_penalty = float(config.backtest_tuning.ohlc_only_spread_soft_penalty)
-        penalties["ASSUMED_OHLC_SPREAD"] = max(penalties.get("ASSUMED_OHLC_SPREAD", 0.0), soft_penalty)
-        evaluation.metadata["spread_gate_soft_penalty_applied"] = True
-        soft_reasons = evaluation.metadata.get("soft_reasons")
-        if not isinstance(soft_reasons, list):
-            soft_reasons = []
-        if "ASSUMED_OHLC_SPREAD" not in soft_reasons:
-            soft_reasons.append("ASSUMED_OHLC_SPREAD")
-        evaluation.metadata["soft_reasons"] = soft_reasons
-    for key, value in raw.items():
-        if key.startswith("penalty_") and value < 0:
-            mapped_key = key.replace("penalty_", "").upper()
-            penalties[mapped_key] = max(penalties.get(mapped_key, 0.0), abs(float(value)))
-
-    penalty_total = sum(penalties.values())
-    score_pre_penalty = edge_score + trigger_score + execution_score + of_trigger_bonus + of_execution_bonus
-    score_total = _clamp(score_pre_penalty - penalty_total, 0.0, 100.0)
-
-    evaluation.score_layers = {
-        "edge": round(edge_score, 2),
-        "trigger": round(trigger_score, 2),
-        "execution": round(execution_score, 2),
-        "orderflow": round(of_trigger_bonus + of_execution_bonus, 2),
-    }
-    evaluation.penalties = {key: round(value, 2) for key, value in penalties.items()}
-    evaluation.score_total = round(score_total, 2)
-    evaluation.score_breakdown = {
-        "edge_total": round(edge_score, 2),
-        "trigger_total": round(trigger_score, 2),
-        "execution_total": round(execution_score, 2),
-        "penalty_total": round(penalty_total, 2),
-        "score_pre_penalty": round(score_pre_penalty, 2),
-        "score_total": round(score_total, 2),
-    }
-    if spread_ratio is not None:
-        evaluation.metadata["spread_ratio"] = spread_ratio
-    return evaluation
+    return compute_v2_score_core(
+        strategy_name=strategy_name,
+        bias=bias,
+        route_params=route_params,
+        evaluation=evaluation,
+        news_blocked=news_blocked,
+        schedule_open=schedule_open,
+        policy=BACKTEST_SCORE_POLICY,
+        config=config,
+        orderflow_snapshot=orderflow_snapshot,
+        setup_side=setup_side,
+        orderflow_settings=orderflow_settings,
+    )
 
 
-# TODO(dedup): _evaluate_hard_gates is duplicated in main.py with minor drift;
-#   consider merging into bot.strategy.gating once signatures stabilise.
 def _evaluate_hard_gates(
     *,
     route_params: dict[str, object],
@@ -1244,161 +1056,14 @@ def _evaluate_hard_gates(
     now: datetime,
     timezone_name: str,
 ) -> tuple[dict[str, bool], list[str]]:
-    gates = {
-        "ExecutionGate": True,
-        "ScheduleGate": True,
-        "ReactionGate": True,
-        "RiskGate": True,
-    }
-    reasons: list[str] = []
-
-    schedule_cfg = route_params.get("schedule")
-    schedule_open = True
-    if isinstance(schedule_cfg, dict):
-        schedule_open = is_schedule_open(now, schedule_cfg, timezone_name)
-    if not schedule_open:
-        gates["ScheduleGate"] = False
-        reasons.append("EXEC_FAIL_MARKET_CLOSED")
-
-    gates_cfg = route_params.get("quality_gates")
-    if isinstance(gates_cfg, dict):
-        max_spread_ratio = float(gates_cfg.get("spread_ratio_max", 0.15))
-        try:
-            min_confirm = max(0, int(gates_cfg.get("min_confirm", 0)))
-        except (TypeError, ValueError):
-            min_confirm = 0
-        try:
-            min_confirm_trade = max(0, int(gates_cfg.get("min_confirm_trade", min_confirm)))
-        except (TypeError, ValueError):
-            min_confirm_trade = min_confirm
-        try:
-            min_confirm_small = max(0, int(gates_cfg.get("min_confirm_small", max(0, min_confirm_trade - 1))))
-        except (TypeError, ValueError):
-            min_confirm_small = max(0, min_confirm_trade - 1)
-        if min_confirm_small > min_confirm_trade:
-            min_confirm_small = min_confirm_trade
-    else:
-        max_spread_ratio = 0.15
-        min_confirm = 0
-        min_confirm_trade = 0
-        min_confirm_small = 0
-    spread_ratio = evaluation.metadata.get("spread_ratio")
-    atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-    spread_value = evaluation.snapshot.get("spread", evaluation.metadata.get("spread"))
-    spread_mode = str(evaluation.metadata.get("spread_mode", "REAL_BIDASK")).upper()
-    missing_features: list[str] = []
-    if spread_value is None:
-        quote = evaluation.metadata.get("quote")
-        if isinstance(quote, tuple) and len(quote) >= 3:
-            spread_value = quote[2]
-    close_value = evaluation.snapshot.get("close", evaluation.metadata.get("close"))
-    if atr_value is None:
-        gates["ExecutionGate"] = False
-        reasons.append("EXEC_FAIL_MISSING_FEATURES")
-        missing_features.append("atr_m5")
-    else:
-        try:
-            if float(atr_value) <= 0:
-                gates["ExecutionGate"] = False
-                reasons.append("EXEC_FAIL_INVALID_ATR")
-                missing_features.append("atr_m5")
-        except (TypeError, ValueError):
-            gates["ExecutionGate"] = False
-            reasons.append("EXEC_FAIL_INVALID_ATR")
-            missing_features.append("atr_m5")
-    if spread_ratio is None:
-        if atr_value is not None and spread_value is not None:
-            try:
-                atr_float = float(atr_value)
-                spread_float = float(spread_value)
-                if atr_float > 0:
-                    spread_ratio = spread_float / atr_float
-                    evaluation.metadata["spread_ratio"] = spread_ratio
-            except (TypeError, ValueError):
-                spread_ratio = None
-    if spread_ratio is None:
-        if spread_value is None and close_value is not None:
-            # No BID/ASK spread available: keep pipeline alive for mid-only data.
-            spread_ratio = 0.0
-            evaluation.metadata["spread_ratio"] = spread_ratio
-        elif spread_value is None:
-            gates["ExecutionGate"] = False
-            reasons.append("EXEC_FAIL_NO_PRICE")
-        elif atr_value is not None and (isinstance(atr_value, (float, int)) and float(atr_value) > 0):
-            gates["ExecutionGate"] = False
-            reasons.append("EXEC_FAIL_MISSING_FEATURES")
-            missing_features.append("spread_or_spread_ratio")
-    elif float(spread_ratio) > max_spread_ratio:
-        if spread_mode == "ASSUMED_OHLC":
-            evaluation.metadata["spread_gate_ohlc_hard_skipped"] = True
-            soft_reasons = evaluation.metadata.get("soft_reasons")
-            if not isinstance(soft_reasons, list):
-                soft_reasons = []
-            if "ASSUMED_OHLC_SPREAD" not in soft_reasons:
-                soft_reasons.append("ASSUMED_OHLC_SPREAD")
-            evaluation.metadata["soft_reasons"] = soft_reasons
-        else:
-            gates["ExecutionGate"] = False
-            reasons.append("EXEC_FAIL_SPREAD_TOO_HIGH")
-
-    has_candidate = (
-        evaluation.metadata.get("candidate_id") is not None
-        or evaluation.metadata.get("setup_id") is not None
+    result = evaluate_hard_gates_core(
+        route_params=route_params,
+        evaluation=evaluation,
+        now=now,
+        timezone_name=timezone_name,
+        policy=BACKTEST_HARD_GATE_POLICY,
     )
-    required_confirm = 0
-    if has_candidate:
-        if evaluation.action == DecisionAction.TRADE:
-            required_confirm = min_confirm_trade
-        elif evaluation.action == DecisionAction.SMALL:
-            required_confirm = min_confirm_small
-    if required_confirm > 0 and has_candidate:
-        trigger_raw = evaluation.metadata.get("trigger_confirmations", evaluation.snapshot.get("trigger_confirmations"))
-        if trigger_raw is None:
-            missing_features.append("trigger_confirmations")
-            gates["ExecutionGate"] = False
-            reasons.append("EXEC_FAIL_MISSING_FEATURES")
-        else:
-            try:
-                trigger_int = int(trigger_raw)
-            except (TypeError, ValueError):
-                trigger_int = -1
-            if trigger_int < required_confirm:
-                can_downgrade_to_small = (
-                    evaluation.action == DecisionAction.TRADE
-                    and min_confirm_small > 0
-                    and trigger_int >= min_confirm_small
-                )
-                if can_downgrade_to_small:
-                    evaluation.action = DecisionAction.SMALL
-                    evaluation.metadata["confirmations_downgrade"] = {
-                        "from": "TRADE",
-                        "to": "SMALL",
-                        "trigger_confirmations": trigger_int,
-                        "required_trade": min_confirm_trade,
-                        "required_small": min_confirm_small,
-                    }
-                    soft_reasons = evaluation.metadata.get("soft_reasons")
-                    if not isinstance(soft_reasons, list):
-                        soft_reasons = []
-                    if "CONFIRMATIONS_DOWNGRADE_SMALL" not in soft_reasons:
-                        soft_reasons.append("CONFIRMATIONS_DOWNGRADE_SMALL")
-                    evaluation.metadata["soft_reasons"] = soft_reasons
-                else:
-                    gates["ExecutionGate"] = False
-                    reasons.append("EXEC_FAIL_CONFIRMATIONS_LOW")
-
-    if close_value is None:
-        missing_features.append("close")
-    if missing_features:
-        evaluation.metadata["missing_features"] = list(dict.fromkeys(missing_features))
-
-    evaluation.gates = gates
-    if reasons:
-        for key, value in gates.items():
-            if not value:
-                evaluation.gate_blocked = key
-                break
-    return gates, reasons
+    return result.gates, result.reasons
 
 
 def _quality_gate_reasons(
@@ -1408,13 +1073,13 @@ def _quality_gate_reasons(
     now: datetime,
     timezone_name: str,
 ) -> list[str]:
-    _, reasons = _evaluate_hard_gates(
+    return quality_gate_reasons_core(
         route_params=route_params,
         evaluation=evaluation,
         now=now,
         timezone_name=timezone_name,
+        policy=BACKTEST_HARD_GATE_POLICY,
     )
-    return reasons
 
 
 def _missing_execution_features(
@@ -1919,47 +1584,11 @@ def _apply_orderflow_small_soft_gate(
     evaluation: StrategyEvaluation,
     orderflow_settings: dict[str, float] | None,
 ) -> StrategyEvaluation:
-    if evaluation.action != DecisionAction.SMALL:
-        return evaluation
-    snapshot_raw = evaluation.metadata.get("orderflow_snapshot")
-    if not isinstance(snapshot_raw, dict):
-        return evaluation
-    metrics = snapshot_raw.get("metrics")
-    if not isinstance(metrics, dict):
-        return evaluation
-
-    try:
-        confidence = float(snapshot_raw.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    try:
-        chop_score = float(metrics.get("chop_score", 0.0))
-    except (TypeError, ValueError):
-        chop_score = 0.0
-
-    conf_threshold = _orderflow_param(
+    return _apply_orderflow_small_soft_gate_core(
         route_params=route_params,
-        settings=orderflow_settings,
-        key="small_soft_gate_confidence",
-        default=0.75,
+        evaluation=evaluation,
+        orderflow_settings=orderflow_settings,
     )
-    chop_threshold = _orderflow_param(
-        route_params=route_params,
-        settings=orderflow_settings,
-        key="small_soft_gate_chop",
-        default=0.75,
-    )
-    if confidence >= conf_threshold and chop_score >= chop_threshold:
-        evaluation.action = DecisionAction.OBSERVE
-        if "OF_SOFT_GATE_CHOP" not in evaluation.reasons_blocking:
-            evaluation.reasons_blocking.append("OF_SOFT_GATE_CHOP")
-        if "ORDERFLOW_CHOP_CLEARED" not in evaluation.would_enter_if:
-            evaluation.would_enter_if.append("ORDERFLOW_CHOP_CLEARED")
-        evaluation.gates.setdefault("OrderflowSoftGate", True)
-        evaluation.gates["OrderflowSoftGate"] = False
-        if evaluation.gate_blocked is None:
-            evaluation.gate_blocked = "OrderflowSoftGate"
-    return evaluation
 
 
 def _risk_multiplier_for(
@@ -1968,14 +1597,11 @@ def _risk_multiplier_for(
     route_risk: dict[str, object],
     config: AppConfig,
 ) -> float:
-    signal_override = evaluation.metadata.get("risk_multiplier_override")
-    if signal_override is not None:
-        return max(0.01, min(1.0, float(signal_override)))
-    if evaluation.action == DecisionAction.SMALL:
-        value = float(route_risk.get("small_risk_multiplier", config.decision_policy.small_risk_multiplier_default))
-        return max(0.01, min(1.0, value))
-    value = float(route_risk.get("trade_risk_multiplier", config.decision_policy.trade_risk_multiplier))
-    return max(0.01, min(1.0, value))
+    return _risk_multiplier_for_core(
+        evaluation=evaluation,
+        route_risk=route_risk,
+        config=config,
+    )
 
 
 def _append_live_placeholder(candles: list[Candle], timeframe_minutes: int) -> list[Candle]:
