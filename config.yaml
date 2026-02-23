@@ -110,6 +110,8 @@ daily_gate:
   pre_minutes: 30
   post_minutes: 30
   allowed_strategies: []
+capital_ramp:
+  enabled: false
 research:
   objective_mode: "pnl_dd_cap"
   dd_cap_pct: 25.0

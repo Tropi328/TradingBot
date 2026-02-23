@@ -1,0 +1,29 @@
+timezone: Europe/Warsaw
+account_currency: PLN
+fx_conversion_fee_rate: 0.007
+fx_fee_mode: all_in_rate
+fx_rate_source: static
+fx_static_rates:
+  USDPLN: 4.0
+  EURPLN: 4.3
+  EURUSD: 1.08
+fx_apply_to:
+  - pnl
+  - swap
+  - commission
+reporting_currency: account
+
+market_hours:
+  default_profile: WEEKDAYS
+  symbol_profiles:
+    BTCUSD: ALWAYS
+
+risk:
+  equity: 100
+
+capital_ramp:
+  enabled: true
+
+monte_carlo:
+  live_window:
+    open_on_start: false

@@ -175,6 +175,28 @@ Reference commands:
 - SAFE baseline:
   `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_SAFE_BASE.yaml --no-dashboard --no-mc-viewer`
 
+## Capital Ramp 100 -> 1200 PLN
+Feature is config-only (`capital_ramp.enabled: true`) and works in live/paper/backtest without changing signal logic.
+
+Policy (fixed in code):
+- start equity: `100 PLN`
+- monthly topup: `+100 PLN`
+- first topup: first day of next month
+- topups stop when:
+  - model equity reaches `1200 PLN`, or
+  - after `31 Dec` of start year
+- model equity basis: realized closed PnL only
+- backtest multi-year: topups only in first campaign year
+
+Required:
+- `account_currency: PLN` when enabled
+
+Starter variant:
+- `configs/variants/config.variant_LIVE_CAPITAL_RAMP_100PLN.yaml`
+
+Backtest example:
+- `python main.py --backtest --backtest-symbols XAUUSD --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_LIVE_CAPITAL_RAMP_100PLN.yaml --no-dashboard --no-mc-viewer`
+
 ## Currency conversion fee (all-in rate, 0.7%)
 Backtest/paper now support explicit account currency conversion with Capital.com-style fee embedded in the FX rate.
 

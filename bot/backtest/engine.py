@@ -10,6 +10,14 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from bot.capital_ramp import (
+    EVENT_STOP_TARGET,
+    EVENT_STOP_YEAR_END,
+    EVENT_TOPUP,
+    START_EQUITY_PLN,
+    CapitalRampEvent,
+    CapitalRampRuntime,
+)
 from bot.config import AppConfig, AssetConfig
 from bot.data.candles import Candle
 from bot.diagnostics.decision_trace import DecisionTraceWriter
@@ -177,6 +185,11 @@ class BacktestReport:
     decision_funnel: dict[str, Any] = field(default_factory=dict)
     score_v3_summary: dict[str, Any] = field(default_factory=dict)
     shadow_summary: dict[str, Any] = field(default_factory=dict)
+    capital_ramp_enabled: bool = False
+    capital_ramp_topups_total: float = 0.0
+    capital_ramp_topups_count: int = 0
+    capital_ramp_stopped_reason: str | None = None
+    capital_ramp_events: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -246,6 +259,11 @@ class BacktestReport:
             "decision_funnel": self.decision_funnel,
             "score_v3_summary": self.score_v3_summary,
             "shadow_summary": self.shadow_summary,
+            "capital_ramp_enabled": self.capital_ramp_enabled,
+            "capital_ramp_topups_total": self.capital_ramp_topups_total,
+            "capital_ramp_topups_count": self.capital_ramp_topups_count,
+            "capital_ramp_stopped_reason": self.capital_ramp_stopped_reason,
+            "capital_ramp_events": self.capital_ramp_events,
         }
 
 
@@ -1912,6 +1930,33 @@ def _gate_counts_from_blockers(blockers: Counter[str]) -> dict[str, int]:
     }
 
 
+def _capital_ramp_event_to_dict(event: CapitalRampEvent) -> dict[str, Any]:
+    return {
+        "event_type": str(event.event_type),
+        "event_ts_utc": event.event_ts_utc.astimezone(timezone.utc).isoformat(),
+        "local_date": event.local_date.isoformat(),
+        "amount": float(event.amount),
+        "model_equity": float(event.model_equity),
+        "payload": dict(event.payload or {}),
+    }
+
+
+def _capital_ramp_summary(
+    runtime: CapitalRampRuntime | None,
+    events: list[CapitalRampEvent],
+) -> tuple[bool, float, int, str | None, list[dict[str, Any]]]:
+    if runtime is None:
+        return False, 0.0, 0, None, []
+    state = runtime.state
+    return (
+        True,
+        float(state.topups_total),
+        int(state.topups_count),
+        state.stopped_reason,
+        [_capital_ramp_event_to_dict(item) for item in events],
+    )
+
+
 def _merge_wait_metrics(reports: list[BacktestReport]) -> dict[str, float]:
     keys: set[str] = set()
     for report in reports:
@@ -1950,6 +1995,7 @@ def aggregate_backtest_reports(
             account_currency=str(config.account_currency).upper(),
             instrument_currency=str(asset.instrument_currency or asset.currency).upper(),
             fx_conversion_fee_rate_used=float(config.fx_conversion_fee_rate),
+            capital_ramp_enabled=bool(config.capital_ramp.enabled),
         )
 
     all_trades = sorted(
@@ -1967,7 +2013,10 @@ def aggregate_backtest_reports(
     avg_win_r, avg_loss_r, payoff_r = _trade_r_quality_metrics(all_trades)
     exit_reason_distribution = _exit_reason_distribution(all_trades)
 
-    equity = float(config.risk.equity)
+    equity_start_for_agg = float(
+        START_EQUITY_PLN if any(bool(getattr(report, "capital_ramp_enabled", False)) for report in reports) else config.risk.equity
+    )
+    equity = equity_start_for_agg
     peak = equity
     max_drawdown = 0.0
     for trade in all_trades:
@@ -1978,7 +2027,7 @@ def aggregate_backtest_reports(
         if drawdown > max_drawdown:
             max_drawdown = drawdown
 
-    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(all_trades, float(config.risk.equity))
+    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(all_trades, equity_start_for_agg)
 
     decision_counts: Counter[str] = Counter()
     blockers: Counter[str] = Counter()
@@ -2016,6 +2065,11 @@ def aggregate_backtest_reports(
     account_currencies: Counter[str] = Counter()
     instrument_currencies: Counter[str] = Counter()
     fx_fee_rate_values: list[float] = []
+    capital_ramp_enabled = False
+    capital_ramp_topups_total = 0.0
+    capital_ramp_topups_count = 0
+    capital_ramp_stopped_reason: str | None = None
+    capital_ramp_events: list[dict[str, Any]] = []
     for report in reports:
         decision_counts.update(report.decision_counts)
         blockers.update(report.top_blockers)
@@ -2055,6 +2109,22 @@ def aggregate_backtest_reports(
         account_currencies.update([str(getattr(report, "account_currency", config.account_currency)).upper()])
         instrument_currencies.update([str(getattr(report, "instrument_currency", asset.instrument_currency or asset.currency)).upper()])
         fx_fee_rate_values.append(float(getattr(report, "fx_conversion_fee_rate_used", config.fx_conversion_fee_rate)))
+        if bool(getattr(report, "capital_ramp_enabled", False)):
+            capital_ramp_enabled = True
+        capital_ramp_topups_total = max(
+            capital_ramp_topups_total,
+            float(getattr(report, "capital_ramp_topups_total", 0.0) or 0.0),
+        )
+        capital_ramp_topups_count = max(
+            capital_ramp_topups_count,
+            int(getattr(report, "capital_ramp_topups_count", 0) or 0),
+        )
+        reason = getattr(report, "capital_ramp_stopped_reason", None)
+        if reason:
+            capital_ramp_stopped_reason = str(reason)
+        events = getattr(report, "capital_ramp_events", None)
+        if isinstance(events, list) and events:
+            capital_ramp_events.extend(events)
 
     _agg_spread = _spread_point_stats(spread_points_samples)
     return BacktestReport(
@@ -2130,6 +2200,11 @@ def aggregate_backtest_reports(
         forced_closes_count=forced_closes_count,
         min_size_overrides_count=min_size_overrides_count,
         margin_capped_count=margin_capped_count,
+        capital_ramp_enabled=capital_ramp_enabled,
+        capital_ramp_topups_total=capital_ramp_topups_total,
+        capital_ramp_topups_count=capital_ramp_topups_count,
+        capital_ramp_stopped_reason=capital_ramp_stopped_reason,
+        capital_ramp_events=capital_ramp_events,
     )
 
 
@@ -2251,11 +2326,30 @@ def run_backtest_multi_strategy(
         if dynamic_assumed_spread:
             assumed_spread_used = float(sum(dynamic_assumed_spread) / len(dynamic_assumed_spread))
 
-    equity = config.risk.equity
+    capital_ramp_runtime: CapitalRampRuntime | None = None
+    capital_ramp_events: list[CapitalRampEvent] = []
+    capital_ramp_closed_pnl = 0.0
+    if bool(config.capital_ramp.enabled):
+        if trade_start is not None:
+            ramp_start_ts = trade_start
+        elif candles_m5:
+            ramp_start_ts = candles_m5[0].timestamp
+        else:
+            ramp_start_ts = datetime.now(timezone.utc)
+        capital_ramp_runtime = CapitalRampRuntime.initialize(
+            scope=f"CAPITAL_RAMP:BACKTEST:{asset.epic}",
+            now_utc=ramp_start_ts,
+            timezone_name=config.timezone,
+            current_closed_pnl=0.0,
+        )
+        equity = float(START_EQUITY_PLN)
+    else:
+        equity = float(config.risk.equity)
     peak_equity = equity
     max_drawdown = 0.0
     _dd_halt_pct = float(config.backtest_tuning.max_drawdown_halt_pct)
     _dd_halt_abs = (equity * _dd_halt_pct / 100.0) if _dd_halt_pct > 0 else 0.0
+    equity_start_value = float(equity)
     _dd_halted = False
     trades: list[BacktestTrade] = []
     pending: _PendingOrder | None = None
@@ -2344,6 +2438,46 @@ def run_backtest_multi_strategy(
             _shadow_path = Path(v3_dc.shadow_output_path)
             shadow_observer = ShadowObserver(_shadow_path)
 
+    def _capture_capital_ramp_event(event: CapitalRampEvent | None) -> None:
+        if event is not None:
+            capital_ramp_events.append(event)
+
+    def _refresh_capital_ramp_for_timestamp(ts: datetime) -> None:
+        nonlocal equity
+        if capital_ramp_runtime is None:
+            return
+        topup_event, stop_event = capital_ramp_runtime.maybe_apply_topup(
+            now_utc=ts,
+            current_closed_pnl=capital_ramp_closed_pnl,
+        )
+        _capture_capital_ramp_event(topup_event)
+        _capture_capital_ramp_event(stop_event)
+        equity = float(
+            capital_ramp_runtime.effective_equity(
+                now_utc=ts,
+                current_closed_pnl=capital_ramp_closed_pnl,
+            )
+        )
+
+    def _apply_closed_pnl(pnl_delta: float, ts: datetime) -> None:
+        nonlocal equity, capital_ramp_closed_pnl
+        equity += float(pnl_delta)
+        if capital_ramp_runtime is None:
+            return
+        capital_ramp_closed_pnl += float(pnl_delta)
+        topup_event, stop_event = capital_ramp_runtime.maybe_apply_topup(
+            now_utc=ts,
+            current_closed_pnl=capital_ramp_closed_pnl,
+        )
+        _capture_capital_ramp_event(topup_event)
+        _capture_capital_ramp_event(stop_event)
+        equity = float(
+            capital_ramp_runtime.effective_equity(
+                now_utc=ts,
+                current_closed_pnl=capital_ramp_closed_pnl,
+            )
+        )
+
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
         if candle.bid is not None and candle.ask is not None:
@@ -2392,9 +2526,13 @@ def run_backtest_multi_strategy(
     slice_m5_live = _append_live_placeholder(candles_m5[: start_idx + 1], 5)
     slice_m15_live: list[Candle] = []
     slice_h1_live: list[Candle] = []
+    if capital_ramp_runtime is not None:
+        for _pre in candles_m5[: min(start_idx, len(candles_m5))]:
+            _refresh_capital_ramp_for_timestamp(_pre.timestamp)
 
     for i in range(start_idx, len(candles_m5)):
         candle = candles_m5[i]
+        _refresh_capital_ramp_for_timestamp(candle.timestamp)
         if i > start_idx:
             slice_m5_live[-1] = candle
             slice_m5_live.append(_live_placeholder_from(candle, 5))
@@ -2577,7 +2715,7 @@ def run_backtest_multi_strategy(
                         fx_cost=open_pos.fx_cost_total,
                     )
                     _eq_before = equity
-                    equity += _pnl_eq
+                    _apply_closed_pnl(_pnl_eq, candle.timestamp)
                     daily_pnl[day_key] += _pnl_eq
                     r_mult = _trade_r_multiple(
                         total_pnl=total_pnl,
@@ -2703,7 +2841,7 @@ def run_backtest_multi_strategy(
                     fx_cost=open_pos.fx_cost_total,
                 )
                 _eq_before = equity
-                equity += _pnl_eq
+                _apply_closed_pnl(_pnl_eq, candle.timestamp)
                 daily_pnl[day_key] += _pnl_eq
                 r_mult = _trade_r_multiple(
                     total_pnl=total_pnl,
@@ -3692,7 +3830,7 @@ def run_backtest_multi_strategy(
             fx_cost=open_pos.fx_cost_total,
         )
         _eq_before = equity
-        equity += _pnl_eq
+        _apply_closed_pnl(_pnl_eq, last_candle.timestamp)
         r_mult = _trade_r_multiple(
             total_pnl=total_pnl,
             position=open_pos,
@@ -3768,7 +3906,7 @@ def run_backtest_multi_strategy(
     swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
     fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
     avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
-    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(trades, float(config.risk.equity))
+    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(trades, equity_start_value)
 
     # ── ScoreV3 / shadow observer finalization ──
     _score_v3_summary: dict[str, Any] = {}
@@ -3791,6 +3929,14 @@ def run_backtest_multi_strategy(
         _shadow_summary = shadow_observer.summary()
         _shadow_out = Path(config.score_v3.shadow_output_path).with_suffix(".summary.json")
         shadow_observer.save_summary(_shadow_out)
+
+    (
+        capital_ramp_enabled,
+        capital_ramp_topups_total,
+        capital_ramp_topups_count,
+        capital_ramp_stopped_reason,
+        capital_ramp_events_payload,
+    ) = _capital_ramp_summary(capital_ramp_runtime, capital_ramp_events)
 
     return BacktestReport(
         epic=asset.epic,
@@ -3863,6 +4009,11 @@ def run_backtest_multi_strategy(
         margin_capped_count=margin_capped_count,
         score_v3_summary=_score_v3_summary,
         shadow_summary=_shadow_summary,
+        capital_ramp_enabled=capital_ramp_enabled,
+        capital_ramp_topups_total=capital_ramp_topups_total,
+        capital_ramp_topups_count=capital_ramp_topups_count,
+        capital_ramp_stopped_reason=capital_ramp_stopped_reason,
+        capital_ramp_events=capital_ramp_events_payload,
     )
 
 
@@ -3903,11 +4054,28 @@ def run_backtest(
         if dynamic_assumed_spread:
             assumed_spread_used = float(sum(dynamic_assumed_spread) / len(dynamic_assumed_spread))
 
-    equity = config.risk.equity
+    capital_ramp_runtime: CapitalRampRuntime | None = None
+    capital_ramp_events: list[CapitalRampEvent] = []
+    capital_ramp_closed_pnl = 0.0
+    if bool(config.capital_ramp.enabled):
+        if candles_m5:
+            ramp_start_ts = candles_m5[0].timestamp
+        else:
+            ramp_start_ts = datetime.now(timezone.utc)
+        capital_ramp_runtime = CapitalRampRuntime.initialize(
+            scope=f"CAPITAL_RAMP:BACKTEST:{asset.epic}",
+            now_utc=ramp_start_ts,
+            timezone_name=config.timezone,
+            current_closed_pnl=0.0,
+        )
+        equity = float(START_EQUITY_PLN)
+    else:
+        equity = float(config.risk.equity)
     peak_equity = equity
     max_drawdown = 0.0
     _dd_halt_pct = float(config.backtest_tuning.max_drawdown_halt_pct)
     _dd_halt_abs = (equity * _dd_halt_pct / 100.0) if _dd_halt_pct > 0 else 0.0
+    equity_start_value = float(equity)
     _dd_halted = False
     trades: list[BacktestTrade] = []
     pending_orders: list[_PendingOrder] = []
@@ -3955,6 +4123,46 @@ def run_backtest(
     funnel = DecisionFunnel()
     m15_ptr = -1
     h1_ptr = -1
+
+    def _capture_capital_ramp_event(event: CapitalRampEvent | None) -> None:
+        if event is not None:
+            capital_ramp_events.append(event)
+
+    def _refresh_capital_ramp_for_timestamp(ts: datetime) -> None:
+        nonlocal equity
+        if capital_ramp_runtime is None:
+            return
+        topup_event, stop_event = capital_ramp_runtime.maybe_apply_topup(
+            now_utc=ts,
+            current_closed_pnl=capital_ramp_closed_pnl,
+        )
+        _capture_capital_ramp_event(topup_event)
+        _capture_capital_ramp_event(stop_event)
+        equity = float(
+            capital_ramp_runtime.effective_equity(
+                now_utc=ts,
+                current_closed_pnl=capital_ramp_closed_pnl,
+            )
+        )
+
+    def _apply_closed_pnl(pnl_delta: float, ts: datetime) -> None:
+        nonlocal equity, capital_ramp_closed_pnl
+        equity += float(pnl_delta)
+        if capital_ramp_runtime is None:
+            return
+        capital_ramp_closed_pnl += float(pnl_delta)
+        topup_event, stop_event = capital_ramp_runtime.maybe_apply_topup(
+            now_utc=ts,
+            current_closed_pnl=capital_ramp_closed_pnl,
+        )
+        _capture_capital_ramp_event(topup_event)
+        _capture_capital_ramp_event(stop_event)
+        equity = float(
+            capital_ramp_runtime.effective_equity(
+                now_utc=ts,
+                current_closed_pnl=capital_ramp_closed_pnl,
+            )
+        )
 
     def _spread_for(index: int) -> float:
         candle = candles_m5[index]
@@ -4005,8 +4213,12 @@ def run_backtest(
     slice_m5: list[Candle] = list(candles_m5[:start_idx])
     slice_m15: list[Candle] = []
     slice_h1: list[Candle] = []
+    if capital_ramp_runtime is not None:
+        for _pre in candles_m5[: min(start_idx, len(candles_m5))]:
+            _refresh_capital_ramp_for_timestamp(_pre.timestamp)
     for i in range(start_idx, len(candles_m5)):
         candle = candles_m5[i]
+        _refresh_capital_ramp_for_timestamp(candle.timestamp)
         spread_now = _spread_for(i)
         slippage_now = _slippage_for(i)
         spread_points_now = _spread_points_for(spread_now)
@@ -4146,7 +4358,7 @@ def run_backtest(
                         fx_cost=_pos.fx_cost_total,
                     )
                     _eq_before = equity
-                    equity += _pnl_eq
+                    _apply_closed_pnl(_pnl_eq, candle.timestamp)
                     daily_pnl[day_key] += _pnl_eq
                     if risk_budget_inst.enabled:
                         risk_budget_inst.record_trade_pnl(_pnl_eq)
@@ -4262,7 +4474,7 @@ def run_backtest(
                     fx_cost=_pos.fx_cost_total,
                 )
                 _eq_before = equity
-                equity += _pnl_eq
+                _apply_closed_pnl(_pnl_eq, candle.timestamp)
                 daily_pnl[day_key] += _pnl_eq
                 if risk_budget_inst.enabled:
                     risk_budget_inst.record_trade_pnl(_pnl_eq)
@@ -4573,7 +4785,14 @@ def run_backtest(
     swap_cost_sum = sum(float(trade.swap_cost) for trade in trades)
     fx_cost_sum = sum(float(trade.fx_cost) for trade in trades)
     avg_spread_points, median_spread_points, p90_spread_points = _spread_point_stats(spread_points_series)
-    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(trades, float(config.risk.equity))
+    expectancy_net, profit_factor_net, max_drawdown_net = _net_quality_metrics(trades, equity_start_value)
+    (
+        capital_ramp_enabled,
+        capital_ramp_topups_total,
+        capital_ramp_topups_count,
+        capital_ramp_stopped_reason,
+        capital_ramp_events_payload,
+    ) = _capital_ramp_summary(capital_ramp_runtime, capital_ramp_events)
 
     return BacktestReport(
         epic=asset.epic,
@@ -4629,6 +4848,11 @@ def run_backtest(
         forced_closes_count=forced_closes_count,
         min_size_overrides_count=min_size_overrides_count,
         margin_capped_count=margin_capped_count,
+        capital_ramp_enabled=capital_ramp_enabled,
+        capital_ramp_topups_total=capital_ramp_topups_total,
+        capital_ramp_topups_count=capital_ramp_topups_count,
+        capital_ramp_stopped_reason=capital_ramp_stopped_reason,
+        capital_ramp_events=capital_ramp_events_payload,
         decision_funnel=funnel.to_dict(
             total_pnl=total_pnl,
             expectancy=expectancy,

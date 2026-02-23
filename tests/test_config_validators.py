@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 from bot.config import (
+    AppConfig,
     CapitalConfig,
     IndicatorsConfig,
     InstrumentConfig,
@@ -204,3 +205,13 @@ class TestOpsConfigValidation:
     def test_rejects_invalid_backup_retention(self):
         with pytest.raises(ValueError, match="ops.backup_retention_days"):
             OpsConfig(backup_retention_days=-1)
+
+
+class TestCapitalRampValidation:
+    def test_capital_ramp_requires_pln_account_currency(self):
+        with pytest.raises(ValueError, match="account_currency=PLN"):
+            AppConfig(account_currency="USD", capital_ramp={"enabled": True})
+
+    def test_capital_ramp_accepts_pln_account_currency(self):
+        cfg = AppConfig(account_currency="PLN", capital_ramp={"enabled": True})
+        assert cfg.capital_ramp.enabled is True

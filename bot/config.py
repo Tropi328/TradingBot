@@ -361,6 +361,10 @@ class OpsConfig(BaseModel):
         return self
 
 
+class CapitalRampConfig(BaseModel):
+    enabled: bool = False
+
+
 class MarketHoursConfig(BaseModel):
     default_profile: str = "WEEKDAYS"
     symbol_profiles: dict[str, str] = Field(default_factory=dict)
@@ -1395,6 +1399,7 @@ class AppConfig(BaseModel):
     news_gate: NewsGateConfig = Field(default_factory=NewsGateConfig)
     daily_gate: DailyGateConfig = Field(default_factory=DailyGateConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    capital_ramp: CapitalRampConfig = Field(default_factory=CapitalRampConfig)
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     ops: OpsConfig = Field(default_factory=OpsConfig)
@@ -1429,6 +1434,8 @@ class AppConfig(BaseModel):
     @model_validator(mode="after")
     def normalize_assets(self) -> "AppConfig":
         self.account_currency = str(self.account_currency or "USD").strip().upper() or "USD"
+        if bool(self.capital_ramp.enabled) and self.account_currency != "PLN":
+            raise ValueError("capital_ramp.enabled requires account_currency=PLN")
         self.fx_fee_mode = str(self.fx_fee_mode or "all_in_rate").strip().lower()
         if self.fx_fee_mode not in {"all_in_rate"}:
             raise ValueError("fx_fee_mode must be all_in_rate")

@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
+from bot.capital_ramp import CapitalRampEvent, CapitalRampState
 from bot.storage.models import (
     DailyStats,
     OrderRecord,
@@ -26,6 +27,18 @@ def _from_iso(value: str | None) -> datetime | None:
     if value is None:
         return None
     return datetime.fromisoformat(value)
+
+
+def _to_iso_date(value: date | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat()
+
+
+def _from_iso_date(value: str | None) -> date | None:
+    if value is None:
+        return None
+    return date.fromisoformat(value)
 
 
 class Journal:
@@ -313,6 +326,143 @@ class Journal:
                 (_to_iso(timestamp), epic, spread),
             )
             self.conn.commit()
+
+    def get_capital_ramp_state(self, scope: str) -> CapitalRampState | None:
+        row = self.conn.execute(
+            "SELECT * FROM capital_ramp_state WHERE scope = ?",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CapitalRampState(
+            scope=str(row["scope"]),
+            timezone_name=str(row["timezone_name"]),
+            start_ts_utc=_from_iso(row["start_ts_utc"]) or datetime.now(timezone.utc),
+            start_year_local=int(row["start_year_local"]),
+            start_equity=float(row["start_equity"]),
+            monthly_topup=float(row["monthly_topup"]),
+            target_equity=float(row["target_equity"]),
+            pnl_baseline_at_start=float(row["pnl_baseline_at_start"]),
+            topups_total=float(row["topups_total"]),
+            topups_count=int(row["topups_count"]),
+            next_topup_date_local=_from_iso_date(row["next_topup_date_local"]),
+            last_topup_date_local=_from_iso_date(row["last_topup_date_local"]),
+            stopped_reason=str(row["stopped_reason"]) if row["stopped_reason"] is not None else None,
+            stopped_at_utc=_from_iso(row["stopped_at_utc"]),
+            updated_at_utc=_from_iso(row["updated_at_utc"]),
+        )
+
+    def upsert_capital_ramp_state(self, state: CapitalRampState) -> None:
+        now = state.updated_at_utc or datetime.now(timezone.utc)
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO capital_ramp_state (
+                    scope, timezone_name, start_ts_utc, start_year_local,
+                    start_equity, monthly_topup, target_equity,
+                    pnl_baseline_at_start, topups_total, topups_count,
+                    next_topup_date_local, last_topup_date_local,
+                    stopped_reason, stopped_at_utc, updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope) DO UPDATE SET
+                    timezone_name=excluded.timezone_name,
+                    start_ts_utc=excluded.start_ts_utc,
+                    start_year_local=excluded.start_year_local,
+                    start_equity=excluded.start_equity,
+                    monthly_topup=excluded.monthly_topup,
+                    target_equity=excluded.target_equity,
+                    pnl_baseline_at_start=excluded.pnl_baseline_at_start,
+                    topups_total=excluded.topups_total,
+                    topups_count=excluded.topups_count,
+                    next_topup_date_local=excluded.next_topup_date_local,
+                    last_topup_date_local=excluded.last_topup_date_local,
+                    stopped_reason=excluded.stopped_reason,
+                    stopped_at_utc=excluded.stopped_at_utc,
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                (
+                    state.scope,
+                    state.timezone_name,
+                    _to_iso(state.start_ts_utc),
+                    int(state.start_year_local),
+                    float(state.start_equity),
+                    float(state.monthly_topup),
+                    float(state.target_equity),
+                    float(state.pnl_baseline_at_start),
+                    float(state.topups_total),
+                    int(state.topups_count),
+                    _to_iso_date(state.next_topup_date_local),
+                    _to_iso_date(state.last_topup_date_local),
+                    state.stopped_reason,
+                    _to_iso(state.stopped_at_utc),
+                    _to_iso(now),
+                ),
+            )
+            self.conn.commit()
+
+    def append_capital_ramp_event(self, event: CapitalRampEvent) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO capital_ramp_events (
+                    scope, event_type, event_ts_utc, local_date, amount, model_equity, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.scope,
+                    event.event_type,
+                    _to_iso(event.event_ts_utc),
+                    _to_iso_date(event.local_date),
+                    float(event.amount),
+                    float(event.model_equity),
+                    json.dumps(event.payload, ensure_ascii=True),
+                ),
+            )
+            self.conn.commit()
+
+    def list_capital_ramp_events(self, scope: str) -> list[CapitalRampEvent]:
+        rows = self.conn.execute(
+            "SELECT * FROM capital_ramp_events WHERE scope = ? ORDER BY event_ts_utc ASC, id ASC",
+            (scope,),
+        ).fetchall()
+        events: list[CapitalRampEvent] = []
+        for row in rows:
+            payload = {}
+            raw_payload = row["payload"]
+            if raw_payload:
+                try:
+                    loaded = json.loads(raw_payload)
+                    if isinstance(loaded, dict):
+                        payload = loaded
+                except json.JSONDecodeError:
+                    payload = {}
+            events.append(
+                CapitalRampEvent(
+                    scope=str(row["scope"]),
+                    event_type=str(row["event_type"]),
+                    event_ts_utc=_from_iso(row["event_ts_utc"]) or datetime.now(timezone.utc),
+                    local_date=_from_iso_date(row["local_date"]) or datetime.now(timezone.utc).date(),
+                    amount=float(row["amount"]),
+                    model_equity=float(row["model_equity"]),
+                    payload=payload,
+                )
+            )
+        return events
+
+    def sum_closed_pnl(self, prefix: str) -> float:
+        pattern = f"{prefix.strip()}-%"
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl), 0.0) AS total
+            FROM positions
+            WHERE status = 'CLOSED' AND deal_id LIKE ?
+            """,
+            (pattern,),
+        ).fetchone()
+        if row is None:
+            return 0.0
+        return float(row["total"] or 0.0)
 
     def load_recent_spreads(self, limit: int, epic: str) -> list[float]:
         rows = self.conn.execute(

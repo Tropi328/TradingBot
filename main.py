@@ -35,6 +35,14 @@ from bot.backtest.engine import (
 )
 from bot.backtest.monte_carlo import MCAdaptiveModel, run_monte_carlo_simulation
 from bot.backtest.runner import BacktestRunner
+from bot.capital_ramp import (
+    EVENT_STOP_TARGET,
+    EVENT_STOP_YEAR_END,
+    EVENT_TOPUP,
+    START_EQUITY_PLN,
+    CapitalRampEvent,
+    CapitalRampRuntime,
+)
 from bot.clock import (
     is_symbol_market_open,
     should_poll_closed_candle,
@@ -781,8 +789,10 @@ def create_decision_record_from_outcome(
     )
 
 
-def apply_closed_events(events: list[ClosedPositionEvent], trading_day_str: str, journal: Journal, risk_engine: RiskEngine, now: datetime, alerts: AlertDispatcher) -> None:
+def apply_closed_events(events: list[ClosedPositionEvent], trading_day_str: str, journal: Journal, risk_engine: RiskEngine, now: datetime, alerts: AlertDispatcher) -> float:
+    total_closed_pnl = 0.0
     for event in events:
+        total_closed_pnl += float(event.pnl)
         journal.add_daily_pnl(trading_day_str, event.pnl, epic=event.epic)
         journal.add_daily_pnl(trading_day_str, event.pnl, epic="GLOBAL")
         for scope in (f"ASSET:{event.epic}", "GLOBAL"):
@@ -2399,14 +2409,7 @@ def _run_multi_strategy_segmented(
     daily_gate_prepared: bool = False,
     mc_model: MCAdaptiveModel | None = None,
 ):
-    segments, segment_info = loader.split_frame_by_gaps(
-        frame,
-        timeframe,
-        gap_bars=3,
-        soft_gap_minutes=int(config.backtest_tuning.segment_soft_gap_minutes),
-        hard_gap_minutes=int(config.backtest_tuning.segment_hard_gap_minutes),
-    )
-    if not segments:
+    if bool(config.capital_ramp.enabled):
         segments = [frame]
         segment_info = {
             "segment_count": 1,
@@ -2420,10 +2423,32 @@ def _run_multi_strategy_segmented(
             "gaps_over_threshold": [],
             "gaps_soft_only": [],
         }
+    else:
+        segments, segment_info = loader.split_frame_by_gaps(
+            frame,
+            timeframe,
+            gap_bars=3,
+            soft_gap_minutes=int(config.backtest_tuning.segment_soft_gap_minutes),
+            hard_gap_minutes=int(config.backtest_tuning.segment_hard_gap_minutes),
+        )
+        if not segments:
+            segments = [frame]
+            segment_info = {
+                "segment_count": 1,
+                "segment_sizes": [int(len(frame))],
+                "gap_threshold_bars": 3,
+                "gap_threshold_minutes": 0.0,
+                "soft_gap_minutes": float(config.backtest_tuning.segment_soft_gap_minutes),
+                "hard_gap_minutes": float(config.backtest_tuning.segment_hard_gap_minutes),
+                "gap_count_over_threshold": 0,
+                "gap_count_soft_only": 0,
+                "gaps_over_threshold": [],
+                "gaps_soft_only": [],
+            }
 
     reports = []
     skipped_small = 0
-    rolling_equity = float(config.risk.equity)
+    rolling_equity = float(START_EQUITY_PLN if config.capital_ramp.enabled else config.risk.equity)
     warmup_bars_per_segment = max(260, int(config.execution.history_bars.m5))
     for idx, segment in enumerate(segments):
         segment_input = segment
@@ -2511,7 +2536,7 @@ def _run_multi_strategy_segmented(
     segment_meta = dict(segment_info)
     segment_meta["segment_run_count"] = len(reports)
     segment_meta["segment_skipped_small"] = skipped_small
-    segment_meta["equity_start"] = float(config.risk.equity)
+    segment_meta["equity_start"] = float(START_EQUITY_PLN if config.capital_ramp.enabled else config.risk.equity)
     segment_meta["equity_end"] = float(rolling_equity)
     return merged, segment_meta
 
@@ -3060,7 +3085,7 @@ def run_backtest_mode(args: argparse.Namespace, config: AppConfig, assets: list[
             variant=variant_code,
             mode=mode,
             price=str(args.backtest_price),
-            initial_equity=float(config.risk.equity),
+            initial_equity=float(START_EQUITY_PLN if config.capital_ramp.enabled else config.risk.equity),
             config=str(args.config),
             data_root=data_root_value,
         )
@@ -4397,6 +4422,8 @@ def run_multi_strategy_loop(
     sc_logger: SignalCandidateLogger | None = None,
     sc_aggregator: SignalCandidateAggregator | None = None,
     micro_loss_metrics: MicroLossMetrics | None = None,
+    capital_ramp_scope: str = "CAPITAL_RAMP:PAPER",
+    capital_ramp_pnl_prefix: str = "PAPER",
 ) -> None:
     metrics_start = client.metrics_snapshot() if client is not None else {}
     daily_summary = DailyRuntimeSummary(
@@ -4487,6 +4514,87 @@ def run_multi_strategy_loop(
             if provider is not None:
                 daily_gate_services[epic] = provider
 
+    capital_ramp_runtime: CapitalRampRuntime | None = None
+    capital_ramp_closed_pnl = 0.0
+    if bool(config.capital_ramp.enabled):
+        if str(config.account_currency).strip().upper() != "PLN":
+            raise RuntimeError("capital_ramp.enabled requires account_currency=PLN")
+        scope_value = str(capital_ramp_scope or "CAPITAL_RAMP:PAPER").strip() or "CAPITAL_RAMP:PAPER"
+        pnl_prefix = str(capital_ramp_pnl_prefix or "PAPER").strip().upper() or "PAPER"
+        capital_ramp_closed_pnl = float(journal.sum_closed_pnl(pnl_prefix))
+        persisted_state = journal.get_capital_ramp_state(scope_value)
+        if persisted_state is None:
+            capital_ramp_runtime = CapitalRampRuntime.initialize(
+                scope=scope_value,
+                now_utc=utc_now(),
+                timezone_name=config.timezone,
+                current_closed_pnl=capital_ramp_closed_pnl,
+            )
+            journal.upsert_capital_ramp_state(capital_ramp_runtime.state)
+        else:
+            capital_ramp_runtime = CapitalRampRuntime(persisted_state)
+        status = capital_ramp_runtime.status(
+            now_utc=utc_now(),
+            current_closed_pnl=capital_ramp_closed_pnl,
+        )
+        LOGGER.info(
+            "Capital ramp enabled | scope=%s model_equity=%.2f topups_total=%.2f topups_count=%d next_topup=%s stopped_reason=%s",
+            scope_value,
+            float(status.get("model_equity", 0.0) or 0.0),
+            float(status.get("topups_total", 0.0) or 0.0),
+            int(status.get("topups_count", 0) or 0),
+            status.get("next_topup_date_local"),
+            status.get("stopped_reason"),
+        )
+
+    def _persist_capital_ramp_event(event: CapitalRampEvent) -> None:
+        journal.append_capital_ramp_event(event)
+        if capital_ramp_runtime is not None:
+            journal.upsert_capital_ramp_state(capital_ramp_runtime.state)
+        if event.event_type == EVENT_TOPUP:
+            LOGGER.info(
+                "Capital ramp topup | scope=%s amount=%.2f model_equity=%.2f local_date=%s",
+                event.scope,
+                float(event.amount),
+                float(event.model_equity),
+                event.local_date.isoformat(),
+            )
+            alerts.send(
+                event="CAPITAL_RAMP_TOPUP",
+                level="info",
+                message=(
+                    f"Topup applied amount={event.amount:.2f} model_equity={event.model_equity:.2f} "
+                    f"date={event.local_date.isoformat()}"
+                ),
+                dedupe_key=f"capital-ramp-topup-{event.scope}-{event.local_date.isoformat()}",
+            )
+            return
+        if event.event_type == EVENT_STOP_TARGET:
+            LOGGER.info(
+                "Capital ramp stopped (target reached) | scope=%s model_equity=%.2f",
+                event.scope,
+                float(event.model_equity),
+            )
+            alerts.send(
+                event="CAPITAL_RAMP_STOP_TARGET",
+                level="warning",
+                message=f"Capital ramp stopped: target reached model_equity={event.model_equity:.2f}",
+                dedupe_key=f"capital-ramp-stop-target-{event.scope}",
+            )
+            return
+        if event.event_type == EVENT_STOP_YEAR_END:
+            LOGGER.info(
+                "Capital ramp stopped (year end) | scope=%s model_equity=%.2f",
+                event.scope,
+                float(event.model_equity),
+            )
+            alerts.send(
+                event="CAPITAL_RAMP_STOP_YEAR_END",
+                level="warning",
+                message=f"Capital ramp stopped: year end model_equity={event.model_equity:.2f}",
+                dedupe_key=f"capital-ramp-stop-year-end-{event.scope}",
+            )
+
     def _stop(signum: int, _frame: object) -> None:
         LOGGER.info("Received signal %s, shutting down.", signum)
         stop_event.set()
@@ -4507,6 +4615,23 @@ def run_multi_strategy_loop(
                 api_requests_start=metrics.get("total_requests", 0),
                 api_retries_start=metrics.get("total_retries", 0),
                 api_429_start=metrics.get("http_429_count", 0),
+            )
+        capital_ramp_effective_equity = float(config.risk.equity)
+        if capital_ramp_runtime is not None:
+            topup_event, stop_event_capital = capital_ramp_runtime.maybe_apply_topup(
+                now_utc=now,
+                current_closed_pnl=capital_ramp_closed_pnl,
+            )
+            if topup_event is not None:
+                _persist_capital_ramp_event(topup_event)
+            if stop_event_capital is not None:
+                _persist_capital_ramp_event(stop_event_capital)
+            journal.upsert_capital_ramp_state(capital_ramp_runtime.state)
+            capital_ramp_effective_equity = float(
+                capital_ramp_runtime.effective_equity(
+                    now_utc=now,
+                    current_closed_pnl=capital_ramp_closed_pnl,
+                )
             )
         daily_summary.cycles += 1
         # ── Session matching (multi-strategy loop) ────
@@ -4620,7 +4745,24 @@ def run_multi_strategy_loop(
             closed_manage = position_manager.manage_open_positions(now=now, quotes_by_epic=quotes)
             closed = closed_sync + closed_manage
             if closed:
-                apply_closed_events(closed, day, journal, risk_engine, now, alerts)
+                closed_delta = apply_closed_events(closed, day, journal, risk_engine, now, alerts)
+                if capital_ramp_runtime is not None:
+                    capital_ramp_closed_pnl += float(closed_delta)
+                    topup_event_after_close, stop_event_after_close = capital_ramp_runtime.maybe_apply_topup(
+                        now_utc=now,
+                        current_closed_pnl=capital_ramp_closed_pnl,
+                    )
+                    if topup_event_after_close is not None:
+                        _persist_capital_ramp_event(topup_event_after_close)
+                    if stop_event_after_close is not None:
+                        _persist_capital_ramp_event(stop_event_after_close)
+                    journal.upsert_capital_ramp_state(capital_ramp_runtime.state)
+                    capital_ramp_effective_equity = float(
+                        capital_ramp_runtime.effective_equity(
+                            now_utc=now,
+                            current_closed_pnl=capital_ramp_closed_pnl,
+                        )
+                    )
                 # ── Update re-entry state per asset ──────────
                 for _cev in closed:
                     _rs = states.get(_cev.epic)
@@ -5112,7 +5254,11 @@ def run_multi_strategy_loop(
                     continue
 
                 # ── Compound equity ──────────────────────
-                _sizing_equity = float(config.risk.equity)
+                _sizing_equity = (
+                    float(capital_ramp_effective_equity)
+                    if capital_ramp_runtime is not None
+                    else float(config.risk.equity)
+                )
                 if config.compound_equity.enabled:
                     _sizing_equity = compute_compound_equity(
                         _sizing_equity,
@@ -5454,24 +5600,28 @@ def run_multi_strategy_loop(
                     sc_aggregator.maybe_log_summary(session_start_utc, now)
 
             if (mono - last_dashboard) >= config.monitoring.dashboard_interval_seconds:
-                dashboard_writer.write(
-                    {
-                        "mode": "multi-strategy",
-                        "trading_day": day,
-                        "global_daily_pnl": round(journal.get_daily_stats(day, epic="GLOBAL").pnl, 4),
-                        "open_positions": len(position_manager.get_open_positions()),
-                        "pending_orders": len(order_executor.get_pending_orders()),
-                        "assets": {
-                            epic: {
-                                "strategy": st.strategy_name,
-                                "trade_enabled": st.asset.trade_enabled,
-                                "last_reasons": st.last_reason_codes,
-                                "score_total": st.last_evaluation.score_total if st.last_evaluation is not None else None,
-                            }
-                            for epic, st in states.items()
-                        },
-                    }
-                )
+                dashboard_payload = {
+                    "mode": "multi-strategy",
+                    "trading_day": day,
+                    "global_daily_pnl": round(journal.get_daily_stats(day, epic="GLOBAL").pnl, 4),
+                    "open_positions": len(position_manager.get_open_positions()),
+                    "pending_orders": len(order_executor.get_pending_orders()),
+                    "assets": {
+                        epic: {
+                            "strategy": st.strategy_name,
+                            "trade_enabled": st.asset.trade_enabled,
+                            "last_reasons": st.last_reason_codes,
+                            "score_total": st.last_evaluation.score_total if st.last_evaluation is not None else None,
+                        }
+                        for epic, st in states.items()
+                    },
+                }
+                if capital_ramp_runtime is not None:
+                    dashboard_payload["capital_ramp"] = capital_ramp_runtime.status(
+                        now_utc=now,
+                        current_closed_pnl=capital_ramp_closed_pnl,
+                    )
+                dashboard_writer.write(dashboard_payload)
                 last_dashboard = mono
 
         except CapitalAPIError as exc:
@@ -5573,6 +5723,8 @@ def _run_live_body(
         )
         for a in assets
     }
+    capital_ramp_scope = "CAPITAL_RAMP:PAPER" if paper_mode else "CAPITAL_RAMP:LIVE"
+    capital_ramp_pnl_prefix = str(position_manager.mode_prefix).strip().upper()
 
     run_multi_strategy_loop(
         args=args,
@@ -5599,6 +5751,8 @@ def _run_live_body(
         sc_logger=sc_logger,
         sc_aggregator=sc_aggregator,
         micro_loss_metrics=micro_loss_metrics,
+        capital_ramp_scope=capital_ramp_scope,
+        capital_ramp_pnl_prefix=capital_ramp_pnl_prefix,
     )
 
     # Export diagnostics on shutdown if requested

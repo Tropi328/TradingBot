@@ -42,6 +42,14 @@ _TRADE_FIELD_ORDER = [
     "margin_capped",
 ]
 _EQUITY_FIELD_ORDER = ["idx", "ts", "equity", "drawdown", "drawdown_pct"]
+_CAPITAL_RAMP_EVENT_FIELD_ORDER = [
+    "event_type",
+    "event_ts_utc",
+    "local_date",
+    "amount",
+    "model_equity",
+    "payload",
+]
 _HEADLINE_KEYS = [
     "trades_count",
     "wins",
@@ -62,6 +70,10 @@ _HEADLINE_KEYS = [
     "constraint_dd_cap_pass_initial",
     "constraint_dd_cap_pass",
     "objective_value",
+    "capital_ramp_enabled",
+    "capital_ramp_topups_total",
+    "capital_ramp_topups_count",
+    "capital_ramp_stopped_reason",
 ]
 
 
@@ -123,14 +135,27 @@ class BacktestReporter:
         equity_series = compute_drawdown_series(equity)
         metrics = compute_metrics(trades, equity_series, initial_equity=float(run.meta.initial_equity))
         source_report = run.extra.get("source_report") if isinstance(run.extra, dict) else None
+        capital_ramp_events: list[dict[str, Any]] = []
         if isinstance(source_report, dict):
             _merge_source_report_metrics(metrics, source_report)
+            raw_capital_events = source_report.get("capital_ramp_events")
+            if isinstance(raw_capital_events, list):
+                capital_ramp_events = [
+                    _normalize_capital_ramp_event(item)
+                    for item in raw_capital_events
+                ]
         metrics["anomaly_flags"] = compute_anomaly_flags(metrics)
 
         artifacts: dict[str, Any] = {"charts": {}}
         if "csv" in format_set:
             _write_csv(outdir / "trades.csv", trades, _TRADE_FIELD_ORDER)
             _write_csv(outdir / "equity.csv", equity_series, _EQUITY_FIELD_ORDER)
+            if capital_ramp_events:
+                _write_csv(
+                    outdir / "capital_ramp_events.csv",
+                    capital_ramp_events,
+                    _CAPITAL_RAMP_EVENT_FIELD_ORDER,
+                )
 
         if "png" in format_set:
             try:
@@ -212,6 +237,19 @@ def _merge_source_report_metrics(metrics: dict[str, Any], source_report: dict[st
     for spread_key in ("avg_spread_points", "median_spread_points", "p90_spread_points"):
         if spread_key in source_report:
             metrics[spread_key] = _to_float(source_report.get(spread_key), metrics.get(spread_key, 0.0))
+
+    if "capital_ramp_enabled" in source_report:
+        metrics["capital_ramp_enabled"] = bool(source_report.get("capital_ramp_enabled"))
+    if "capital_ramp_topups_total" in source_report:
+        metrics["capital_ramp_topups_total"] = _to_float(source_report.get("capital_ramp_topups_total"), 0.0)
+    if "capital_ramp_topups_count" in source_report:
+        try:
+            metrics["capital_ramp_topups_count"] = int(source_report.get("capital_ramp_topups_count") or 0)
+        except (TypeError, ValueError):
+            metrics["capital_ramp_topups_count"] = 0
+    if "capital_ramp_stopped_reason" in source_report:
+        reason = source_report.get("capital_ramp_stopped_reason")
+        metrics["capital_ramp_stopped_reason"] = str(reason) if reason is not None else None
 
 
 def _normalize_formats(formats: tuple[str, ...] | list[str] | set[str] | str) -> set[str]:
@@ -311,6 +349,27 @@ def _to_optional_float(value: Any) -> float | None:
     if converted != converted:  # NaN
         return None
     return converted
+
+
+def _normalize_capital_ramp_event(item: Any) -> dict[str, Any]:
+    event_type = _extract_value(item, ("event_type",), "")
+    event_ts = _to_iso_timestamp(_extract_value(item, ("event_ts_utc", "event_ts")))
+    local_date = str(_extract_value(item, ("local_date",), "") or "")
+    amount = _to_float(_extract_value(item, ("amount",), 0.0))
+    model_equity = _to_float(_extract_value(item, ("model_equity",), 0.0))
+    payload_raw = _extract_value(item, ("payload",), {})
+    if isinstance(payload_raw, dict):
+        payload = json.dumps(payload_raw, ensure_ascii=True, sort_keys=True)
+    else:
+        payload = str(payload_raw)
+    return {
+        "event_type": str(event_type),
+        "event_ts_utc": event_ts,
+        "local_date": local_date,
+        "amount": amount,
+        "model_equity": model_equity,
+        "payload": payload,
+    }
 
 
 def _normalize_trade(item: Any, meta: BacktestMeta) -> dict[str, Any]:

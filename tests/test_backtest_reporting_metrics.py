@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -90,3 +91,45 @@ def test_reporter_writes_json_and_csv_for_empty_trades(tmp_path: Path) -> None:
     assert (outdir / "summary.json").exists()
     assert (outdir / "trades.csv").exists()
     assert (outdir / "equity.csv").exists()
+
+
+def test_reporter_writes_capital_ramp_events_csv_when_available(tmp_path: Path) -> None:
+    reporter = BacktestReporter(tmp_path / "reports" / "backtest")
+    run = BacktestRun(
+        meta=BacktestMeta(
+            symbol="XAUUSD",
+            timeframe="5m",
+            start="2024-01-01",
+            end="2024-01-02",
+            variant="W0",
+            mode="backtest",
+            initial_equity=100.0,
+        ),
+        trades=[],
+        equity=[{"ts": "2024-01-01T00:00:00+00:00", "equity": 100.0}],
+        extra={
+            "source_report": {
+                "capital_ramp_enabled": True,
+                "capital_ramp_topups_total": 100.0,
+                "capital_ramp_topups_count": 1,
+                "capital_ramp_stopped_reason": None,
+                "capital_ramp_events": [
+                    {
+                        "event_type": "TOPUP",
+                        "event_ts_utc": "2024-02-01T00:00:00+00:00",
+                        "local_date": "2024-02-01",
+                        "amount": 100.0,
+                        "model_equity": 200.0,
+                        "payload": {"topups_count": 1},
+                    }
+                ]
+            }
+        },
+    )
+    reporter.generate(run=run, formats=("json", "csv"))
+
+    assert reporter.last_output_dir is not None
+    outdir = reporter.last_output_dir
+    assert (outdir / "capital_ramp_events.csv").exists()
+    payload = json.loads((outdir / "summary.json").read_text(encoding="utf-8"))
+    assert payload["metrics"]["capital_ramp_enabled"] is True

@@ -189,9 +189,39 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS capital_ramp_state (
+            scope TEXT PRIMARY KEY,
+            timezone_name TEXT NOT NULL,
+            start_ts_utc TEXT NOT NULL,
+            start_year_local INTEGER NOT NULL,
+            start_equity REAL NOT NULL,
+            monthly_topup REAL NOT NULL,
+            target_equity REAL NOT NULL,
+            pnl_baseline_at_start REAL NOT NULL DEFAULT 0,
+            topups_total REAL NOT NULL DEFAULT 0,
+            topups_count INTEGER NOT NULL DEFAULT 0,
+            next_topup_date_local TEXT,
+            last_topup_date_local TEXT,
+            stopped_reason TEXT,
+            stopped_at_utc TEXT,
+            updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS capital_ramp_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_ts_utc TEXT NOT NULL,
+            local_date TEXT NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            model_equity REAL NOT NULL DEFAULT 0,
+            payload TEXT NOT NULL DEFAULT '{}'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
         CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
         CREATE INDEX IF NOT EXISTS idx_spreads_timestamp ON spreads(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_capital_ramp_events_scope_ts ON capital_ramp_events(scope, event_ts_utc);
         """
     )
     # Runtime migration support for existing databases.
