@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 
+from bot.data.api_models import MarketDetailsResponse
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -577,13 +579,23 @@ class CapitalClient:
         resolved_epic = self._resolve_cached_epic(epic)
         payload = self._request("GET", f"/markets/{resolved_epic}", allow_404=True)
         if payload:
-            return payload
+            try:
+                return MarketDetailsResponse.model_validate(payload).model_dump()
+            except Exception as exc:
+                raise CapitalAPIError(
+                    f"Invalid market details payload for {epic}: {exc}"
+                ) from exc
         discovered = self._resolve_epic_via_search(epic)
         if discovered and discovered != resolved_epic:
             self._cache_epic_alias(epic, discovered)
             payload = self._request("GET", f"/markets/{discovered}", allow_404=True)
             if payload:
-                return payload
+                try:
+                    return MarketDetailsResponse.model_validate(payload).model_dump()
+                except Exception as exc:
+                    raise CapitalAPIError(
+                        f"Invalid market details payload for {epic}: {exc}"
+                    ) from exc
         raise CapitalAPIError(
             f"API error GET /markets/{epic}: epic not found. Try CAPITAL_EPIC=GOLD for Capital DEMO."
         )
@@ -662,7 +674,8 @@ class CapitalClient:
         return self._request("PUT", f"/positions/{deal_id}", json=payload)
 
     def partial_close_position(self, deal_id: str, size: float) -> dict[str, Any]:
-        # TODO: Verify exact partial-close payload for Capital.com in your account type.
-        # In dry-run mode this call is not used. In paper mode this attempts a common pattern.
-        payload = {"size": size}
+        normalized_size = float(size)
+        if normalized_size <= 0:
+            raise CapitalAPIError("partial_close_position size must be > 0")
+        payload = {"size": normalized_size}
         return self._request("DELETE", f"/positions/{deal_id}", json=payload)

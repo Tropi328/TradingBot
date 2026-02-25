@@ -189,3 +189,21 @@ python main.py --ops-healthcheck --config config.yaml
   - `E_DB_WRITE_FAIL`
   - `E_BACKUP_STALE`
 - [ ] Decision recorded: `GO` (next hardening/live-readiness) or `NO-GO` (fix list + owner + ETA).
+
+## 8. Docker local quickstart
+1. Build image:
+```bash
+docker compose build
+```
+2. Start paper profile:
+```bash
+docker compose up -d
+```
+3. Follow logs:
+```bash
+docker compose logs -f trading-bot-paper
+```
+4. Stop:
+```bash
+docker compose down
+```

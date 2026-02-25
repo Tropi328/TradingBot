@@ -3,6 +3,41 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+_ALLOWED_MIGRATION_TABLES = frozenset(
+    {
+        "journal_trades",
+        "orders",
+        "positions",
+        "daily_stats",
+        "spreads",
+        "risk_state",
+        "capital_ramp_state",
+        "capital_ramp_events",
+    }
+)
+_ALLOWED_MIGRATION_COLUMNS = frozenset(
+    {
+        "epic",
+        "request_id",
+        "remote_status",
+        "filled_size",
+    }
+)
+
+
+def _validate_sql_identifier(identifier: str) -> str:
+    normalized = str(identifier).strip()
+    if not normalized:
+        raise ValueError("SQL identifier cannot be empty")
+    if not normalized.replace("_", "").isalnum():
+        raise ValueError(f"Invalid SQL identifier: {identifier!r}")
+    return normalized
+
+
+def _quote_identifier(identifier: str) -> str:
+    validated = _validate_sql_identifier(identifier)
+    return f'"{validated}"'
+
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
@@ -15,7 +50,8 @@ def get_connection(db_path: str | Path) -> sqlite3.Connection:
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    quoted_table = _quote_identifier(table_name)
+    rows = conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
     return {str(row[1]) for row in rows}
 
 
@@ -25,9 +61,15 @@ def _ensure_column(
     column_name: str,
     column_sql: str,
 ) -> None:
+    if table_name not in _ALLOWED_MIGRATION_TABLES:
+        raise ValueError(f"Unsupported migration table: {table_name!r}")
+    if column_name not in _ALLOWED_MIGRATION_COLUMNS:
+        raise ValueError(f"Unsupported migration column: {column_name!r}")
     if column_name in _table_columns(conn, table_name):
         return
-    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+    quoted_table = _quote_identifier(table_name)
+    quoted_column = _quote_identifier(column_name)
+    conn.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {column_sql}")
 
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -102,10 +144,14 @@ def _drop_legacy_daily_stats_indexes(conn: sqlite3.Connection) -> None:
         is_unique = int(row[2]) == 1
         if not is_unique or index_name.startswith("sqlite_autoindex"):
             continue
-        idx_cols = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        try:
+            quoted_index = _quote_identifier(index_name)
+        except ValueError:
+            continue
+        idx_cols = conn.execute(f"PRAGMA index_info({quoted_index})").fetchall()
         col_names = [str(idx_col[2]) for idx_col in idx_cols]
         if col_names == ["trading_day"]:
-            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+            conn.execute(f"DROP INDEX IF EXISTS {quoted_index}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:

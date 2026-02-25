@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  trading-bot-paper:
+    build: .
+    command: ["--paper", "--config", "configs/variants/config.variant_SAFE_BASE.yaml"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data:ro
+      - ./logs:/app/logs
+      - ./state:/app/state
+    restart: unless-stopped

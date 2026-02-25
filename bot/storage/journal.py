@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 
 from bot.capital_ramp import CapitalRampEvent, CapitalRampState
@@ -45,6 +46,25 @@ class Journal:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
         self.lock = threading.Lock()
+        self._transaction_depth = 0
+
+    def _commit_if_needed(self) -> None:
+        if self._transaction_depth == 0:
+            self.conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        self._transaction_depth += 1
+        try:
+            yield
+            if self._transaction_depth == 1:
+                self.conn.commit()
+        except Exception:
+            if self._transaction_depth == 1:
+                self.conn.rollback()
+            raise
+        finally:
+            self._transaction_depth = max(0, self._transaction_depth - 1)
 
     def log_decision(self, record: StrategyDecisionRecord) -> None:
         with self.lock:
@@ -72,7 +92,7 @@ class Journal:
                     json.dumps(record.payload),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def upsert_order(self, order: OrderRecord) -> None:
         with self.lock:
@@ -117,7 +137,7 @@ class Journal:
                     json.dumps(order.metadata),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def update_order_status(
         self,
@@ -144,7 +164,7 @@ class Journal:
                     """,
                     (status, remote_status, filled_size, _to_iso(updated_at), order_id),
                 )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def get_pending_orders(self, epic: str | None = None) -> list[OrderRecord]:
         if epic:
@@ -201,7 +221,7 @@ class Journal:
                     json.dumps(position.metadata),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def get_open_positions(self, epic: str | None = None) -> list[PositionRecord]:
         if epic:
@@ -259,7 +279,7 @@ class Journal:
                     _to_iso(updated_at),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def increment_daily_trades(self, trading_day: str, increment: int = 1, epic: str = "GLOBAL") -> DailyStats:
         stats = self.get_daily_stats(trading_day, epic=epic)
@@ -317,7 +337,7 @@ class Journal:
                     _to_iso(now),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def save_spread(self, timestamp: datetime, spread: float, epic: str) -> None:
         with self.lock:
@@ -325,7 +345,7 @@ class Journal:
                 "INSERT INTO spreads (timestamp, epic, spread) VALUES (?, ?, ?)",
                 (_to_iso(timestamp), epic, spread),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def get_capital_ramp_state(self, scope: str) -> CapitalRampState | None:
         row = self.conn.execute(
@@ -399,7 +419,7 @@ class Journal:
                     _to_iso(now),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def append_capital_ramp_event(self, event: CapitalRampEvent) -> None:
         with self.lock:
@@ -419,7 +439,7 @@ class Journal:
                     json.dumps(event.payload, ensure_ascii=True),
                 ),
             )
-            self.conn.commit()
+            self._commit_if_needed()
 
     def list_capital_ramp_events(self, scope: str) -> list[CapitalRampEvent]:
         rows = self.conn.execute(

@@ -20,8 +20,16 @@ This repo contains a DEMO/paper trading bot for Capital.com Open API with:
 
 ## Install
 1. `pip install -r requirements.txt`
+   (alternatywnie dla developmentu: `pip install -e ".[dev]"`)
 2. `copy .env.example .env`
 3. Fill `.env` values.
+
+## Runtime architecture (post-refactor)
+- `main.py` is now a thin bootstrap/proxy entrypoint.
+- Full runtime/orchestration lives in `bot/app_main.py`.
+- CLI argument definition lives in `bot/cli/args.py`.
+- Mode dispatch is grouped under `bot/runners/` (`live`, `backtest`, `research`, `batch`, `ops`).
+- Public CLI contract is unchanged (`python main.py ...` still works).
 
 ## Run
 - Dry-run loop: `python main.py --dry-run`

@@ -2537,7 +2537,7 @@ def run_backtest_multi_strategy(
             slice_m5_live[-1] = candle
             slice_m5_live.append(_live_placeholder_from(candle, 5))
             if len(slice_m5_live) > _SLICE_KEEP_M5 * 2:
-                slice_m5_live = slice_m5_live[-_SLICE_KEEP_M5:]
+                del slice_m5_live[:-_SLICE_KEEP_M5]
         spread_now = _spread_for(i)
         slippage_now = _slippage_for(i)
         spread_points_now = _spread_points_for(spread_now)
@@ -4227,7 +4227,7 @@ def run_backtest(
         spread_history = list(spread_history_window)
         slice_m5.append(candle)
         if len(slice_m5) > _SLICE_KEEP_M5 * 2:
-            slice_m5 = slice_m5[-_SLICE_KEEP_M5:]
+            del slice_m5[:-_SLICE_KEEP_M5]
         day_key = candle.timestamp.date().isoformat()
         daily_trades.setdefault(day_key, 0)
         daily_pnl.setdefault(day_key, 0.0)
