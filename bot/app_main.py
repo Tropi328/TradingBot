@@ -121,7 +121,7 @@ from bot.research.optimizer import (
     save_checkpoint,
     upsert_checkpoint_record,
 )
-from bot.storage.db import get_connection, init_db
+from bot.storage.db import init_db, managed_connection
 from bot.storage.journal import Journal
 from bot.storage.models import ClosedPositionEvent, DailyStats, StrategyDecisionRecord
 from bot.strategy.contracts import (
@@ -6475,8 +6475,7 @@ def run() -> None:
     _maybe_start_mc_viewer(config, root, cli_override=getattr(args, "mc_viewer", None))
 
     db_path = resolve_db_path(root, paper_mode=paper_mode)
-    conn = get_connection(db_path)
-    try:  # try/finally guarantees conn.close() even on crash
+    with managed_connection(db_path) as conn:
         live_runner.run(
             args,
             config,
@@ -6484,12 +6483,7 @@ def run() -> None:
             root,
             handler=lambda a, c, aset, r: _run_live_body(a, c, aset, r, paper_mode, mode_dry_run, conn, db_path),
         )
-    finally:
-        try:
-            conn.close()
-            LOGGER.debug("SQLite connection closed.")
-        except Exception:
-            LOGGER.debug("SQLite connection already closed or failed to close.")
+    LOGGER.debug("SQLite connection closed.")
 
 
 if __name__ == "__main__":

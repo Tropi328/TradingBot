@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 _ALLOWED_MIGRATION_TABLES = frozenset(
     {
@@ -47,6 +49,16 @@ def get_connection(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     return conn
+
+
+@contextmanager
+def managed_connection(db_path: str | Path) -> Iterator[sqlite3.Connection]:
+    """Yield a SQLite connection and always close it on exit."""
+    conn = get_connection(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -233,11 +234,15 @@ class TestMicroLossMetrics:
 # =========================================================================
 # signal_candidates tests
 # =========================================================================
-def _get_test_db():
+@contextmanager
+def _test_db():
     conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    init_signal_candidates_table(conn)
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        init_signal_candidates_table(conn)
+        yield conn
+    finally:
+        conn.close()
 
 
 def _make_candidate(**overrides) -> SignalCandidate:
@@ -271,105 +276,105 @@ def _make_candidate(**overrides) -> SignalCandidate:
 
 class TestSignalCandidateLogger:
     def test_log_single(self):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        candidate = _make_candidate()
-        logger.log(candidate)
-        rows = conn.execute("SELECT * FROM signal_candidates").fetchall()
-        assert len(rows) == 1
-        assert rows[0]["symbol"] == "XAUUSD"
-        assert rows[0]["score"] == 65.0
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            candidate = _make_candidate()
+            logger.log(candidate)
+            rows = conn.execute("SELECT * FROM signal_candidates").fetchall()
+            assert len(rows) == 1
+            assert rows[0]["symbol"] == "XAUUSD"
+            assert rows[0]["score"] == 65.0
 
     def test_log_many(self):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        candidates = [_make_candidate(score=s) for s in [50.0, 60.0, 70.0]]
-        logger.log_many(candidates)
-        count = conn.execute("SELECT COUNT(*) FROM signal_candidates").fetchone()[0]
-        assert count == 3
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            candidates = [_make_candidate(score=s) for s in [50.0, 60.0, 70.0]]
+            logger.log_many(candidates)
+            count = conn.execute("SELECT COUNT(*) FROM signal_candidates").fetchone()[0]
+            assert count == 3
 
     def test_rejection_reasons_stored(self):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        candidate = _make_candidate(
-            action="OBSERVE",
-            accepted=False,
-            rejection_reasons=["SCORE_BELOW_MIN", "SL_TOO_TIGHT"],
-        )
-        logger.log(candidate)
-        row = conn.execute("SELECT * FROM signal_candidates").fetchone()
-        reasons = json.loads(row["rejection_reasons"])
-        assert "SCORE_BELOW_MIN" in reasons
-        assert "SL_TOO_TIGHT" in reasons
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            candidate = _make_candidate(
+                action="OBSERVE",
+                accepted=False,
+                rejection_reasons=["SCORE_BELOW_MIN", "SL_TOO_TIGHT"],
+            )
+            logger.log(candidate)
+            row = conn.execute("SELECT * FROM signal_candidates").fetchone()
+            reasons = json.loads(row["rejection_reasons"])
+            assert "SCORE_BELOW_MIN" in reasons
+            assert "SL_TOO_TIGHT" in reasons
 
 
 class TestSignalCandidateAggregator:
     def test_aggregate_empty(self):
-        conn = _get_test_db()
-        agg = SignalCandidateAggregator(conn)
-        start = datetime(2025, 1, 1, tzinfo=timezone.utc)
-        end = datetime(2025, 12, 31, tzinfo=timezone.utc)
-        result = agg.aggregate_window(start, end)
-        assert result.candidates_count == 0
-        assert result.score_p50 is None
+        with _test_db() as conn:
+            agg = SignalCandidateAggregator(conn)
+            start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+            end = datetime(2025, 12, 31, tzinfo=timezone.utc)
+            result = agg.aggregate_window(start, end)
+            assert result.candidates_count == 0
+            assert result.score_p50 is None
 
     def test_aggregate_with_data(self):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        candidates = [
-            _make_candidate(score=50.0, action="OBSERVE", accepted=False, rejection_reasons=["LOW_SCORE"]),
-            _make_candidate(score=60.0, action="SMALL", accepted=False, rejection_reasons=["COOLDOWN"]),
-            _make_candidate(score=70.0, action="TRADE", accepted=True),
-        ]
-        logger.log_many(candidates)
-        agg = SignalCandidateAggregator(conn)
-        result = agg.aggregate_window(
-            datetime(2025, 1, 1, tzinfo=timezone.utc),
-            datetime(2026, 1, 1, tzinfo=timezone.utc),
-        )
-        assert result.candidates_count == 3
-        assert result.accepted_trades_count == 1
-        assert result.score_p50 == 60.0
-        assert result.action_distribution["TRADE"] == 1
-        assert result.action_distribution["OBSERVE"] == 1
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            candidates = [
+                _make_candidate(score=50.0, action="OBSERVE", accepted=False, rejection_reasons=["LOW_SCORE"]),
+                _make_candidate(score=60.0, action="SMALL", accepted=False, rejection_reasons=["COOLDOWN"]),
+                _make_candidate(score=70.0, action="TRADE", accepted=True),
+            ]
+            logger.log_many(candidates)
+            agg = SignalCandidateAggregator(conn)
+            result = agg.aggregate_window(
+                datetime(2025, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            assert result.candidates_count == 3
+            assert result.accepted_trades_count == 1
+            assert result.score_p50 == 60.0
+            assert result.action_distribution["TRADE"] == 1
+            assert result.action_distribution["OBSERVE"] == 1
 
     def test_to_dict(self):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        logger.log(_make_candidate())
-        agg = SignalCandidateAggregator(conn)
-        result = agg.aggregate_window(
-            datetime(2025, 1, 1, tzinfo=timezone.utc),
-            datetime(2026, 1, 1, tzinfo=timezone.utc),
-        )
-        d = result.to_dict()
-        assert "candidates_count" in d
-        assert "rejection_reasons_top10" in d
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            logger.log(_make_candidate())
+            agg = SignalCandidateAggregator(conn)
+            result = agg.aggregate_window(
+                datetime(2025, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            d = result.to_dict()
+            assert "candidates_count" in d
+            assert "rejection_reasons_top10" in d
 
 
 class TestExportDiagnostics:
     def test_export_json(self, tmp_path):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        logger.log(_make_candidate())
-        output = tmp_path / "diagnostics.json"
-        result = export_diagnostics(conn, output, fmt="json")
-        assert result.exists()
-        data = json.loads(result.read_text())
-        assert "summary" in data
-        assert "candidates" in data
-        assert len(data["candidates"]) == 1
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            logger.log(_make_candidate())
+            output = tmp_path / "diagnostics.json"
+            result = export_diagnostics(conn, output, fmt="json")
+            assert result.exists()
+            data = json.loads(result.read_text())
+            assert "summary" in data
+            assert "candidates" in data
+            assert len(data["candidates"]) == 1
 
     def test_export_csv(self, tmp_path):
-        conn = _get_test_db()
-        logger = SignalCandidateLogger(conn)
-        logger.log(_make_candidate())
-        output = tmp_path / "diagnostics"
-        result = export_diagnostics(conn, output, fmt="csv")
-        assert result.suffix == ".csv"
-        assert result.exists()
-        summary_path = tmp_path / "diagnostics_summary.json"
-        assert summary_path.exists()
+        with _test_db() as conn:
+            logger = SignalCandidateLogger(conn)
+            logger.log(_make_candidate())
+            output = tmp_path / "diagnostics"
+            result = export_diagnostics(conn, output, fmt="csv")
+            assert result.suffix == ".csv"
+            assert result.exists()
+            summary_path = tmp_path / "diagnostics_summary.json"
+            assert summary_path.exists()
 
 
 class TestSignalCandidateModel:

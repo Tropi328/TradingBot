@@ -62,3 +62,6 @@ bot/data/local_csv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local split/release scratch
+.tmp_release_split/

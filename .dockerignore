@@ -1,0 +1,38 @@
+# VCS and editor metadata
+.git
+.gitignore
+.idea
+.vscode
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime/data artifacts
+reports/
+runs/
+logs/
+runtime/
+state/
+backups/
+data/
+
+# Local temp and split work files
+.tmp_release_split/
+tmp/
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
