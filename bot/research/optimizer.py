@@ -354,7 +354,127 @@ def build_stage_b_summary(
     }
 
 
-def optimizer_rank_key(summary: Mapping[str, Any]) -> tuple[float, float, float, float]:
+def _normalize_quality_mode(value: str | None) -> str:
+    mode = str(value or "strict").strip().lower()
+    if mode not in {"strict", "off"}:
+        mode = "strict"
+    return mode
+
+
+def _normalize_quality_windows(values: Sequence[str] | None) -> list[str]:
+    if not values:
+        return ["is", "oos"]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        key = str(item).strip().lower()
+        if key not in {"is", "oos"} or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out or ["is", "oos"]
+
+
+def _normalize_blocked_flags(values: Sequence[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values or []:
+        key = str(item).strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _summary_flags(summary: Mapping[str, Any] | None) -> set[str]:
+    if not isinstance(summary, Mapping):
+        return set()
+    raw = summary.get("anomaly_flags", [])
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return set()
+    out: set[str] = set()
+    for item in raw:
+        key = str(item).strip().upper()
+        if key:
+            out.add(key)
+    return out
+
+
+def _summary_non_negative_int(summary: Mapping[str, Any] | None, key: str) -> int:
+    if not isinstance(summary, Mapping):
+        return 0
+    try:
+        value = int(float(summary.get(key, 0)))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def evaluate_quality_filter(
+    *,
+    is_summary: Mapping[str, Any] | None,
+    oos_summary: Mapping[str, Any] | None,
+    mode: str = "strict",
+    apply_windows: Sequence[str] | None = ("is", "oos"),
+    blocked_anomaly_flags: Sequence[str] | None = ("PF_EXTREME", "PAYOFF_EXTREME", "LOSS_TINY_VS_SPREAD"),
+    min_is_trades: int = 120,
+    min_oos_trades: int = 120,
+    require_orders_submitted: bool = True,
+    require_trades_filled: bool = True,
+) -> dict[str, Any]:
+    normalized_mode = _normalize_quality_mode(mode)
+    windows = _normalize_quality_windows(apply_windows)
+    blocked = set(_normalize_blocked_flags(blocked_anomaly_flags))
+
+    flags_is = _summary_flags(is_summary)
+    flags_oos = _summary_flags(oos_summary)
+    reasons: list[str] = []
+
+    if normalized_mode == "strict":
+        if "is" in windows:
+            if not isinstance(is_summary, Mapping):
+                reasons.append("IS_SUMMARY_MISSING")
+            else:
+                is_trades = _summary_non_negative_int(is_summary, "trades")
+                if is_trades < max(0, int(min_is_trades)):
+                    reasons.append(f"IS_TRADES_BELOW_MIN:{is_trades}<{int(min_is_trades)}")
+                if blocked:
+                    hit = sorted(flags_is.intersection(blocked))
+                    if hit:
+                        reasons.append(f"IS_ANOMALY_FLAGS:{'|'.join(hit)}")
+                if require_orders_submitted and _summary_non_negative_int(is_summary, "orders_submitted") <= 0:
+                    reasons.append("IS_ORDERS_SUBMITTED_ZERO")
+                if require_trades_filled and _summary_non_negative_int(is_summary, "trades_filled") <= 0:
+                    reasons.append("IS_TRADES_FILLED_ZERO")
+
+        if "oos" in windows:
+            if not isinstance(oos_summary, Mapping):
+                reasons.append("OOS_SUMMARY_MISSING")
+            else:
+                oos_trades = _summary_non_negative_int(oos_summary, "trades")
+                if oos_trades < max(0, int(min_oos_trades)):
+                    reasons.append(f"OOS_TRADES_BELOW_MIN:{oos_trades}<{int(min_oos_trades)}")
+                if blocked:
+                    hit = sorted(flags_oos.intersection(blocked))
+                    if hit:
+                        reasons.append(f"OOS_ANOMALY_FLAGS:{'|'.join(hit)}")
+                if require_orders_submitted and _summary_non_negative_int(oos_summary, "orders_submitted") <= 0:
+                    reasons.append("OOS_ORDERS_SUBMITTED_ZERO")
+                if require_trades_filled and _summary_non_negative_int(oos_summary, "trades_filled") <= 0:
+                    reasons.append("OOS_TRADES_FILLED_ZERO")
+
+    return {
+        "quality_mode": normalized_mode,
+        "quality_windows": windows,
+        "quality_pass": len(reasons) == 0,
+        "quality_reasons": reasons,
+        "anomaly_flags_is": sorted(flags_is),
+        "anomaly_flags_oos": sorted(flags_oos),
+    }
+
+
+def optimizer_rank_key(summary: Mapping[str, Any]) -> tuple[float, float, float, float, float]:
     return objective_rank_key(summary)
 
 

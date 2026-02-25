@@ -53,10 +53,117 @@ class SizingResult:
     clamped: bool = False          # True if qty was clamped by min/max
 
 
+class GoldCfdSizingStatus(str, Enum):
+    OK = "OK"
+    BLOCKED_INVALID_SL = "BLOCKED_INVALID_SL"
+    BLOCKED_MIN_QTY = "BLOCKED_MIN_QTY"
+    BLOCKED_RISK_TOO_HIGH = "BLOCKED_RISK_TOO_HIGH"
+
+
+@dataclass(slots=True)
+class GoldCfdSizingResult:
+    status: str
+    raw_qty_oz: float
+    rounded_qty_oz: float
+    risk_pln: float
+    real_risk_pln: float
+    sl_pts: float
+    point_size_pln: float
+    debug_reason: str
+
+
 def _floor_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     return math.floor(value / step) * step
+
+
+def compute_gold_cfd_position_size(
+    *,
+    equity_pln: float,
+    risk_pct: float,
+    entry_price_pln_per_oz: float,
+    stop_loss_price_pln_per_oz: float,
+    max_risk_multiplier: float = 1.05,
+    min_qty_oz: float = 0.01,
+    qty_step_oz: float = 0.01,
+    point_size_pln: float = 0.01,
+    symbol: str = "XAUUSD",
+) -> GoldCfdSizingResult:
+    if point_size_pln <= 0:
+        raise ValueError("point_size_pln must be > 0")
+    if qty_step_oz <= 0:
+        raise ValueError("qty_step_oz must be > 0")
+    if min_qty_oz <= 0:
+        raise ValueError("min_qty_oz must be > 0")
+
+    risk_pln = float(equity_pln) * float(risk_pct)
+    sl_pts = abs(float(entry_price_pln_per_oz) - float(stop_loss_price_pln_per_oz)) / float(point_size_pln)
+
+    if sl_pts <= 0:
+        return GoldCfdSizingResult(
+            status=GoldCfdSizingStatus.BLOCKED_INVALID_SL.value,
+            raw_qty_oz=0.0,
+            rounded_qty_oz=0.0,
+            risk_pln=round(risk_pln, 8),
+            real_risk_pln=0.0,
+            sl_pts=round(sl_pts, 8),
+            point_size_pln=round(float(point_size_pln), 8),
+            debug_reason=(
+                f"{symbol}: invalid SL distance. "
+                f"entry={entry_price_pln_per_oz:.8f}, stop={stop_loss_price_pln_per_oz:.8f}, sl_pts={sl_pts:.8f}"
+            ),
+        )
+
+    value_per_point_pln_for_1oz = float(point_size_pln)
+    raw_qty_oz = risk_pln / (sl_pts * value_per_point_pln_for_1oz)
+    rounded_qty_oz = _floor_step(raw_qty_oz, float(qty_step_oz))
+
+    if rounded_qty_oz < float(min_qty_oz):
+        real_risk_pln = rounded_qty_oz * sl_pts * float(point_size_pln)
+        return GoldCfdSizingResult(
+            status=GoldCfdSizingStatus.BLOCKED_MIN_QTY.value,
+            raw_qty_oz=round(raw_qty_oz, 8),
+            rounded_qty_oz=round(rounded_qty_oz, 8),
+            risk_pln=round(risk_pln, 8),
+            real_risk_pln=round(real_risk_pln, 8),
+            sl_pts=round(sl_pts, 8),
+            point_size_pln=round(float(point_size_pln), 8),
+            debug_reason=(
+                f"{symbol}: rounded qty below min. "
+                f"raw_qty={raw_qty_oz:.8f}, rounded_qty={rounded_qty_oz:.8f}, min_qty={min_qty_oz:.8f}"
+            ),
+        )
+
+    real_risk_pln = rounded_qty_oz * sl_pts * float(point_size_pln)
+    if real_risk_pln > (risk_pln * float(max_risk_multiplier)):
+        return GoldCfdSizingResult(
+            status=GoldCfdSizingStatus.BLOCKED_RISK_TOO_HIGH.value,
+            raw_qty_oz=round(raw_qty_oz, 8),
+            rounded_qty_oz=round(rounded_qty_oz, 8),
+            risk_pln=round(risk_pln, 8),
+            real_risk_pln=round(real_risk_pln, 8),
+            sl_pts=round(sl_pts, 8),
+            point_size_pln=round(float(point_size_pln), 8),
+            debug_reason=(
+                f"{symbol}: real risk above cap. "
+                f"real_risk={real_risk_pln:.8f}, cap={(risk_pln * float(max_risk_multiplier)):.8f}"
+            ),
+        )
+
+    return GoldCfdSizingResult(
+        status=GoldCfdSizingStatus.OK.value,
+        raw_qty_oz=round(raw_qty_oz, 8),
+        rounded_qty_oz=round(rounded_qty_oz, 8),
+        risk_pln=round(risk_pln, 8),
+        real_risk_pln=round(real_risk_pln, 8),
+        sl_pts=round(sl_pts, 8),
+        point_size_pln=round(float(point_size_pln), 8),
+        debug_reason=(
+            f"{symbol}: sizing ok. "
+            f"risk={risk_pln:.8f}, sl_pts={sl_pts:.8f}, raw_qty={raw_qty_oz:.8f}, rounded_qty={rounded_qty_oz:.8f}"
+        ),
+    )
 
 
 def compute_position_size(req: SizingRequest) -> SizingResult:

@@ -132,6 +132,20 @@ research:
     seed: 42
     top_gate_keep: 10
     top_final_keep: 20
+    capitals:
+      - equity: 10000
+        currency: "USD"
+      - equity: 100
+        currency: "PLN"
+    capital_run_mode: "sequential"
+    quality_filter:
+      mode: "strict"
+      apply_windows: ["is", "oos"]
+      blocked_anomaly_flags: ["PF_EXTREME", "PAYOFF_EXTREME", "LOSS_TINY_VS_SPREAD"]
+      min_is_trades: 120
+      min_oos_trades: 120
+      require_orders_submitted: true
+      require_trades_filled: true
   search_space:
     gate:
       trend_thr: [0.0004, 0.0006, 0.0008, 0.0010, 0.0012, 0.0015, 0.0020, 0.0025, 0.0030]

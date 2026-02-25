@@ -1145,6 +1145,68 @@ class DiagnosticsConfig(BaseModel):
     decision_trace_auto_enable_backtest: bool = False
 
 
+class ResearchCapitalConfig(BaseModel):
+    equity: float
+    currency: str = "USD"
+
+    @model_validator(mode="after")
+    def validate_capital(self) -> "ResearchCapitalConfig":
+        if self.equity <= 0:
+            raise ValueError("research.optimize.capitals.equity must be > 0")
+        self.currency = str(self.currency or "USD").strip().upper() or "USD"
+        return self
+
+
+class ResearchQualityFilterConfig(BaseModel):
+    mode: str = "strict"
+    apply_windows: list[str] = Field(default_factory=lambda: ["is", "oos"])
+    blocked_anomaly_flags: list[str] = Field(
+        default_factory=lambda: ["PF_EXTREME", "PAYOFF_EXTREME", "LOSS_TINY_VS_SPREAD"]
+    )
+    min_is_trades: int = 120
+    min_oos_trades: int = 120
+    require_orders_submitted: bool = True
+    require_trades_filled: bool = True
+
+    @model_validator(mode="after")
+    def validate_quality_filter(self) -> "ResearchQualityFilterConfig":
+        self.mode = str(self.mode or "strict").strip().lower()
+        if self.mode not in {"strict", "off"}:
+            raise ValueError("research.optimize.quality_filter.mode must be strict or off")
+
+        normalized_windows: list[str] = []
+        seen_windows: set[str] = set()
+        for item in self.apply_windows:
+            key = str(item).strip().lower()
+            if key not in {"is", "oos"}:
+                continue
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            normalized_windows.append(key)
+        if not normalized_windows:
+            raise ValueError("research.optimize.quality_filter.apply_windows must contain is and/or oos")
+        self.apply_windows = normalized_windows
+
+        normalized_flags: list[str] = []
+        seen_flags: set[str] = set()
+        for item in self.blocked_anomaly_flags:
+            key = str(item).strip().upper()
+            if not key or key in seen_flags:
+                continue
+            seen_flags.add(key)
+            normalized_flags.append(key)
+        if self.mode == "strict" and not normalized_flags:
+            raise ValueError("research.optimize.quality_filter.blocked_anomaly_flags cannot be empty in strict mode")
+        self.blocked_anomaly_flags = normalized_flags
+
+        if self.min_is_trades < 0:
+            raise ValueError("research.optimize.quality_filter.min_is_trades must be >= 0")
+        if self.min_oos_trades < 0:
+            raise ValueError("research.optimize.quality_filter.min_oos_trades must be >= 0")
+        return self
+
+
 class ResearchOptimizeConfig(BaseModel):
     enabled: bool = False
     runtime_budget: str = "deep"
@@ -1157,6 +1219,9 @@ class ResearchOptimizeConfig(BaseModel):
     seed: int = 42
     top_gate_keep: int = 10
     top_final_keep: int = 20
+    capitals: list[ResearchCapitalConfig] = Field(default_factory=list)
+    capital_run_mode: str = "sequential"
+    quality_filter: ResearchQualityFilterConfig = Field(default_factory=ResearchQualityFilterConfig)
 
     @model_validator(mode="after")
     def validate_optimize(self) -> "ResearchOptimizeConfig":
@@ -1183,6 +1248,9 @@ class ResearchOptimizeConfig(BaseModel):
             raise ValueError("research.optimize.top_gate_keep must be >= 1")
         if self.top_final_keep < 1:
             raise ValueError("research.optimize.top_final_keep must be >= 1")
+        self.capital_run_mode = str(self.capital_run_mode or "sequential").strip().lower()
+        if self.capital_run_mode not in {"sequential", "parallel"}:
+            raise ValueError("research.optimize.capital_run_mode must be sequential or parallel")
         return self
 
 

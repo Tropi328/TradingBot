@@ -21,6 +21,11 @@ def test_augment_report_adds_required_research_fields() -> None:
         "commission_cost_sum": 3.0,
         "swap_cost_sum": 4.0,
         "fx_cost_sum": 5.0,
+        "orders_submitted": 7,
+        "trades_filled": 3,
+        "anomaly_flags": ["PF_EXTREME"],
+        "profit_factor_net": 2.5,
+        "payoff_ratio": 1.3,
     }
     enriched = augment_report(
         report,
@@ -39,6 +44,11 @@ def test_augment_report_adds_required_research_fields() -> None:
     assert enriched["blocked_by_reason"]["SIZE_TOO_SMALL"] == 4
     assert enriched["blocked_by_reason"]["NEWS_WINDOW"] == 2
     assert enriched["cost_breakdown_net"]["fx_cost_sum"] == 5.0
+    assert enriched["orders_submitted"] == 7
+    assert enriched["trades_filled"] == 3
+    assert enriched["anomaly_flags"] == ["PF_EXTREME"]
+    assert enriched["profit_factor_net"] == 2.5
+    assert enriched["payoff_ratio"] == 1.3
     assert enriched["max_drawdown_pct_peak"] == 10.0
     assert enriched["max_drawdown_pct_initial"] == 10.0
     assert enriched["max_drawdown_pct"] == 10.0
@@ -52,6 +62,9 @@ def test_aggregate_reports_applies_dd_cap_objective_filter() -> None:
             "max_drawdown_pct_peak": 30.0,
             "max_drawdown_pct_initial": 30.0,
             "expectancy": 1.0,
+            "orders_submitted": 6,
+            "trades_filled": 4,
+            "anomaly_flags": ["PAYOFF_EXTREME"],
         },
         {
             "trades": 60,
@@ -59,6 +72,9 @@ def test_aggregate_reports_applies_dd_cap_objective_filter() -> None:
             "max_drawdown_pct_peak": 12.0,
             "max_drawdown_pct_initial": 12.0,
             "expectancy": 2.0,
+            "orders_submitted": 7,
+            "trades_filled": 5,
+            "anomaly_flags": ["PF_EXTREME"],
         },
     ]
     summary = aggregate_reports(
@@ -73,6 +89,9 @@ def test_aggregate_reports_applies_dd_cap_objective_filter() -> None:
     assert summary["trades"] == 140
     assert summary["max_drawdown_pct_peak"] == 30.0
     assert summary["max_drawdown_pct_initial"] == 30.0
+    assert summary["orders_submitted"] == 13
+    assert summary["trades_filled"] == 9
+    assert summary["anomaly_flags"] == ["PAYOFF_EXTREME", "PF_EXTREME"]
     assert summary["constraint_dd_cap_pass"] is False
     assert summary["objective_value"] == OBJECTIVE_FAIL_VALUE
 

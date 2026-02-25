@@ -32,3 +32,21 @@ def test_optimizer_rank_key_tie_break_policy() -> None:
     assert optimizer_rank_key(best) < optimizer_rank_key(lower_pnl)
     assert optimizer_rank_key(best) < optimizer_rank_key(higher_dd)
     assert optimizer_rank_key(best) < optimizer_rank_key(lower_expectancy)
+
+
+def test_optimizer_rank_key_prioritizes_quality_pass_over_raw_objective() -> None:
+    quality_pass = {
+        "quality_pass": True,
+        "objective_value": 10.0,
+        "oos_total_pnl_net": 100.0,
+        "oos_dd_ref_pct": 5.0,
+        "oos_expectancy_net": 1.0,
+    }
+    quality_fail_with_higher_objective = {
+        "quality_pass": False,
+        "objective_value": 999.0,
+        "oos_total_pnl_net": 999.0,
+        "oos_dd_ref_pct": 1.0,
+        "oos_expectancy_net": 9.0,
+    }
+    assert optimizer_rank_key(quality_pass) < optimizer_rank_key(quality_fail_with_higher_objective)

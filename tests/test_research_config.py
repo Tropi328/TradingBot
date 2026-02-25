@@ -15,6 +15,9 @@ def test_research_config_defaults() -> None:
     assert cfg.optimize.runtime_budget == "deep"
     assert cfg.optimize.objective_mode == "risk_adjusted_pnl_dd"
     assert cfg.optimize.top_gate_keep == 10
+    assert cfg.optimize.capital_run_mode == "sequential"
+    assert cfg.optimize.quality_filter.mode == "strict"
+    assert cfg.optimize.quality_filter.apply_windows == ["is", "oos"]
     assert len(cfg.search_space.risk_profiles) == 12
 
 

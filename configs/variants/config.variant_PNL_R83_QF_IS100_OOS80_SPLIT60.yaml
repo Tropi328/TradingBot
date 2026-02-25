@@ -134,6 +134,11 @@ monitoring:
   log_decision_reasons: true
 research:
   dd_cap_basis: both
+  optimize:
+    split_ratio_is: 0.60
+    quality_filter:
+      min_is_trades: 100
+      min_oos_trades: 80
 diagnostics:
   decision_trace_auto_enable_backtest: false
 strategy_runtime:

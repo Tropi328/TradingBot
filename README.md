@@ -124,14 +124,15 @@ If one symbol has missing data in the requested range, research stores a `partia
 so you can still compare modes on symbols that completed.
 
 ## Research optimize (deep PnL+DD pipeline)
-Use `--research-optimize` to run a two-stage optimizer:
+Use `--research-optimize` to run a two-stage optimizer with optional dual-capital qualification:
 - Stage A: gate-only sweep on IS (70% split by UTC day)
 - Stage B: top gates x risk presets on IS+OOS (30%)
 - ranking objective: `risk_adjusted_pnl_dd = oos_total_pnl_net / max(oos_dd_ref_pct, 0.25)`
 - hard DD constraint enforced with `dd_cap_basis` (`both` recommended)
+- strict quality filter (`IS+OOS`) can reject overfit/anomalous candidates before winner selection
 
 CLI:
-`python main.py --research-optimize --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --research-benchmark-symbols XAUUSD --research-dd-cap 25 --research-dd-cap-basis both --research-workers 3 --research-runtime-budget deep`
+`python main.py --research-optimize --backtest-start 2024-01-01 --backtest-end 2025-02-01 --backtest-tf 5m --backtest-price mid --backtest-data-root data --config configs/variants/config.variant_PNL_R83.yaml --research-benchmark-symbols XAUUSD --research-dd-cap 25 --research-dd-cap-basis both --research-workers 3 --research-runtime-budget deep --research-capitals 10000:USD,100:PLN --research-capital-run-mode sequential`
 
 Key config:
 ```yaml
@@ -148,6 +149,20 @@ research:
     seed: 42
     top_gate_keep: 10
     top_final_keep: 20
+    capitals:
+      - equity: 10000
+        currency: "USD"
+      - equity: 100
+        currency: "PLN"
+    capital_run_mode: "sequential"
+    quality_filter:
+      mode: "strict"
+      apply_windows: ["is", "oos"]
+      blocked_anomaly_flags: ["PF_EXTREME", "PAYOFF_EXTREME", "LOSS_TINY_VS_SPREAD"]
+      min_is_trades: 120
+      min_oos_trades: 120
+      require_orders_submitted: true
+      require_trades_filled: true
   search_space:
     gate: ...
     risk_profiles: ...
@@ -156,12 +171,20 @@ research:
 Artifacts:
 - `reports/research_opt/<timestamp>/search_space.json`
 - `reports/research_opt/<timestamp>/split_info.json`
-- `reports/research_opt/<timestamp>/stage_a_gate_is.csv`
-- `reports/research_opt/<timestamp>/stage_b_gate_risk_is_oos.csv`
-- `reports/research_opt/<timestamp>/top20.json`
-- `reports/research_opt/<timestamp>/best.json`
-- `reports/research_opt/<timestamp>/checkpoint.json` (resume state)
-- `configs/variants/config.variant_RESEARCH_OPT_BEST.yaml` (auto-generated winner config)
+- `reports/research_opt/<timestamp>/capital_<EQUITY>_<CCY>/...`:
+  - `stage_a_gate_is.csv`
+  - `stage_b_gate_risk_is_oos.csv`
+  - `top20.json`
+  - `best.json`
+  - `checkpoint.json`
+- `reports/research_opt/<timestamp>/dual_capital_summary.json`
+- `reports/research_opt/<timestamp>/dual_capital_ranking.csv`
+- `reports/research_opt/<timestamp>/winner_qualification.json`
+- `configs/variants/config.variant_RESEARCH_OPT_BEST_10K_USD.yaml`
+- `configs/variants/config.variant_RESEARCH_OPT_BEST_100PLN.yaml`
+
+Note:
+- when `--research-capitals` includes `PLN`, config must define `fx_static_rates.USDPLN`; optimizer fails fast otherwise.
 
 ## Recommended variants
 - Stress/aggressive profile:
