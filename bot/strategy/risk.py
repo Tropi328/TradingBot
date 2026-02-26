@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from bot.config import RiskConfig
 from bot.storage.models import DailyStats, PositionRecord
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -25,7 +28,8 @@ class RiskEngine:
         if not self.risk.low_equity_mode_enabled:
             return False
         eq = self._resolved_equity(equity)
-        # Relative threshold: use pct of initial equity if configured
+        # Priority: pct of *initial* equity (risk.equity) > absolute threshold.
+        # Only one path is active at a time; config validator ensures threshold > 0.
         if self.risk.low_equity_threshold_pct > 0:
             threshold = float(self.risk.equity) * float(self.risk.low_equity_threshold_pct)
         else:
@@ -34,10 +38,22 @@ class RiskEngine:
 
     def effective_risk_per_trade(self, *, risk_multiplier: float = 1.0, equity: float | None = None) -> float:
         base = max(0.0, float(self.risk.risk_per_trade) * max(0.0, float(risk_multiplier)))
-        if self.is_low_equity_mode(equity):
-            base *= self.risk.low_equity_risk_multiplier
-            base = min(base, self.risk.low_equity_risk_per_trade_cap)
-        return min(base, 1.0)
+        low_eq = self.is_low_equity_mode(equity)
+        if low_eq:
+            pre_cap = base * self.risk.low_equity_risk_multiplier
+            base = min(pre_cap, self.risk.low_equity_risk_per_trade_cap)
+        result = min(base, 1.0)
+        if low_eq and result < 0.005:
+            LOGGER.warning(
+                "effective_risk_per_trade very low: %.4f%% "
+                "(base=%.4f, risk_mult=%.3f, low_eq_mult=%.3f). "
+                "Review risk config.",
+                result * 100,
+                float(self.risk.risk_per_trade),
+                risk_multiplier,
+                float(self.risk.low_equity_risk_multiplier),
+            )
+        return result
 
     def effective_max_trades_per_day(self, equity: float | None = None) -> int:
         if self.is_low_equity_mode(equity):
@@ -137,12 +153,13 @@ class RiskEngine:
         if projected_risk_pct > self.risk.max_total_risk_pct:
             reasons.append("GLOBAL_MAX_TOTAL_RISK_REACHED")
 
+        # Pre-normalize open position epics once to avoid repeated
+        # .strip().upper() calls per position × per group in the inner loop.
+        open_epics = [p.epic.strip().upper() for p in all_open_positions]
         for group in self.risk.correlation_groups:
             if epic not in group.epics:
                 continue
-            open_in_group = sum(
-                1 for position in all_open_positions if position.epic.strip().upper() in group.epics
-            )
+            open_in_group = sum(1 for e in open_epics if e in group.epics)
             if open_in_group >= group.max_open_positions:
                 reasons.append(f"CORRELATION_LIMIT_{group.name}")
 

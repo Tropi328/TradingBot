@@ -42,7 +42,7 @@ class _MissProbe:
 @dataclass(slots=True)
 class _ScalpState:
     bias: BiasState | None = None
-    queue: deque[SetupCandidate] = field(default_factory=deque)
+    queue: deque[SetupCandidate] = field(default_factory=lambda: deque(maxlen=50))
     last_evaluation: StrategyEvaluation | None = None
     last_order: StrategySignal | None = None
     last_candidate_at: datetime | None = None
@@ -418,6 +418,20 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             active.append(probe)
             active_keys.add(probe.miss_key)
             active_semantic_keys.add(probe.semantic_key)
+        # Hard cap: never keep more than 200 active probes per symbol.
+        # Under normal operation ~10-20 probes are expected; this guards
+        # against edge cases where expiry timestamps are far in the future.
+        _MAX_ACTIVE_PROBES = 200
+        if len(active) > _MAX_ACTIVE_PROBES:
+            LOGGER.warning(
+                "Probe list for %s exceeded %d entries (%d active); trimming oldest.",
+                active[0].symbol if active else "?",
+                _MAX_ACTIVE_PROBES,
+                len(active),
+            )
+            active = active[-_MAX_ACTIVE_PROBES:]
+            active_keys = {p.miss_key for p in active}
+            active_semantic_keys = {p.semantic_key for p in active}
         state.probes = active
         state.recent_probe_keys = active_keys
         state.recent_probe_semantic_keys = active_semantic_keys

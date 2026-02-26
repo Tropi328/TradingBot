@@ -150,9 +150,10 @@ def extract_features(
         except (TypeError, ValueError):
             location_score = 0.5
 
-    # FVG quality
-    fvg_present = 1.0 if meta.get("fvg_detected") else 0.0
+    # FVG quality — require non-zero size to count as present;
+    # fvg_detected=True with fvg_size=0 (missing) should not grant the presence bonus.
     fvg_size = float(meta.get("fvg_size", 0))
+    fvg_present = 1.0 if meta.get("fvg_detected") and fvg_size > 0 else 0.0
     fvg_size_atr = fvg_size / atr if atr > 0 else 0
     fvg_mid = meta.get("fvg_mid")
     fvg_dist = abs(float(fvg_mid) - close_price) / atr if fvg_mid is not None and atr > 0 else 0
@@ -351,10 +352,13 @@ def heuristic_score_v3(features: dict[str, float]) -> float:
     score -= features.get("news_blocked", 0) * _HEURISTIC_PENALTIES["news_blocked"]
     score -= features.get("v2_penalty_total", 0) * _HEURISTIC_PENALTIES["v2_penalty_total"]
 
-    if features.get("spread_ratio", 0) > 0.20:
+    # Pessimistic defaults: missing spread_ratio → assume high (penalty applies),
+    # missing rr_ratio → assume low (penalty applies). This prevents bypassing
+    # penalties when features dict is incomplete.
+    if features.get("spread_ratio", 0.5) > 0.20:
         score -= _HEURISTIC_PENALTIES["spread_too_high"]
 
-    if features.get("rr_ratio", 2.0) < 1.5:
+    if features.get("rr_ratio", 0.0) < 1.5:
         score -= _HEURISTIC_PENALTIES["low_rr"]
 
     return max(0.0, min(100.0, round(score, 2)))

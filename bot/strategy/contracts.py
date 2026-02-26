@@ -18,6 +18,23 @@ class DecisionAction(str, Enum):
     SKIP = "SKIP"
 
 
+class SetupState:
+    """String constants for setup_state metadata field.
+
+    Using class constants instead of scattered magic strings prevents typos
+    and provides a single place to see all valid states.
+    """
+    READY = "READY"
+    WAIT_MITIGATION = "WAIT_MITIGATION"
+    WAIT_REACTION = "WAIT_REACTION"
+    ACTIVE = "ACTIVE"
+    EXPIRED = "EXPIRED"
+    TRIGGERED = "TRIGGERED"
+
+    # States that block immediate execution (used in ReactionGate)
+    PENDING_STATES: frozenset[str] = frozenset({WAIT_MITIGATION, WAIT_REACTION})
+
+
 @dataclass(slots=True)
 class BiasState:
     symbol: str

@@ -145,7 +145,7 @@ backtest_tuning:
   tp_target_a_plus_r: 3.2
   tp_profile_mode: "strict_tp_price"
   trailing_after_tp1: true
-  trailing_swing_window_bars: 10
+  trailing_swing_window_bars: 20
   trailing_buffer_r: 0.07
   expected_rr_min: 2.0
   expected_rr_lookback_bars: 120

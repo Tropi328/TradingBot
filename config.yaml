@@ -110,6 +110,9 @@ daily_gate:
   pre_minutes: 30
   post_minutes: 30
   allowed_strategies: []
+# capital_ramp: disabled while validating strategy stability on current equity level.
+# Re-enable once live PnL is consistently positive over 30+ trading days.
+# When enabled, equity is gradually increased from initial to target over N months.
 capital_ramp:
   enabled: false
 research:
@@ -255,17 +258,22 @@ backtest_tuning:
   wait_timeout_small_risk_multiplier: 0.4
   wait_timeout_soft_grace_bars: 3
   max_loss_r_cap: 1.0
-  tp1_trigger_r: 1.2
+  # TP1 at 1.5R matches user minimum RR (was 1.2 — below the 1.5:1 floor).
+  # BE moves to +0.25R after TP1 (was 0.05 — near-zero, caused 65% of position
+  # to stop out for almost no profit, dragging avg_R to ~0.049).
+  # Trailing buffer widened 0.08→0.15 R to avoid normal-retrace stop-outs.
+  # Trailing window widened 10→20 bars (50→100 min on M5) for the same reason.
+  tp1_trigger_r: 1.5
   tp1_fraction: 0.35
-  be_offset_r: 0.05
+  be_offset_r: 0.25
   be_delay_bars_after_tp1: 2
   tp_target_min_r: 2.0
   tp_target_max_r: 2.0
   tp_target_a_plus_r: 3.0
   tp_profile_mode: "strict_tp_price"
   trailing_after_tp1: true
-  trailing_swing_window_bars: 10
-  trailing_buffer_r: 0.08
+  trailing_swing_window_bars: 20
+  trailing_buffer_r: 0.15
   expected_rr_min: 2.0
   expected_rr_lookback_bars: 120
   segment_soft_gap_minutes: 120
@@ -295,6 +303,9 @@ backtest_tuning:
     GOLD: 0.65
   broker_leverage: 20.0
   broker_margin_requirement_pct: 5.0
+  # Overnight swap rates are kept here for reference and backtest cost modeling,
+  # but are NOT incurred in live trading because no_overnight=true forces all
+  # positions to close before the 23:00 UTC rollover window.
   overnight_swap_time_utc: "23:00"
   overnight_swap_long_pct: -0.016
   overnight_swap_short_pct: 0.0076

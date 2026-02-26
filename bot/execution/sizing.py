@@ -35,7 +35,9 @@ def position_size_from_risk(
     sized = floor_to_step(raw_size, size_step)
     if sized < min_size:
         if allow_min_size_fallback and min_size_fallback_max_risk_pct > 0 and equity > 0:
-            fallback_size = ceil_to_step(min_size, size_step)
+            # Use min_size directly (not rounded up via ceil_to_step) to avoid
+            # inflating the order size — and thus risk — beyond the cap check.
+            fallback_size = min_size
             fallback_risk = fallback_size * risk_distance
             fallback_risk_cap = equity * min_size_fallback_max_risk_pct
             if fallback_risk <= fallback_risk_cap:

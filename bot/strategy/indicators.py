@@ -44,11 +44,16 @@ def _atr_cache_store(key: tuple, entry: _AtrCacheEntry) -> None:
 
 
 def _atr_cache_key(candles: list[Candle], period: int) -> tuple:
-    """Content-based cache key that is immune to id() reuse after GC."""
+    """Content-based cache key immune to id() reuse after GC.
+
+    Includes the last candle's close price so that in-place bar updates
+    (e.g., partial candles being finalised) invalidate the cache correctly.
+    """
     n = len(candles)
     ts0 = candles[0].timestamp if n else None
     tsN = candles[-1].timestamp if n else None
-    return (n, ts0, tsN, int(period))
+    last_close = round(candles[-1].close, 6) if n else None
+    return (n, ts0, tsN, last_close, int(period))
 
 
 def atr(candles: list[Candle], period: int) -> list[float | None]:

@@ -137,16 +137,16 @@ backtest_tuning:
   wait_timeout_small_risk_multiplier: 0.4
   wait_timeout_soft_grace_bars: 3
   max_loss_r_cap: 1.0
-  tp1_trigger_r: 1.2
+  tp1_trigger_r: 1.5
   tp1_fraction: 0.3
-  be_offset_r: 0.05
+  be_offset_r: 0.25
   be_delay_bars_after_tp1: 2
   tp_target_min_r: 2.0
   tp_target_max_r: 2.0
   tp_target_a_plus_r: 3.0
   tp_profile_mode: strict_tp_price
   trailing_after_tp1: true
-  trailing_swing_window_bars: 10
+  trailing_swing_window_bars: 20
   trailing_buffer_r: 0.09
   expected_rr_min: 2.0
   expected_rr_lookback_bars: 120

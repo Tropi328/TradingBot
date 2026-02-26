@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 from bot.config import AppConfig
+
+LOGGER = logging.getLogger(__name__)
 from bot.strategy.contracts import (
     BiasState,
     DecisionAction,
     SetupCandidate,
+    SetupState,
     StrategyDataBundle,
     StrategyEvaluation,
     StrategyPlugin,
@@ -75,6 +79,33 @@ BACKTEST_HARD_GATE_POLICY = HardGatePolicy(
 
 def clamp_value(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
+
+
+def resolve_spread(
+    evaluation: "StrategyEvaluation",
+    *,
+    policy_source: str = "snapshot_only",
+) -> float | None:
+    """Single authoritative spread resolver used by both scoring and gates.
+
+    policy_source:
+      "snapshot_only"        – live mode; only trust real bid/ask snapshot
+      "snapshot_or_metadata" – backtest mode; fall back to metadata spread
+    """
+    snap_val = evaluation.snapshot.get("spread")
+    if snap_val is not None:
+        try:
+            return float(snap_val)
+        except (TypeError, ValueError):
+            pass
+    if policy_source == "snapshot_or_metadata":
+        meta_val = evaluation.metadata.get("spread")
+        if meta_val is not None:
+            try:
+                return float(meta_val)
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def default_observe_evaluation(*, symbol: str, reason: str) -> StrategyEvaluation:
@@ -223,10 +254,7 @@ def compute_v2_score_core(
     trigger_score = clamp_value(mitigation_quality + reaction_confirmed + trigger_clean, 0.0, 40.0)
 
     atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-    if policy.spread_source == "snapshot_or_metadata":
-        spread_value = evaluation.snapshot.get("spread", evaluation.metadata.get("spread"))
-    else:
-        spread_value = evaluation.snapshot.get("spread")
+    spread_value = resolve_spread(evaluation, policy_source=policy.spread_source)
     spread_mode = str(evaluation.metadata.get("spread_mode", "REAL_BIDASK")).upper()
     spread_ratio = None
     if atr_value is not None and spread_value is not None:
@@ -266,6 +294,15 @@ def compute_v2_score_core(
         evaluation.metadata["orderflow_snapshot"] = of_dict
         evaluation.snapshot["orderflow"] = of_dict
 
+        # Minimum confidence gate: below this threshold the sample is too small
+        # or too choppy to influence scoring. The confidence already encodes
+        # data_quality (bar count / window) via the provider — see orderflow.py:186.
+        _of_min_confidence = orderflow_param(
+            route_params=route_params,
+            settings=orderflow_settings,
+            key="min_confidence_for_bonus",
+            default=0.20,
+        )
         confidence = float(orderflow_snapshot.confidence)
         chop_score = float(orderflow_snapshot.metrics.chop_score)
         of_spread_ratio = float(orderflow_snapshot.metrics.spread_ratio)
@@ -300,13 +337,19 @@ def compute_v2_score_core(
             divergence_penalty_min, divergence_penalty_max = divergence_penalty_max, divergence_penalty_min
 
         flow_alignment = clamp_value(abs(of_pressure), 0.0, 1.0)
-        of_trigger_bonus = clamp_value(
-            confidence * (1.0 - chop_score) * (0.5 + (0.5 * flow_alignment)) * trigger_bonus_cap,
-            0.0,
-            trigger_bonus_cap,
-        )
-        execution_quality = clamp_value(1.0 - (of_spread_ratio / max(max_spread_ratio, 1e-9)), 0.0, 1.0)
-        of_execution_bonus = clamp_value(confidence * execution_quality * execution_bonus_cap, 0.0, execution_bonus_cap)
+        # Only apply bonuses when confidence exceeds the minimum threshold.
+        # This prevents tiny samples (few bars) from inflating the score.
+        if confidence >= _of_min_confidence:
+            of_trigger_bonus = clamp_value(
+                confidence * (1.0 - chop_score) * (0.5 + (0.5 * flow_alignment)) * trigger_bonus_cap,
+                0.0,
+                trigger_bonus_cap,
+            )
+            execution_quality = clamp_value(1.0 - (of_spread_ratio / max(max_spread_ratio, 1e-9)), 0.0, 1.0)
+            of_execution_bonus = clamp_value(confidence * execution_quality * execution_bonus_cap, 0.0, execution_bonus_cap)
+        else:
+            of_trigger_bonus = 0.0
+            of_execution_bonus = 0.0
 
         if side in {"LONG", "SHORT"} and of_direction in {"LONG", "SHORT"} and of_direction != side:
             of_divergence_penalty = clamp_value(
@@ -452,16 +495,22 @@ def evaluate_hard_gates_core(
 
     spread_ratio = evaluation.metadata.get("spread_ratio")
     atr_value = evaluation.metadata.get("atr_m5", evaluation.snapshot.get("atr_m5"))
-    if policy.allow_mid_close_fallback_without_spread or policy.allow_ohlc_spread_soft_skip or policy.enable_confirmation_rules:
-        spread_value = evaluation.snapshot.get("spread", evaluation.metadata.get("spread"))
-        if spread_value is None:
-            quote = evaluation.metadata.get("quote")
-            if isinstance(quote, tuple) and len(quote) >= 3:
-                spread_value = quote[2]
-        close_value = evaluation.snapshot.get("close", evaluation.metadata.get("close"))
-    else:
-        spread_value = evaluation.snapshot.get("spread")
-        close_value = evaluation.snapshot.get("close")
+    # Use resolve_spread() — same helper used by scoring — for consistent spread source.
+    _gate_spread_source = (
+        "snapshot_or_metadata"
+        if (policy.allow_mid_close_fallback_without_spread or policy.allow_ohlc_spread_soft_skip or policy.enable_confirmation_rules)
+        else "snapshot_only"
+    )
+    spread_value = resolve_spread(evaluation, policy_source=_gate_spread_source)
+    if spread_value is None and _gate_spread_source == "snapshot_or_metadata":
+        quote = evaluation.metadata.get("quote")
+        if isinstance(quote, tuple) and len(quote) >= 3:
+            spread_value = quote[2]
+    close_value = (
+        evaluation.snapshot.get("close", evaluation.metadata.get("close"))
+        if _gate_spread_source == "snapshot_or_metadata"
+        else evaluation.snapshot.get("close")
+    )
     spread_mode = str(evaluation.metadata.get("spread_mode", "REAL_BIDASK")).upper()
     track_missing_features = bool(
         policy.allow_mid_close_fallback_without_spread
@@ -579,8 +628,8 @@ def evaluate_hard_gates_core(
                         reasons.append("EXEC_FAIL_CONFIRMATIONS_LOW")
 
     if policy.enable_setup_state_reaction_gate:
-        setup_state = str(evaluation.metadata.get("setup_state", "READY")).upper()
-        if setup_state in {"WAIT_MITIGATION", "WAIT_REACTION"}:
+        setup_state = str(evaluation.metadata.get("setup_state", SetupState.READY)).upper()
+        if setup_state in SetupState.PENDING_STATES:
             gates["ReactionGate"] = False
             reasons.append(f"GATE_REACTION_{setup_state}")
 
@@ -594,12 +643,15 @@ def evaluate_hard_gates_core(
             missing_features = dedup_missing
 
     evaluation.gates = gates
-    if reasons:
-        for key, value in gates.items():
-            if not value:
-                evaluation.gate_blocked = key
-                metadata_updates["gate_blocked"] = key
-                break
+    blocked_gates = [key for key, value in gates.items() if not value]
+    if blocked_gates:
+        # Report the first blocked gate as primary (backwards-compatible field)
+        # and store the full list for diagnostics.
+        evaluation.gate_blocked = blocked_gates[0]
+        metadata_updates["gate_blocked"] = blocked_gates[0]
+        if len(blocked_gates) > 1:
+            evaluation.metadata["all_blocked_gates"] = blocked_gates
+            metadata_updates["all_blocked_gates"] = blocked_gates
 
     return HardGateResult(
         gates=gates,
@@ -681,11 +733,24 @@ def risk_multiplier_for(
     route_risk: dict[str, object],
     config: AppConfig,
 ) -> float:
+    """Return the route-level risk multiplier (clamped to [0.01, 1.0]).
+
+    NOTE: this is combined multiplicatively with RiskEngine.effective_risk_per_trade()
+    which may apply an additional low_equity_risk_multiplier. The final effective
+    risk fraction seen by the sizer is:
+        risk_per_trade × risk_multiplier_for(…) × [low_equity_mult if applicable]
+    """
     signal_override = evaluation.metadata.get("risk_multiplier_override")
     if signal_override is not None:
-        return max(0.01, min(1.0, float(signal_override)))
+        mult = max(0.01, min(1.0, float(signal_override)))
+        LOGGER.debug("risk_multiplier_for: signal override → %.4f", mult)
+        return mult
     if evaluation.action == DecisionAction.SMALL:
         value = float(route_risk.get("small_risk_multiplier", config.decision_policy.small_risk_multiplier_default))
-        return max(0.01, min(1.0, value))
+        mult = max(0.01, min(1.0, value))
+        LOGGER.debug("risk_multiplier_for: SMALL action → %.4f", mult)
+        return mult
     value = float(route_risk.get("trade_risk_multiplier", config.decision_policy.trade_risk_multiplier))
-    return max(0.01, min(1.0, value))
+    mult = max(0.01, min(1.0, value))
+    LOGGER.debug("risk_multiplier_for: TRADE action → %.4f", mult)
+    return mult
