@@ -3,7 +3,6 @@ pydantic>=2.8,<3
 PyYAML>=6.0,<7
 python-dotenv>=1.0,<2
 tenacity>=9.0,<10
-pytest>=8.0,<9
 tzdata>=2024.1
 pandas>=2.2,<3
 pyarrow>=16.0,<18
@@ -11,3 +10,7 @@ matplotlib>=3.8,<4
 Pillow>=10.0,<12
 rich>=13.0,<14
 plotext>=5.2,<6
+
+# ML training (optional — only needed for `python -m bot.ml.train_v3`)
+scikit-learn>=1.5,<2
+lightgbm>=4.0,<5
