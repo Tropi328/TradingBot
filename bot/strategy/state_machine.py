@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from bot.config import AppConfig
@@ -859,7 +859,7 @@ class StrategyEngine:
             candles_m15=candles_m15,
             h1=h1,
             minimal_tick_buffer=minimal_tick_buffer,
-            now=candles_m15[-1].timestamp if candles_m15 else datetime.now(timezone.utc),
+            now=candles_m15[-1].timestamp if candles_m15 else datetime.now(UTC),
             previous=None,
         )
         decision, _ = self.evaluate_m5(

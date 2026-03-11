@@ -12,8 +12,7 @@ Multiply by ``size`` to get cash impact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -29,7 +28,7 @@ class SlippageModelConfig(BaseModel):
     beta_atr: float = 0.005
 
     @model_validator(mode="after")
-    def validate(self) -> "SlippageModelConfig":
+    def validate(self) -> SlippageModelConfig:
         if self.base_ticks < 0:
             raise ValueError("base_ticks must be >= 0")
         if self.beta_spread < 0:
@@ -52,12 +51,12 @@ class PaperCostConfig(BaseModel):
     slippage_limit: SlippageModelConfig = Field(
         default_factory=lambda: SlippageModelConfig(base_ticks=0.01, beta_spread=0.10, beta_atr=0.003)
     )
-    commission_per_side: float = 0.0    # in account currency per lot
-    swap_per_day: float = 0.0           # placeholder
+    commission_per_side: float = 0.0  # in account currency per lot
+    swap_per_day: float = 0.0  # TODO: implement per-asset swap cost model (currently always 0)
     use_bid_ask_fills: bool = True
 
     @model_validator(mode="after")
-    def validate(self) -> "PaperCostConfig":
+    def validate(self) -> PaperCostConfig:
         if self.commission_per_side < 0:
             raise ValueError("commission_per_side must be >= 0")
         return self
@@ -147,12 +146,12 @@ def compute_fill_prices(
 class RoundtripCost:
     """Estimated round-trip cost breakdown."""
 
-    spread_cost: float          # full spread (entry + exit)
-    slippage_entry: float       # slippage at entry
-    slippage_exit: float        # slippage at exit (worst-case: stop)
-    commission: float           # both sides
-    swap: float                 # daily swap estimate
-    total: float                # sum of all
+    spread_cost: float  # full spread (entry + exit)
+    slippage_entry: float  # slippage at entry
+    slippage_exit: float  # slippage at exit (worst-case: stop)
+    commission: float  # both sides
+    swap: float  # daily swap estimate
+    total: float  # sum of all
 
     def to_dict(self) -> dict[str, float]:
         return {

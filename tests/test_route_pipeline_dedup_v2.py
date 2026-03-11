@@ -88,7 +88,9 @@ class _DummyStrategy:
             )
         ]
 
-    def evaluate_candidate(self, symbol: str, candidate: SetupCandidate, data: StrategyDataBundle) -> StrategyEvaluation:
+    def evaluate_candidate(
+        self, symbol: str, candidate: SetupCandidate, data: StrategyDataBundle
+    ) -> StrategyEvaluation:
         del symbol, candidate, data
         return deepcopy(self._evaluation)
 
@@ -219,9 +221,9 @@ def test_route_pipeline_main_profile_preserves_orderflow_influence() -> None:
         spread=0.2,
         quote=quote,
         orderflow_provider=provider,
-        orderflow_default_mode="FULL",
+        orderflow_default_mode="LITE",
         orderflow_default_window=16,
-        orderflow_full_symbols={"XAUUSD"},
+        orderflow_full_symbols=set(),
         orderflow_settings=None,
     )
 
@@ -315,7 +317,9 @@ def test_route_pipeline_backtest_profile_keeps_assumed_ohlc_penalty_and_reason_d
         normalize_and_gate=lambda **kwargs: kwargs["evaluation"],
         apply_orderflow_small_soft_gate=lambda **kwargs: kwargs["evaluation"],
         build_payload=lambda **kwargs: {"score_total": kwargs["evaluation"].score_total},
-        build_reason_codes=lambda _ctx, evaluation: list(dict.fromkeys(evaluation.reasons_blocking + ["REPEAT", "REPEAT"])),
+        build_reason_codes=lambda _ctx, evaluation: list(
+            dict.fromkeys(evaluation.reasons_blocking + ["REPEAT", "REPEAT"])
+        ),
         on_outcome=lambda _ctx, outcome: outcome.reason_codes.append("REPEAT"),
     )
 

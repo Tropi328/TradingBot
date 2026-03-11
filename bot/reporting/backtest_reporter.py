@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -89,7 +89,7 @@ class BacktestMeta:
     initial_equity: float = 0.0
     config: str = ""
     data_root: str = ""
-    generated_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    generated_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -274,7 +274,7 @@ def _sanitize_path_part(value: Any) -> str:
 
 
 def _run_folder_name(meta: BacktestMeta) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     return "_".join(
         [
             _sanitize_path_part(meta.symbol).upper(),
@@ -302,7 +302,7 @@ def _to_iso_timestamp(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, datetime):
-        dt = value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        dt = value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
         return dt.isoformat()
     raw = str(value).strip()
     if not raw:
@@ -311,7 +311,7 @@ def _to_iso_timestamp(value: Any) -> str:
         raw = raw[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(raw)
-        dt = dt.astimezone(timezone.utc) if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
         return dt.isoformat()
     except ValueError:
         return str(value)
@@ -455,7 +455,7 @@ def _ordered_fields(rows: list[dict[str, Any]], preferred: list[str]) -> list[st
     seen = set(preferred)
     out = list(preferred)
     for row in rows:
-        for key in row.keys():
+        for key in row:
             if key not in seen:
                 out.append(key)
                 seen.add(key)

@@ -17,7 +17,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -117,8 +117,8 @@ INSERT INTO signal_candidates (
 
 def _to_iso(dt: datetime) -> str:
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
 
 
 def init_signal_candidates_table(conn: sqlite3.Connection) -> None:
@@ -354,8 +354,8 @@ def export_diagnostics(
         if ts_raw:
             session_start = datetime.fromisoformat(ts_raw)
         else:
-            session_start = datetime.now(timezone.utc)
-    session_end = datetime.now(timezone.utc)
+            session_start = datetime.now(UTC)
+    session_end = datetime.now(UTC)
 
     agg = SignalCandidateAggregator(conn).aggregate_window(session_start, session_end)
 

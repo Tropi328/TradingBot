@@ -4,7 +4,7 @@ import argparse
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from bot.backtest.data_provider import AutoDataLoader, MissingDataError, normalize_timeframe
@@ -36,8 +36,8 @@ def _parse_datetime(value: str) -> datetime:
         normalized = normalized[:-1] + "+00:00"
     dt = datetime.fromisoformat(normalized)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _parse_start(value: str) -> datetime:
@@ -158,7 +158,7 @@ def main() -> int:
                         end_raw=args.end,
                     )
                     continue
-                except Exception as fetch_exc:  # noqa: BLE001
+                except Exception as fetch_exc:
                     print(f"AUTOFETCH_ERROR: {fetch_exc}", file=sys.stderr)
                     return 2
             return 2

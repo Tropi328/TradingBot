@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 import logging
+from collections import OrderedDict
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -54,13 +54,13 @@ def timeframe_to_minutes(value: str) -> int:
 
 
 def _month_start(dt: datetime) -> datetime:
-    return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+    return datetime(dt.year, dt.month, 1, tzinfo=UTC)
 
 
 def _next_month(dt: datetime) -> datetime:
     if dt.month == 12:
-        return datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
-    return datetime(dt.year, dt.month + 1, 1, tzinfo=timezone.utc)
+        return datetime(dt.year + 1, 1, 1, tzinfo=UTC)
+    return datetime(dt.year, dt.month + 1, 1, tzinfo=UTC)
 
 
 def _iter_months(start_utc: datetime, end_utc: datetime) -> list[tuple[int, int]]:
@@ -80,8 +80,8 @@ def _to_utc(ts: datetime | str) -> datetime:
     else:
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 @dataclass(slots=True)
@@ -96,10 +96,7 @@ class MissingDataItem:
         return (self.symbol, self.side, self.timeframe, self.year, self.month)
 
     def to_line(self) -> str:
-        return (
-            f"symbol={self.symbol} side={self.side} tf={self.timeframe} "
-            f"year={self.year} month={self.month:02d}"
-        )
+        return f"symbol={self.symbol} side={self.side} tf={self.timeframe} year={self.year} month={self.month:02d}"
 
 
 class MissingDataError(RuntimeError):
@@ -470,8 +467,12 @@ class AutoDataLoader:
             if merged.empty:
                 raise MissingDataError(
                     [
-                        MissingDataItem(symbol=symbol, side="BID", timeframe=timeframe, year=start.year, month=start.month),
-                        MissingDataItem(symbol=symbol, side="ASK", timeframe=timeframe, year=start.year, month=start.month),
+                        MissingDataItem(
+                            symbol=symbol, side="BID", timeframe=timeframe, year=start.year, month=start.month
+                        ),
+                        MissingDataItem(
+                            symbol=symbol, side="ASK", timeframe=timeframe, year=start.year, month=start.month
+                        ),
                     ]
                 )
             frame = pd.DataFrame(
@@ -515,7 +516,7 @@ class AutoDataLoader:
             frame["close_ask"] = pd.NA
             frame["spread"] = pd.NA
             if price_mode == "mid":
-                diag["MID_FALLBACK_OHLC_CLOSE"] += int(len(frame))
+                diag["MID_FALLBACK_OHLC_CLOSE"] += len(frame)
         elif price_mode == "mid" and bid_df is not None:
             frame = pd.DataFrame(
                 {
@@ -536,7 +537,7 @@ class AutoDataLoader:
             frame["low_ask"] = pd.NA
             frame["close_ask"] = pd.NA
             frame["spread"] = pd.NA
-            diag["MID_FALLBACK_SINGLE_SIDE"] += int(len(frame))
+            diag["MID_FALLBACK_SINGLE_SIDE"] += len(frame)
         elif price_mode == "mid" and ask_df is not None:
             frame = pd.DataFrame(
                 {
@@ -557,7 +558,7 @@ class AutoDataLoader:
             frame["low_bid"] = pd.NA
             frame["close_bid"] = pd.NA
             frame["spread"] = pd.NA
-            diag["MID_FALLBACK_SINGLE_SIDE"] += int(len(frame))
+            diag["MID_FALLBACK_SINGLE_SIDE"] += len(frame)
         elif bid_df is not None and price_mode == "bid":
             frame = pd.DataFrame(
                 {
@@ -600,7 +601,11 @@ class AutoDataLoader:
             frame["spread"] = pd.NA
         else:
             raise MissingDataError(
-                [MissingDataItem(symbol=symbol, side=price_mode.upper(), timeframe=timeframe, year=start.year, month=start.month)]
+                [
+                    MissingDataItem(
+                        symbol=symbol, side=price_mode.upper(), timeframe=timeframe, year=start.year, month=start.month
+                    )
+                ]
             )
 
         if price_mode == "mid":
@@ -680,7 +685,10 @@ class AutoDataLoader:
                     allow_csv_fallback=False,
                 )
             raise MissingDataError(
-                [MissingDataItem(symbol=symbol, side=side_norm, timeframe=tf_norm, year=year, month=month) for year, month in months]
+                [
+                    MissingDataItem(symbol=symbol, side=side_norm, timeframe=tf_norm, year=year, month=month)
+                    for year, month in months
+                ]
             )
 
         preferred_tf: str
@@ -709,8 +717,7 @@ class AutoDataLoader:
                             for source in sources
                         )
                         has_1m = any(
-                            self._file_path(source, symbol, side_norm, "1m", year, month).exists()
-                            for source in sources
+                            self._file_path(source, symbol, side_norm, "1m", year, month).exists() for source in sources
                         )
                         if not has_target and not has_1m:
                             missing.append(
@@ -807,7 +814,7 @@ class AutoDataLoader:
         min_ts = sorted_ts.min()
         max_ts = sorted_ts.max()
         return {
-            "bars": int(len(frame)),
+            "bars": len(frame),
             "timeframe_minutes": tf_minutes,
             "min_ts_utc": min_ts.isoformat() if pd.notna(min_ts) else None,
             "max_ts_utc": max_ts.isoformat() if pd.notna(max_ts) else None,
@@ -862,7 +869,7 @@ class AutoDataLoader:
                 "soft_gap_minutes": soft_minutes,
                 "hard_gap_minutes": hard_minutes,
                 "segment_count": 1 if not work.empty else 0,
-                "segment_sizes": [int(len(work))] if not work.empty else [],
+                "segment_sizes": [len(work)] if not work.empty else [],
                 "gap_count_over_threshold": 0,
                 "gap_count_soft_only": 0,
                 "gaps_over_threshold": [],
@@ -920,7 +927,7 @@ class AutoDataLoader:
             "soft_gap_minutes": soft_minutes,
             "hard_gap_minutes": hard_minutes,
             "segment_count": len(segments),
-            "segment_sizes": [int(len(segment)) for segment in segments],
+            "segment_sizes": [len(segment) for segment in segments],
             "gap_count_over_threshold": int(np.count_nonzero(hard_mask)),
             "gap_count_soft_only": int(np.count_nonzero(soft_mask)),
             "gaps_over_threshold": gap_rows,
@@ -1055,8 +1062,8 @@ class AutoDataLoader:
         try:
             rel = file_path.resolve().relative_to(self.data_root.resolve())
             return rel.parts[0] if rel.parts else "unknown"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            LOGGER.debug("Cannot resolve relative path for %s", path, exc_info=True)
         parts = file_path.parts
         return parts[-6] if len(parts) >= 6 else "unknown"
 

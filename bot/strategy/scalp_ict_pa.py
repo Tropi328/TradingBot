@@ -22,6 +22,7 @@ from bot.strategy.indicators import atr, ema, latest_value, real_body
 from bot.strategy.state_machine import StrategySignal
 from bot.strategy.swings import detect_swings, index_at_or_after
 from bot.strategy.trace import closed_candles
+from bot.strategy.utils import as_bool, as_float, as_int, as_mode
 
 LOGGER = logging.getLogger(__name__)
 
@@ -98,42 +99,10 @@ class ScalpIctPriceActionStrategy(StrategyPlugin):
             self._state_by_symbol[key] = _ScalpState()
         return self._state_by_symbol[key]
 
-    @staticmethod
-    def _as_bool(value: Any, default: bool) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "on"}:
-                return True
-            if normalized in {"0", "false", "no", "off"}:
-                return False
-        return default
-
-    @staticmethod
-    def _as_float(value: Any, default: float) -> float:
-        if value is None:
-            return default
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _as_int(value: Any, default: int) -> int:
-        if value is None:
-            return default
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _as_mode(value: Any, default: str, allowed: set[str]) -> str:
-        if value is None:
-            return default
-        mode = str(value).strip().upper()
-        return mode if mode in allowed else default
+    _as_bool = staticmethod(as_bool)
+    _as_float = staticmethod(as_float)
+    _as_int = staticmethod(as_int)
+    _as_mode = staticmethod(as_mode)
 
     @staticmethod
     def _strategy_params(data: StrategyDataBundle) -> dict[str, Any]:

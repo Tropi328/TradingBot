@@ -18,9 +18,7 @@ Output: JSONL file with one record per candidate.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -325,7 +323,7 @@ class ShadowObserver:
 
     # -- context-manager protocol ------------------------------------------
 
-    def __enter__(self) -> "ShadowObserver":
+    def __enter__(self) -> ShadowObserver:
         return self
 
     def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> None:

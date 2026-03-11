@@ -1,3 +1,18 @@
+"""Orderflow analysis — candle-derived heuristic with enricher extension point.
+
+Architecture:
+  - **LITE mode** (default and only built-in mode): computes orderflow metrics
+    purely from OHLC candle data + optional bid/ask quote.
+  - **ExternalOrderflowEnricher** protocol: clean extension point for future
+    integrations (e.g. Binance futures L2, CME Gold futures tape).  When an
+    enricher is attached to ``CompositeOrderflowProvider`` it post-processes
+    the LITE snapshot with real trade/book data.
+
+The legacy FULL mode (which required a manual ``extra["orderflow_full"]``
+payload that was never provided in practice) has been removed.  Enrichers
+provide a cleaner, more composable replacement.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -53,6 +68,11 @@ def infer_orderflow_direction(metrics: OrderflowMetrics) -> tuple[str, float]:
     return ("LONG" if pressure > 0 else "SHORT"), pressure
 
 
+# =========================================================================
+#  Provider protocol + enricher extension point
+# =========================================================================
+
+
 class OrderflowProvider(Protocol):
     def get_snapshot(
         self,
@@ -66,27 +86,56 @@ class OrderflowProvider(Protocol):
         atr_value: float | None = None,
         extra: dict[str, Any] | None = None,
         mode_override: str | None = None,
-    ) -> OrderflowSnapshot:
-        ...
+    ) -> OrderflowSnapshot: ...
+
+
+class ExternalOrderflowEnricher(Protocol):
+    """Extension point for future external orderflow data sources.
+
+    Implementations receive a LITE snapshot and can replace/augment
+    any metric (e.g. real delta_ratio from Binance futures, real obi_k
+    from CME depth).  The enricher should update ``snapshot.mode`` to
+    indicate the data source (e.g. ``"BINANCE"``, ``"CME"``).
+
+    Example (future)::
+
+        class BinanceFuturesEnricher:
+            def enrich(self, snapshot, symbol):
+                book = self._fetch_book(symbol)
+                snapshot.metrics.obi_k = compute_obi(book)
+                snapshot.mode = "BINANCE"
+                return snapshot
+    """
+
+    def enrich(self, snapshot: OrderflowSnapshot, symbol: str) -> OrderflowSnapshot: ...
+
+
+# =========================================================================
+#  Composite provider — LITE + optional enricher
+# =========================================================================
 
 
 class CompositeOrderflowProvider(OrderflowProvider):
+    """Orderflow provider using candle-derived LITE heuristics.
+
+    Accepts an optional *enricher* that post-processes the LITE snapshot
+    with external data.  When no enricher is provided (default), the
+    provider operates in pure LITE mode.
+
+    Legacy parameters (``default_mode``, ``symbol_modes``) are accepted
+    for backward compatibility but ignored -- mode is always LITE unless
+    an enricher overrides it.
+    """
+
     def __init__(
         self,
         *,
         default_mode: str = "LITE",
         symbol_modes: dict[str, str] | None = None,
+        enricher: ExternalOrderflowEnricher | None = None,
     ) -> None:
-        self.default_mode = default_mode.strip().upper()
-        self.symbol_modes = {k.strip().upper(): v.strip().upper() for k, v in (symbol_modes or {}).items()}
-
-    def _resolve_mode(self, symbol: str, mode_override: str | None) -> str:
-        if mode_override:
-            mode = mode_override.strip().upper()
-            if mode in {"LITE", "FULL"}:
-                return mode
-        mode = self.symbol_modes.get(symbol.strip().upper(), self.default_mode).upper()
-        return mode if mode in {"LITE", "FULL"} else "LITE"
+        # Legacy params accepted for backward compat -- not used.
+        self._enricher = enricher
 
     def get_snapshot(
         self,
@@ -101,24 +150,17 @@ class CompositeOrderflowProvider(OrderflowProvider):
         extra: dict[str, Any] | None = None,
         mode_override: str | None = None,
     ) -> OrderflowSnapshot:
-        mode = self._resolve_mode(symbol, mode_override)
         candles_view = closed_candles(candles or [])
-        if mode == "FULL":
-            return self._snapshot_full(
-                candles=candles_view,
-                spread=spread,
-                quote=quote,
-                atr_value=atr_value,
-                window=window,
-                extra=extra or {},
-            )
-        return self._snapshot_lite(
+        snapshot = self._snapshot_lite(
             candles=candles_view,
             spread=spread,
             quote=quote,
             atr_value=atr_value,
             window=window,
         )
+        if self._enricher is not None:
+            snapshot = self._enricher.enrich(snapshot, symbol)
+        return snapshot
 
     def _snapshot_lite(
         self,
@@ -132,7 +174,9 @@ class CompositeOrderflowProvider(OrderflowProvider):
         if not candles:
             metrics = OrderflowMetrics()
             direction, pressure = infer_orderflow_direction(metrics)
-            return OrderflowSnapshot(confidence=0.0, mode="LITE", metrics=metrics, pressure=pressure, direction=direction)
+            return OrderflowSnapshot(
+                confidence=0.0, mode="LITE", metrics=metrics, pressure=pressure, direction=direction
+            )
 
         view = candles[-max(3, int(window)) :]
         mids = [((c.high + c.low) / 2.0) for c in view]
@@ -200,117 +244,6 @@ class CompositeOrderflowProvider(OrderflowProvider):
         return OrderflowSnapshot(
             confidence=round(confidence, 6),
             mode="LITE",
-            metrics=metrics,
-            pressure=round(pressure, 6),
-            direction=direction,
-        )
-
-    def _snapshot_full(
-        self,
-        *,
-        candles: list[Candle],
-        spread: float | None,
-        quote: tuple[float, float, float] | None,
-        atr_value: float | None,
-        window: int,
-        extra: dict[str, Any],
-    ) -> OrderflowSnapshot:
-        lite = self._snapshot_lite(
-            candles=candles,
-            spread=spread,
-            quote=quote,
-            atr_value=atr_value,
-            window=window,
-        )
-        payload = extra.get("orderflow_full")
-        if not isinstance(payload, dict):
-            # FULL requested but no depth/trade payload available: keep deterministic fallback.
-            return OrderflowSnapshot(
-                confidence=round(_clamp(lite.confidence * 0.6, 0.0, 1.0), 6),
-                mode="FULL",
-                metrics=lite.metrics,
-                pressure=lite.pressure,
-                direction=lite.direction,
-            )
-
-        trades_raw = payload.get("trades")
-        trades = trades_raw if isinstance(trades_raw, list) else []
-        buy_volume = 0.0
-        sell_volume = 0.0
-        for item in trades:
-            if not isinstance(item, dict):
-                continue
-            side = str(item.get("side", "")).strip().lower()
-            try:
-                size = float(item.get("size", 0.0))
-            except (TypeError, ValueError):
-                size = 0.0
-            if size <= 0:
-                continue
-            if side in {"buy", "bid", "b"}:
-                buy_volume += size
-            elif side in {"sell", "ask", "s"}:
-                sell_volume += size
-        total_volume = buy_volume + sell_volume
-        delta_ratio = ((buy_volume - sell_volume) / total_volume) if total_volume > 0 else lite.metrics.delta_ratio
-
-        book_raw = payload.get("book")
-        book = book_raw if isinstance(book_raw, dict) else {}
-        try:
-            bid_size = float(book.get("bid_size", 0.0))
-            ask_size = float(book.get("ask_size", 0.0))
-        except (TypeError, ValueError):
-            bid_size = 0.0
-            ask_size = 0.0
-        size_total = bid_size + ask_size
-        obi_k = ((bid_size - ask_size) / size_total) if size_total > 0 else 0.0
-        obi_k = _clamp(obi_k, -1.0, 1.0)
-
-        try:
-            bid = float(book.get("bid", 0.0))
-            ask = float(book.get("ask", 0.0))
-        except (TypeError, ValueError):
-            bid = 0.0
-            ask = 0.0
-        microprice_bias = lite.metrics.microprice_bias
-        if bid > 0 and ask > 0 and size_total > 0:
-            microprice = ((ask * bid_size) + (bid * ask_size)) / size_total
-            mid = (bid + ask) / 2.0
-            half_spread = max((ask - bid) / 2.0, 1e-9)
-            microprice_bias = _clamp((microprice - mid) / half_spread, -1.0, 1.0)
-
-        trades_quality = _clamp(len(trades) / max(5.0, float(window) / 2.0), 0.0, 1.0)
-        aggression = _clamp((abs(delta_ratio) * 0.6) + (trades_quality * 0.4), 0.0, 1.0)
-
-        absorption_override = payload.get("absorption_score")
-        if absorption_override is not None:
-            try:
-                absorption_score = _clamp(float(absorption_override), 0.0, 1.0)
-            except (TypeError, ValueError):
-                absorption_score = lite.metrics.absorption_score
-        else:
-            absorption_score = _clamp((lite.metrics.absorption_score * 0.6) + ((1.0 - abs(delta_ratio)) * 0.4), 0.0, 1.0)
-
-        confidence = _clamp(
-            (0.2 + (0.35 if trades else 0.0) + (0.25 if size_total > 0 else 0.0) + (0.2 * (1.0 - lite.metrics.chop_score))),
-            0.0,
-            1.0,
-        )
-
-        metrics = OrderflowMetrics(
-            delta_ratio=round(delta_ratio, 6),
-            aggression=round(aggression, 6),
-            obi_k=round(obi_k, 6),
-            microprice_bias=round(microprice_bias, 6),
-            absorption_score=round(absorption_score, 6),
-            chop_score=lite.metrics.chop_score,
-            spread_ratio=lite.metrics.spread_ratio,
-            efficiency_ratio=lite.metrics.efficiency_ratio,
-        )
-        direction, pressure = infer_orderflow_direction(metrics)
-        return OrderflowSnapshot(
-            confidence=round(confidence, 6),
-            mode="FULL",
             metrics=metrics,
             pressure=round(pressure, 6),
             direction=direction,

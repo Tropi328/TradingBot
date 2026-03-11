@@ -73,7 +73,9 @@ class _AlwaysTradeScalp:
             )
         ]
 
-    def evaluate_candidate(self, symbol: str, candidate: SetupCandidate, data: StrategyDataBundle) -> StrategyEvaluation:
+    def evaluate_candidate(
+        self, symbol: str, candidate: SetupCandidate, data: StrategyDataBundle
+    ) -> StrategyEvaluation:
         del symbol, candidate, data
         return StrategyEvaluation(
             action=DecisionAction.TRADE,
@@ -97,7 +99,9 @@ class _AlwaysTradeScalp:
             },
         )
 
-    def generate_order(self, symbol: str, evaluation: StrategyEvaluation, candidate: SetupCandidate, data: StrategyDataBundle) -> StrategySignal | None:
+    def generate_order(
+        self, symbol: str, evaluation: StrategyEvaluation, candidate: SetupCandidate, data: StrategyDataBundle
+    ) -> StrategySignal | None:
         del symbol, evaluation, candidate
         entry = data.candles_m5[-2].close
         return StrategySignal(
@@ -118,7 +122,9 @@ class _AlwaysTradeScalp:
 
 
 class _ObserveScalp(_AlwaysTradeScalp):
-    def evaluate_candidate(self, symbol: str, candidate: SetupCandidate, data: StrategyDataBundle) -> StrategyEvaluation:
+    def evaluate_candidate(
+        self, symbol: str, candidate: SetupCandidate, data: StrategyDataBundle
+    ) -> StrategyEvaluation:
         del symbol, candidate, data
         return StrategyEvaluation(
             action=DecisionAction.OBSERVE,
@@ -135,6 +141,10 @@ def test_backtest_uses_router_plugins_and_places_trades(monkeypatch: pytest.Monk
     monkeypatch.setattr(engine_module, "ScalpIctPriceActionStrategy", lambda cfg: _AlwaysTradeScalp())
 
     config = AppConfig()
+    # Disable V3 scoring so the synthetic score_total=90.0 from
+    # _AlwaysTradeScalp is preserved — this test validates router
+    # integration, not V3 heuristic scoring.
+    config.score_v3.enabled = False
     asset = config.assets[0].model_copy(deep=True)
     asset.epic = "XAUUSD"
     report = engine_module.run_backtest_multi_strategy(
@@ -153,6 +163,9 @@ def test_backtest_reports_top_blockers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(engine_module, "ScalpIctPriceActionStrategy", lambda cfg: _ObserveScalp())
 
     config = AppConfig()
+    # Disable V3 so the synthetic OBSERVE action from _ObserveScalp is
+    # preserved — this test validates blocker reporting, not V3 scoring.
+    config.score_v3.enabled = False
     asset = config.assets[0].model_copy(deep=True)
     asset.epic = "XAUUSD"
     report = engine_module.run_backtest_multi_strategy(

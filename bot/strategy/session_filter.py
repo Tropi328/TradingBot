@@ -43,7 +43,7 @@ class SessionMatch:
     blocked: bool  # True if outside all sessions AND block_outside enabled
 
     @staticmethod
-    def no_match(*, blocked: bool = False) -> "SessionMatch":
+    def no_match(*, blocked: bool = False) -> SessionMatch:
         return SessionMatch(
             matched=False,
             session_name="OFF_SESSION",

@@ -66,7 +66,7 @@ def test_main_score_policy_keeps_orderflow_influence_and_breakdown() -> None:
     evaluation = _evaluation()
     orderflow = OrderflowSnapshot(
         confidence=0.9,
-        mode="FULL",
+        mode="LITE",
         metrics=OrderflowMetrics(chop_score=0.25, spread_ratio=0.04),
         pressure=0.8,
         direction="LONG",

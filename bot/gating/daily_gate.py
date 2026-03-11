@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Iterable
+from datetime import UTC, date, datetime, time, timedelta
 
 from bot.data.candles import Candle
 from bot.news.calendar_provider import Event
@@ -28,8 +28,8 @@ class _DailyBar:
 
 def _to_utc(ts: datetime) -> datetime:
     if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 def _parse_hhmm(value: str | None) -> time | None:
@@ -85,7 +85,7 @@ class DailyGateProvider:
             for item in (allowed_strategies or [])
             if str(item).strip()
         ]
-        self._events: list[Event] = sorted(list(events or []), key=lambda item: _to_utc(item.time))
+        self._events: list[Event] = sorted(events or [], key=lambda item: _to_utc(item.time))
         self._news_windows: list[tuple[datetime, datetime]] = []
         self._news_window_starts: list[datetime] = []
         self._rebuild_event_windows()
@@ -98,7 +98,7 @@ class DailyGateProvider:
         return self.mode in {"trend", "trend_vol_news"}
 
     def set_events(self, events: Iterable[Event]) -> None:
-        self._events = sorted(list(events), key=lambda item: _to_utc(item.time))
+        self._events = sorted(events, key=lambda item: _to_utc(item.time))
         self._rebuild_event_windows()
 
     def refresh_if_needed(self, *, now: datetime, candles: list[Candle]) -> None:

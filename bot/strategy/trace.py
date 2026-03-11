@@ -8,7 +8,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bot.data.candles import Candle
 
-
 REASON_CODE_MAP: dict[str, str] = {
     "BIAS_FAIL": "H1_BIAS_NEUTRAL",
     "PD_FAIL": "H1_PD_FAIL",

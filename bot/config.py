@@ -17,7 +17,7 @@ class InstrumentConfig(BaseModel):
     size_step: float = 0.01
 
     @model_validator(mode="after")
-    def normalize_currency_fields(self) -> "InstrumentConfig":
+    def normalize_currency_fields(self) -> InstrumentConfig:
         self.currency = str(self.currency).strip().upper() or "USD"
         instrument_ccy = str(self.instrument_currency or "").strip().upper()
         self.instrument_currency = instrument_ccy or self.currency
@@ -45,7 +45,7 @@ class IndicatorsConfig(BaseModel):
     atr_period: int = 14
 
     @model_validator(mode="after")
-    def validate_periods(self) -> "IndicatorsConfig":
+    def validate_periods(self) -> IndicatorsConfig:
         if self.ema_period_h1 < 1:
             raise ValueError("indicators.ema_period_h1 must be >= 1")
         if self.atr_period < 1:
@@ -64,7 +64,7 @@ class SweepConfig(BaseModel):
     threshold_atr_multiplier: float = 0.15
 
     @model_validator(mode="after")
-    def validate_lookback(self) -> "SweepConfig":
+    def validate_lookback(self) -> SweepConfig:
         if self.lookback_min_hours > self.lookback_max_hours:
             raise ValueError("lookback_min_hours must be <= lookback_max_hours")
         return self
@@ -126,7 +126,7 @@ class DailyGateConfig(BaseModel):
     allowed_strategies: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_values(self) -> "DailyGateConfig":
+    def validate_values(self) -> DailyGateConfig:
         if isinstance(self.mode, bool):
             mode_normalized = "off" if self.mode is False else "trend"
         else:
@@ -154,11 +154,7 @@ class DailyGateConfig(BaseModel):
             raise ValueError("daily_gate.pre_minutes must be >= 0")
         if self.post_minutes < 0:
             raise ValueError("daily_gate.post_minutes must be >= 0")
-        self.allowed_strategies = [
-            str(item).strip().upper()
-            for item in self.allowed_strategies
-            if str(item).strip()
-        ]
+        self.allowed_strategies = [str(item).strip().upper() for item in self.allowed_strategies if str(item).strip()]
         return self
 
 
@@ -168,7 +164,7 @@ class CorrelationGroupConfig(BaseModel):
     max_open_positions: int = 1
 
     @model_validator(mode="after")
-    def normalize(self) -> "CorrelationGroupConfig":
+    def normalize(self) -> CorrelationGroupConfig:
         self.epics = [str(epic).strip().upper() for epic in self.epics if str(epic).strip()]
         if self.max_open_positions <= 0:
             raise ValueError("max_open_positions must be > 0")
@@ -214,7 +210,7 @@ class RiskConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_risk(self) -> "RiskConfig":
+    def validate_risk(self) -> RiskConfig:
         if self.equity <= 0:
             raise ValueError("risk.equity must be > 0")
         if self.risk_per_trade <= 0:
@@ -237,9 +233,8 @@ class RiskConfig(BaseModel):
             raise ValueError("min_risk_cash_per_trade must be >= 0")
         if self.max_risk_cash_per_trade is not None and float(self.max_risk_cash_per_trade) <= 0:
             raise ValueError("max_risk_cash_per_trade must be > 0 when provided")
-        if (
-            self.max_risk_cash_per_trade is not None
-            and float(self.min_risk_cash_per_trade) > float(self.max_risk_cash_per_trade)
+        if self.max_risk_cash_per_trade is not None and float(self.min_risk_cash_per_trade) > float(
+            self.max_risk_cash_per_trade
         ):
             raise ValueError("min_risk_cash_per_trade cannot exceed max_risk_cash_per_trade")
         if self.max_trades_per_day < 1:
@@ -292,7 +287,7 @@ class CapitalConfig(BaseModel):
     session_refresh_min_interval_seconds: int = 5
 
     @model_validator(mode="after")
-    def validate_capital(self) -> "CapitalConfig":
+    def validate_capital(self) -> CapitalConfig:
         if self.rate_limit_rps <= 0:
             raise ValueError("capital.rate_limit_rps must be > 0")
         if self.rate_limit_burst < 1:
@@ -315,7 +310,7 @@ class StrategyRuntimeConfig(BaseModel):
     neutral_bias_risk_multiplier: float = 0.5
 
     @model_validator(mode="after")
-    def validate_values(self) -> "StrategyRuntimeConfig":
+    def validate_values(self) -> StrategyRuntimeConfig:
         if not (0 < self.neutral_bias_risk_multiplier <= 1.0):
             raise ValueError("neutral_bias_risk_multiplier must be in (0, 1]")
         return self
@@ -332,14 +327,12 @@ class OpsConfig(BaseModel):
     heartbeat_stale_seconds: int = 900
     watchdog_interval_seconds: int = 60
     alert_cooldown_seconds: int = 300
-    required_services: list[str] = Field(
-        default_factory=lambda: ["bot-paper-fx.service", "bot-paper-btc.service"]
-    )
+    required_services: list[str] = Field(default_factory=lambda: ["bot-paper-fx.service", "bot-paper-btc.service"])
     backup_retention_days: int = 14
     backup_verify_on_create: bool = True
 
     @model_validator(mode="after")
-    def validate_values(self) -> "OpsConfig":
+    def validate_values(self) -> OpsConfig:
         if self.heartbeat_stale_seconds <= 0:
             raise ValueError("ops.heartbeat_stale_seconds must be > 0")
         if self.watchdog_interval_seconds <= 0:
@@ -370,7 +363,7 @@ class MarketHoursConfig(BaseModel):
     symbol_profiles: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def normalize(self) -> "MarketHoursConfig":
+    def normalize(self) -> MarketHoursConfig:
         allowed_profiles = {"WEEKDAYS", "ALWAYS"}
         default_profile = str(self.default_profile or "WEEKDAYS").strip().upper() or "WEEKDAYS"
         if default_profile not in allowed_profiles:
@@ -384,9 +377,7 @@ class MarketHoursConfig(BaseModel):
                 continue
             value = str(profile or "").strip().upper() or default_profile
             if value not in allowed_profiles:
-                raise ValueError(
-                    f"market_hours.symbol_profiles[{key}] must be WEEKDAYS or ALWAYS"
-                )
+                raise ValueError(f"market_hours.symbol_profiles[{key}] must be WEEKDAYS or ALWAYS")
             normalized_profiles[key] = value
         self.symbol_profiles = normalized_profiles
         return self
@@ -401,7 +392,7 @@ class WatchlistConfig(BaseModel):
     log_quotes: bool = True
 
     @model_validator(mode="after")
-    def normalize_epics(self) -> "WatchlistConfig":
+    def normalize_epics(self) -> WatchlistConfig:
         normalized: list[str] = []
         seen: set[str] = set()
         for epic in self.epics:
@@ -430,7 +421,7 @@ class StrategySymbolMappingConfig(BaseModel):
     cooldown_seconds: int = 300
 
     @model_validator(mode="after")
-    def normalize(self) -> "StrategySymbolMappingConfig":
+    def normalize(self) -> StrategySymbolMappingConfig:
         self.symbol = self.symbol.strip().upper()
         self.strategy = self.strategy.strip().upper()
         if self.cooldown_seconds < 0:
@@ -464,7 +455,7 @@ class ScalpStrategyConfig(BaseModel):
     time_stop_minutes: int = 120
 
     @model_validator(mode="after")
-    def validate_thresholds(self) -> "ScalpStrategyConfig":
+    def validate_thresholds(self) -> ScalpStrategyConfig:
         if self.candidate_ttl_minutes <= 0:
             raise ValueError("candidate_ttl_minutes must be > 0")
         if not (0 <= self.small_score_min <= self.small_score_max <= 100):
@@ -488,7 +479,7 @@ class PortfolioSupervisorConfig(BaseModel):
     max_entries_per_cycle: int = 1
 
     @model_validator(mode="after")
-    def validate_values(self) -> "PortfolioSupervisorConfig":
+    def validate_values(self) -> PortfolioSupervisorConfig:
         if self.max_open_positions_total <= 0:
             raise ValueError("max_open_positions_total must be > 0")
         if self.max_per_symbol <= 0:
@@ -513,7 +504,7 @@ class RiskBudgetConfig(BaseModel):
     daily_profit_lock_pct: float = 0.0
 
     @model_validator(mode="after")
-    def validate_values(self) -> "RiskBudgetConfig":
+    def validate_values(self) -> RiskBudgetConfig:
         if not (0 < self.risk_per_trade_pct <= 0.05):
             raise ValueError("risk_per_trade_pct must be in (0, 0.05]")
         if not (0 < self.max_open_risk_pct <= 0.10):
@@ -539,12 +530,8 @@ class ScoreTiersConfig(BaseModel):
     A_plus: ScoreTierEntry = Field(
         default_factory=lambda: ScoreTierEntry(min_score=72.0, size_mult=1.0, allow_market_after_ttl=True)
     )
-    A: ScoreTierEntry = Field(
-        default_factory=lambda: ScoreTierEntry(min_score=68.0, size_mult=0.8)
-    )
-    B: ScoreTierEntry = Field(
-        default_factory=lambda: ScoreTierEntry(min_score=62.0, size_mult=0.6)
-    )
+    A: ScoreTierEntry = Field(default_factory=lambda: ScoreTierEntry(min_score=68.0, size_mult=0.8))
+    B: ScoreTierEntry = Field(default_factory=lambda: ScoreTierEntry(min_score=62.0, size_mult=0.6))
 
 
 # ---------------------------------------------------------------------------
@@ -600,9 +587,7 @@ class SecondPositionRuleConfig(BaseModel):
 
 class CorrelationV2Config(BaseModel):
     max_positions_per_group: int = 1
-    allow_second_same_symbol_only_if: SecondPositionRuleConfig = Field(
-        default_factory=SecondPositionRuleConfig
-    )
+    allow_second_same_symbol_only_if: SecondPositionRuleConfig = Field(default_factory=SecondPositionRuleConfig)
 
 
 class DecisionPolicyConfig(BaseModel):
@@ -613,7 +598,7 @@ class DecisionPolicyConfig(BaseModel):
     small_risk_multiplier_default: float = 0.45
 
     @model_validator(mode="after")
-    def validate_values(self) -> "DecisionPolicyConfig":
+    def validate_values(self) -> DecisionPolicyConfig:
         if not (0 < self.trade_score_threshold <= 100):
             raise ValueError("trade_score_threshold must be in (0,100]")
         if not (0 <= self.small_score_min <= self.small_score_max <= 100):
@@ -627,8 +612,9 @@ class DecisionPolicyConfig(BaseModel):
 
 class ScoreV3ConfigModel(BaseModel):
     """Configuration for ScoreV3 scoring system."""
-    enabled: bool = False
-    mode: str = "heuristic"            # "heuristic" or "ml"
+
+    enabled: bool = True
+    mode: str = "heuristic"  # "heuristic" or "ml"
     model_path: str = ""
     trade_threshold: float = 55.0
     small_min: float = 45.0
@@ -687,13 +673,13 @@ class MicroLossDefensePydanticConfig(BaseModel):
 class AdaptiveThresholdPydanticConfig(BaseModel):
     enabled: bool = False
     base_threshold: float = 62.0
-    range_adjust: float = -6.0       # lower threshold in range regime
-    trend_adjust: float = -2.0       # slightly lower in strong trend (re-entry)
-    high_vol_adjust: float = 2.0     # raise threshold in extreme vol
-    low_vol_adjust: float = -3.0     # lower in calm markets
+    range_adjust: float = -6.0  # lower threshold in range regime
+    trend_adjust: float = -2.0  # slightly lower in strong trend (re-entry)
+    high_vol_adjust: float = 2.0  # raise threshold in extreme vol
+    low_vol_adjust: float = -3.0  # lower in calm markets
     # Soft-gate conversion
     soft_gates_enabled: bool = True
-    soft_gate_penalty: float = 4.0   # penalty instead of hard block
+    soft_gate_penalty: float = 4.0  # penalty instead of hard block
 
 
 # ---------------------------------------------------------------------------
@@ -701,14 +687,16 @@ class AdaptiveThresholdPydanticConfig(BaseModel):
 # ---------------------------------------------------------------------------
 class TPLevelConfig(BaseModel):
     """Single take-profit level."""
+
     name: str = "TP1"
-    trigger_r: float = 1.0        # R-multiple to trigger this level
+    trigger_r: float = 1.0  # R-multiple to trigger this level
     close_fraction: float = 0.25  # fraction of remaining size to close
-    move_sl_to_be: bool = False   # whether to move SL to BE after this level
+    move_sl_to_be: bool = False  # whether to move SL to BE after this level
 
 
 class MultiTPConfig(BaseModel):
     """Multi-level take-profit exit profile for PAPER/LIVE."""
+
     enabled: bool = False
     levels: list[TPLevelConfig] = Field(
         default_factory=lambda: [
@@ -717,11 +705,11 @@ class MultiTPConfig(BaseModel):
             TPLevelConfig(name="TP3", trigger_r=3.0, close_fraction=1.0, move_sl_to_be=False),
         ]
     )
-    be_offset_r: float = 0.05        # BE offset as fraction of initial risk
-    be_delay_bars: int = 4            # bars to wait after TP1 before moving to BE
-    trailing_enabled: bool = True     # enable trailing stop after TP1
-    trailing_swing_window: int = 12   # lookback bars for swing detection
-    trailing_buffer_r: float = 0.12   # buffer below swing low (as R fraction)
+    be_offset_r: float = 0.05  # BE offset as fraction of initial risk
+    be_delay_bars: int = 4  # bars to wait after TP1 before moving to BE
+    trailing_enabled: bool = True  # enable trailing stop after TP1
+    trailing_swing_window: int = 12  # lookback bars for swing detection
+    trailing_buffer_r: float = 0.12  # buffer below swing low (as R fraction)
 
 
 # ---------------------------------------------------------------------------
@@ -729,11 +717,12 @@ class MultiTPConfig(BaseModel):
 # ---------------------------------------------------------------------------
 class TierSizingConfig(BaseModel):
     """Score-tier-based position sizing multipliers."""
+
     enabled: bool = False
-    a_plus_mult: float = 1.5     # A+ setups get 1.5× risk
-    a_mult: float = 1.0          # A setups get normal risk
-    b_mult: float = 0.6          # B setups get 0.6× risk
-    observe_mult: float = 0.0    # OBSERVE not traded
+    a_plus_mult: float = 1.5  # A+ setups get 1.5× risk
+    a_mult: float = 1.0  # A setups get normal risk
+    b_mult: float = 0.6  # B setups get 0.6× risk
+    observe_mult: float = 0.0  # OBSERVE not traded
     # Tier score boundaries (used when score_tiers.enabled is False)
     a_plus_min_score: float = 80.0
     a_min_score: float = 65.0
@@ -745,34 +734,48 @@ class TierSizingConfig(BaseModel):
 # ---------------------------------------------------------------------------
 class SessionEntryWindowConfig(BaseModel):
     """Single trading session window."""
+
     name: str = "LONDON"
-    utc_start: str = "07:00"    # UTC start
-    utc_end: str = "16:00"      # UTC end
-    threshold_adjust: float = 0.0   # added to base threshold
-    risk_mult: float = 1.0          # risk multiplier for this session
+    utc_start: str = "07:00"  # UTC start
+    utc_end: str = "16:00"  # UTC end
+    threshold_adjust: float = 0.0  # added to base threshold
+    risk_mult: float = 1.0  # risk multiplier for this session
     weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
 
 
 class SessionFilterConfig(BaseModel):
     """Session-based trading filter."""
+
     enabled: bool = False
     sessions: list[SessionEntryWindowConfig] = Field(
         default_factory=lambda: [
             SessionEntryWindowConfig(
-                name="LONDON", utc_start="07:00", utc_end="11:00",
-                threshold_adjust=-3.0, risk_mult=1.0,
+                name="LONDON",
+                utc_start="07:00",
+                utc_end="11:00",
+                threshold_adjust=-3.0,
+                risk_mult=1.0,
             ),
             SessionEntryWindowConfig(
-                name="NY_OVERLAP", utc_start="12:00", utc_end="16:00",
-                threshold_adjust=-2.0, risk_mult=1.0,
+                name="NY_OVERLAP",
+                utc_start="12:00",
+                utc_end="16:00",
+                threshold_adjust=-2.0,
+                risk_mult=1.0,
             ),
             SessionEntryWindowConfig(
-                name="NY_AFTERNOON", utc_start="16:00", utc_end="20:00",
-                threshold_adjust=0.0, risk_mult=0.8,
+                name="NY_AFTERNOON",
+                utc_start="16:00",
+                utc_end="20:00",
+                threshold_adjust=0.0,
+                risk_mult=0.8,
             ),
             SessionEntryWindowConfig(
-                name="ASIA", utc_start="00:00", utc_end="07:00",
-                threshold_adjust=4.0, risk_mult=0.5,
+                name="ASIA",
+                utc_start="00:00",
+                utc_end="07:00",
+                threshold_adjust=4.0,
+                risk_mult=0.5,
             ),
         ]
     )
@@ -784,10 +787,11 @@ class SessionFilterConfig(BaseModel):
 # ---------------------------------------------------------------------------
 class CompoundEquityConfig(BaseModel):
     """Compound (geometric) equity-based sizing."""
+
     enabled: bool = False
-    floor_equity: float = 50.0    # never size below this equity
-    cap_equity: float = 0.0       # 0 = no cap (unlimited compound)
-    smooth_window: int = 0        # 0 = use raw equity; >0 = EMA smoothing
+    floor_equity: float = 50.0  # never size below this equity
+    cap_equity: float = 0.0  # 0 = no cap (unlimited compound)
+    smooth_window: int = 0  # 0 = use raw equity; >0 = EMA smoothing
 
 
 class BacktestTuningConfig(BaseModel):
@@ -853,7 +857,7 @@ class BacktestTuningConfig(BaseModel):
     wf_roll_equity_forward: bool = False  # if True, each WF split starts with the previous split's ending equity
 
     @model_validator(mode="after")
-    def validate_values(self) -> "BacktestTuningConfig":
+    def validate_values(self) -> BacktestTuningConfig:
         if self.wait_reaction_timeout_bars <= 0:
             raise ValueError("wait_reaction_timeout_bars must be > 0")
         if self.wait_mitigation_timeout_bars <= 0:
@@ -976,8 +980,9 @@ class BacktestTuningConfig(BaseModel):
 
 
 class OrderflowConfig(BaseModel):
+    # FULL mode removed — only LITE is supported. Fields kept for backward compat.
     default_mode: str = "LITE"
-    full_symbols: list[str] = Field(default_factory=lambda: ["BTCUSD"])
+    full_symbols: list[str] = Field(default_factory=list)  # deprecated, ignored
     default_window: int = 64
     trigger_bonus_max: float = 10.0
     execution_bonus_max: float = 5.0
@@ -987,11 +992,10 @@ class OrderflowConfig(BaseModel):
     small_soft_gate_chop: float = 0.75
 
     @model_validator(mode="after")
-    def validate_values(self) -> "OrderflowConfig":
-        self.default_mode = self.default_mode.strip().upper()
-        if self.default_mode not in {"LITE", "FULL"}:
-            raise ValueError("orderflow.default_mode must be LITE or FULL")
-        self.full_symbols = [str(item).strip().upper() for item in self.full_symbols if str(item).strip()]
+    def validate_values(self) -> OrderflowConfig:
+        # Always normalise to LITE — FULL mode is no longer supported.
+        self.default_mode = "LITE"
+        self.full_symbols = []  # ignored, kept for config file compat
         if self.default_window <= 0:
             raise ValueError("orderflow.default_window must be > 0")
         if self.trigger_bonus_max < 0:
@@ -1024,7 +1028,7 @@ class MonteCarloLiveWindowConfig(BaseModel):
     json_path: str = "reports/live/monte_carlo.json"
 
     @model_validator(mode="after")
-    def validate_viewer_mode(self) -> "MonteCarloLiveWindowConfig":
+    def validate_viewer_mode(self) -> MonteCarloLiveWindowConfig:
         mode = self.viewer_mode.strip().lower()
         if mode not in {"process", "manual", "terminal"}:
             raise ValueError("monte_carlo.live_window.viewer_mode must be 'terminal', 'process' or 'manual'")
@@ -1039,6 +1043,7 @@ class MCAdaptiveConfig(BaseModel):
     trades, computes a health score (0-1), and scales *risk_per_trade*
     accordingly.
     """
+
     enabled: bool = False
     min_trades: int = 15
     resim_interval: int = 5
@@ -1057,7 +1062,7 @@ class MCAdaptiveConfig(BaseModel):
     max_step_down: float = 0.10
 
     @model_validator(mode="after")
-    def _validate_adaptive(self) -> "MCAdaptiveConfig":
+    def _validate_adaptive(self) -> MCAdaptiveConfig:
         if self.min_trades < 5:
             raise ValueError("mc_adaptive.min_trades must be >= 5")
         if self.resim_interval < 1:
@@ -1103,7 +1108,7 @@ class MonteCarloConfig(BaseModel):
     adaptive: MCAdaptiveConfig = Field(default_factory=MCAdaptiveConfig)
 
     @model_validator(mode="after")
-    def _validate_mc_params(self) -> "MonteCarloConfig":
+    def _validate_mc_params(self) -> MonteCarloConfig:
         if self.num_simulations < 1:
             raise ValueError("monte_carlo.num_simulations must be >= 1")
         if self.num_simulations > 100_000:
@@ -1143,6 +1148,7 @@ class DiagnosticsConfig(BaseModel):
     decision_trace_enabled: bool = False
     decision_trace_path: str = "logs/decision_trace.jsonl"
     decision_trace_auto_enable_backtest: bool = False
+    dashboard_port: int = 8777
 
 
 class ResearchCapitalConfig(BaseModel):
@@ -1150,7 +1156,7 @@ class ResearchCapitalConfig(BaseModel):
     currency: str = "USD"
 
     @model_validator(mode="after")
-    def validate_capital(self) -> "ResearchCapitalConfig":
+    def validate_capital(self) -> ResearchCapitalConfig:
         if self.equity <= 0:
             raise ValueError("research.optimize.capitals.equity must be > 0")
         self.currency = str(self.currency or "USD").strip().upper() or "USD"
@@ -1169,7 +1175,7 @@ class ResearchQualityFilterConfig(BaseModel):
     require_trades_filled: bool = True
 
     @model_validator(mode="after")
-    def validate_quality_filter(self) -> "ResearchQualityFilterConfig":
+    def validate_quality_filter(self) -> ResearchQualityFilterConfig:
         self.mode = str(self.mode or "strict").strip().lower()
         if self.mode not in {"strict", "off"}:
             raise ValueError("research.optimize.quality_filter.mode must be strict or off")
@@ -1224,7 +1230,7 @@ class ResearchOptimizeConfig(BaseModel):
     quality_filter: ResearchQualityFilterConfig = Field(default_factory=ResearchQualityFilterConfig)
 
     @model_validator(mode="after")
-    def validate_optimize(self) -> "ResearchOptimizeConfig":
+    def validate_optimize(self) -> ResearchOptimizeConfig:
         self.runtime_budget = str(self.runtime_budget or "deep").strip().lower()
         if self.runtime_budget not in {"quick", "medium", "deep"}:
             raise ValueError("research.optimize.runtime_budget must be quick, medium or deep")
@@ -1264,7 +1270,7 @@ class ResearchGateSearchSpaceConfig(BaseModel):
     trend_vol_news_max_spread_mult: list[float] = Field(default_factory=lambda: [1.0, 1.5])
 
     @model_validator(mode="after")
-    def validate_gate_space(self) -> "ResearchGateSearchSpaceConfig":
+    def validate_gate_space(self) -> ResearchGateSearchSpaceConfig:
         def _normalize_float_list(values: list[float], field_name: str) -> list[float]:
             normalized: list[float] = []
             seen: set[float] = set()
@@ -1315,7 +1321,7 @@ class ResearchRiskProfileConfig(BaseModel):
     daily_stop_pct: float
 
     @model_validator(mode="after")
-    def validate_profile(self) -> "ResearchRiskProfileConfig":
+    def validate_profile(self) -> ResearchRiskProfileConfig:
         self.name = str(self.name or "").strip().upper()
         if not self.name:
             raise ValueError("research.search_space.risk_profiles.name cannot be empty")
@@ -1335,46 +1341,94 @@ class ResearchSearchSpaceConfig(BaseModel):
     risk_profiles: list[ResearchRiskProfileConfig] = Field(
         default_factory=lambda: [
             ResearchRiskProfileConfig(
-                name="RISK_01", risk_per_trade=0.003, max_trades_per_day=2, max_total_risk_pct=0.010, daily_stop_pct=0.010
+                name="RISK_01",
+                risk_per_trade=0.003,
+                max_trades_per_day=2,
+                max_total_risk_pct=0.010,
+                daily_stop_pct=0.010,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_02", risk_per_trade=0.003, max_trades_per_day=3, max_total_risk_pct=0.010, daily_stop_pct=0.010
+                name="RISK_02",
+                risk_per_trade=0.003,
+                max_trades_per_day=3,
+                max_total_risk_pct=0.010,
+                daily_stop_pct=0.010,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_03", risk_per_trade=0.003, max_trades_per_day=4, max_total_risk_pct=0.015, daily_stop_pct=0.010
+                name="RISK_03",
+                risk_per_trade=0.003,
+                max_trades_per_day=4,
+                max_total_risk_pct=0.015,
+                daily_stop_pct=0.010,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_04", risk_per_trade=0.005, max_trades_per_day=2, max_total_risk_pct=0.010, daily_stop_pct=0.010
+                name="RISK_04",
+                risk_per_trade=0.005,
+                max_trades_per_day=2,
+                max_total_risk_pct=0.010,
+                daily_stop_pct=0.010,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_05", risk_per_trade=0.005, max_trades_per_day=3, max_total_risk_pct=0.015, daily_stop_pct=0.015
+                name="RISK_05",
+                risk_per_trade=0.005,
+                max_trades_per_day=3,
+                max_total_risk_pct=0.015,
+                daily_stop_pct=0.015,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_06", risk_per_trade=0.005, max_trades_per_day=4, max_total_risk_pct=0.020, daily_stop_pct=0.015
+                name="RISK_06",
+                risk_per_trade=0.005,
+                max_trades_per_day=4,
+                max_total_risk_pct=0.020,
+                daily_stop_pct=0.015,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_07", risk_per_trade=0.0075, max_trades_per_day=2, max_total_risk_pct=0.015, daily_stop_pct=0.010
+                name="RISK_07",
+                risk_per_trade=0.0075,
+                max_trades_per_day=2,
+                max_total_risk_pct=0.015,
+                daily_stop_pct=0.010,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_08", risk_per_trade=0.0075, max_trades_per_day=3, max_total_risk_pct=0.020, daily_stop_pct=0.015
+                name="RISK_08",
+                risk_per_trade=0.0075,
+                max_trades_per_day=3,
+                max_total_risk_pct=0.020,
+                daily_stop_pct=0.015,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_09", risk_per_trade=0.0075, max_trades_per_day=4, max_total_risk_pct=0.020, daily_stop_pct=0.020
+                name="RISK_09",
+                risk_per_trade=0.0075,
+                max_trades_per_day=4,
+                max_total_risk_pct=0.020,
+                daily_stop_pct=0.020,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_10", risk_per_trade=0.010, max_trades_per_day=3, max_total_risk_pct=0.015, daily_stop_pct=0.015
+                name="RISK_10",
+                risk_per_trade=0.010,
+                max_trades_per_day=3,
+                max_total_risk_pct=0.015,
+                daily_stop_pct=0.015,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_11", risk_per_trade=0.010, max_trades_per_day=4, max_total_risk_pct=0.020, daily_stop_pct=0.020
+                name="RISK_11",
+                risk_per_trade=0.010,
+                max_trades_per_day=4,
+                max_total_risk_pct=0.020,
+                daily_stop_pct=0.020,
             ),
             ResearchRiskProfileConfig(
-                name="RISK_12", risk_per_trade=0.010, max_trades_per_day=6, max_total_risk_pct=0.020, daily_stop_pct=0.020
+                name="RISK_12",
+                risk_per_trade=0.010,
+                max_trades_per_day=6,
+                max_total_risk_pct=0.020,
+                daily_stop_pct=0.020,
             ),
         ]
     )
 
     @model_validator(mode="after")
-    def validate_search_space(self) -> "ResearchSearchSpaceConfig":
+    def validate_search_space(self) -> ResearchSearchSpaceConfig:
         if not self.risk_profiles:
             raise ValueError("research.search_space.risk_profiles must contain at least one profile")
         seen_names: set[str] = set()
@@ -1401,7 +1455,7 @@ class ResearchConfig(BaseModel):
     search_space: ResearchSearchSpaceConfig = Field(default_factory=ResearchSearchSpaceConfig)
 
     @model_validator(mode="after")
-    def validate_research(self) -> "ResearchConfig":
+    def validate_research(self) -> ResearchConfig:
         self.objective_mode = str(self.objective_mode or "pnl_dd_cap").strip().lower()
         if self.objective_mode not in {"pnl_dd_cap", "risk_adjusted_pnl_dd"}:
             raise ValueError("research.objective_mode must be pnl_dd_cap or risk_adjusted_pnl_dd")
@@ -1435,7 +1489,7 @@ class BacktestRuntimeConfig(BaseModel):
     deterministic: bool = True
 
     @model_validator(mode="after")
-    def validate_runtime(self) -> "BacktestRuntimeConfig":
+    def validate_runtime(self) -> BacktestRuntimeConfig:
         if self.parallel_workers < 1:
             raise ValueError("backtest_runtime.parallel_workers must be >= 1")
         if self.parallel_workers > 3:
@@ -1500,7 +1554,7 @@ class AppConfig(BaseModel):
     backtest_runtime: BacktestRuntimeConfig = Field(default_factory=BacktestRuntimeConfig)
 
     @model_validator(mode="after")
-    def normalize_assets(self) -> "AppConfig":
+    def normalize_assets(self) -> AppConfig:
         self.account_currency = str(self.account_currency or "USD").strip().upper() or "USD"
         if bool(self.capital_ramp.enabled) and self.account_currency != "PLN":
             raise ValueError("capital_ramp.enabled requires account_currency=PLN")

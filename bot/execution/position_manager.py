@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from bot.data.capital_client import CapitalAPIError, CapitalClient
@@ -11,6 +10,7 @@ from bot.execution.sizing import r_multiple
 from bot.execution.utils import strip_mode_prefix as _strip_mode_prefix
 from bot.storage.journal import Journal
 from bot.storage.models import ClosedPositionEvent, PositionRecord
+from bot.strategy.utils import as_float
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ class TPLevel:
 @dataclass(slots=True, frozen=True)
 class MultiTPProfile:
     """Runtime multi-TP profile — built once from config."""
+
     enabled: bool = False
     levels: tuple[TPLevel, ...] = ()
     be_offset_r: float = 0.05
@@ -44,12 +45,14 @@ def build_multi_tp_profile(config: Any) -> MultiTPProfile:
         return MultiTPProfile(enabled=False)
     levels: list[TPLevel] = []
     for lv in getattr(config, "levels", []):
-        levels.append(TPLevel(
-            name=lv.name,
-            trigger_r=lv.trigger_r,
-            close_fraction=lv.close_fraction,
-            move_sl_to_be=lv.move_sl_to_be,
-        ))
+        levels.append(
+            TPLevel(
+                name=lv.name,
+                trigger_r=lv.trigger_r,
+                close_fraction=lv.close_fraction,
+                move_sl_to_be=lv.move_sl_to_be,
+            )
+        )
     # Sort by trigger_r ascending
     levels.sort(key=lambda x: x.trigger_r)
     return MultiTPProfile(
@@ -67,8 +70,9 @@ def build_multi_tp_profile(config: Any) -> MultiTPProfile:
 
 
 class PositionManager:
-    def __init__(self, *, client: CapitalClient | None, journal: Journal, dry_run: bool,
-                 multi_tp: MultiTPProfile | None = None):
+    def __init__(
+        self, *, client: CapitalClient | None, journal: Journal, dry_run: bool, multi_tp: MultiTPProfile | None = None
+    ):
         self.client = client
         self.journal = journal
         self.dry_run = dry_run
@@ -78,9 +82,7 @@ class PositionManager:
     def get_open_positions(self, epic: str | None = None) -> list[PositionRecord]:
         prefix = f"{self.mode_prefix}-"
         return [
-            position
-            for position in self.journal.get_open_positions(epic=epic)
-            if position.deal_id.startswith(prefix)
+            position for position in self.journal.get_open_positions(epic=epic) if position.deal_id.startswith(prefix)
         ]
 
     def sync_positions_from_api(self) -> list[ClosedPositionEvent]:
@@ -103,7 +105,7 @@ class PositionManager:
             deal_id = f"{self.mode_prefix}-{remote_deal_id}"
             remote_ids.add(deal_id)
             side = "LONG" if pos.get("direction") == "BUY" else "SHORT"
-            opened_at_raw = pos.get("createdDateUTC") or datetime.now(timezone.utc).isoformat()
+            opened_at_raw = pos.get("createdDateUTC") or datetime.now(UTC).isoformat()
             opened_at = datetime.fromisoformat(str(opened_at_raw).replace("Z", "+00:00"))
             record = PositionRecord(
                 deal_id=deal_id,
@@ -121,7 +123,7 @@ class PositionManager:
             )
             self.journal.upsert_position(record)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for local in self.get_open_positions():
             if local.deal_id in remote_ids:
                 continue
@@ -200,7 +202,7 @@ class PositionManager:
         initial_size = float(meta.get("initial_size", position.size + position.partial_closed_size))
         tp1_hit = bool(meta.get("tp1_hit", False))
         be_moved = bool(meta.get("be_moved", False))
-        tp1_hit_at_bar = meta.get("tp1_hit_at_bar", None)
+        tp1_hit_at_bar = meta.get("tp1_hit_at_bar")
         bars_since_open = int(meta.get("bars_managed", 0)) + 1
         meta["bars_managed"] = bars_since_open
 
@@ -218,7 +220,11 @@ class PositionManager:
                     tp_levels_hit.append(level.name)
                     LOGGER.info(
                         "Multi-TP %s hit for %s at %.2fR — closed %.4f (remaining %.4f)",
-                        level.name, position.deal_id, current_r, close_size, position.size,
+                        level.name,
+                        position.deal_id,
+                        current_r,
+                        close_size,
+                        position.size,
                     )
                     if level.move_sl_to_be and not be_moved:
                         tp1_hit = True
@@ -228,7 +234,9 @@ class PositionManager:
                     tp_levels_hit.append(level.name)
                     LOGGER.info(
                         "Multi-TP %s hit for %s — full close signal at %.2fR",
-                        level.name, position.deal_id, current_r,
+                        level.name,
+                        position.deal_id,
+                        current_r,
                     )
 
         # BE movement (after TP1, with delay)
@@ -277,16 +285,8 @@ class PositionManager:
     @staticmethod
     def _get_cost_offset(meta: dict) -> float:
         """Read cost offset from position metadata."""
-        spread = 0.0
-        buf = 0.0
-        try:
-            spread = float(meta.get("spread_at_entry", 0.0))
-        except (TypeError, ValueError):
-            pass
-        try:
-            buf = float(meta.get("be_buffer_ticks", 0.0))
-        except (TypeError, ValueError):
-            pass
+        spread = as_float(meta.get("spread_at_entry"), 0.0)
+        buf = as_float(meta.get("be_buffer_ticks"), 0.0)
         return spread + buf
 
     def _move_sl_to_be_and_partial(self, position: PositionRecord, half_size: float) -> None:
@@ -294,16 +294,8 @@ class PositionManager:
         # Cost-aware BE: SL = entry + spread + slippage + buffer (covers costs)
         be_price = position.entry_price
         meta = dict(position.metadata)
-        spread_at_entry = 0.0
-        be_buffer = 0.0
-        try:
-            spread_at_entry = float(meta.get("spread_at_entry", 0.0))
-        except (TypeError, ValueError):
-            pass
-        try:
-            be_buffer = float(meta.get("be_buffer_ticks", 0.0))
-        except (TypeError, ValueError):
-            pass
+        spread_at_entry = as_float(meta.get("spread_at_entry"), 0.0)
+        be_buffer = as_float(meta.get("be_buffer_ticks"), 0.0)
         cost_offset = spread_at_entry + be_buffer
         if position.side == "LONG":
             be_price = position.entry_price + cost_offset
@@ -352,11 +344,7 @@ class PositionManager:
             pnl = (position.entry_price - exit_price) * position.size
 
         # Subtract estimated roundtrip cost for DRY mode realism
-        rtc = 0.0
-        try:
-            rtc = float(position.metadata.get("estimated_roundtrip_cost", 0.0))
-        except (TypeError, ValueError):
-            pass
+        rtc = as_float(position.metadata.get("estimated_roundtrip_cost"), 0.0)
         net_pnl = pnl - rtc
 
         position.pnl = net_pnl

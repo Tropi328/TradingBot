@@ -6,7 +6,12 @@ import main as main_module
 from bot.config import AppConfig
 from bot.data.candles import Candle
 from bot.strategy.contracts import BiasState, DecisionAction, StrategyEvaluation
-from bot.strategy.orderflow import CompositeOrderflowProvider, OrderflowMetrics, OrderflowSnapshot
+from bot.strategy.orderflow import (
+    CompositeOrderflowProvider,
+    ExternalOrderflowEnricher,
+    OrderflowMetrics,
+    OrderflowSnapshot,
+)
 
 
 def _candles(start: datetime, count: int, step: float = 0.4) -> list[Candle]:
@@ -21,7 +26,11 @@ def _candles(start: datetime, count: int, step: float = 0.4) -> list[Candle]:
         out.append(Candle(timestamp=ts, open=open_price, high=high, low=low, close=close))
         price = close
     # trailing live candle
-    out.append(Candle(timestamp=start + timedelta(minutes=5 * count), open=price, high=price + 0.1, low=price - 0.1, close=price))
+    out.append(
+        Candle(
+            timestamp=start + timedelta(minutes=5 * count), open=price, high=price + 0.1, low=price - 0.1, close=price
+        )
+    )
     return out
 
 
@@ -59,41 +68,21 @@ def test_of_lite_snapshot_is_deterministic() -> None:
     assert 0.0 <= first.metrics.chop_score <= 1.0
 
 
-def test_of_full_snapshot_uses_book_and_trades_payload() -> None:
+def test_enricher_protocol_modifies_snapshot() -> None:
+    """An ExternalOrderflowEnricher can augment the LITE snapshot."""
     start = datetime(2026, 2, 11, 12, 0, tzinfo=timezone.utc)
-    candles = _candles(start, 80, step=2.2)
-    provider = CompositeOrderflowProvider(default_mode="FULL")
+    candles = _candles(start, 80, step=0.35)
 
-    snapshot = provider.get_snapshot(
-        "BTCUSD",
-        "M5",
-        96,
-        candles=candles,
-        spread=12.0,
-        atr_value=80.0,
-        mode_override="FULL",
-        extra={
-            "orderflow_full": {
-                "trades": [
-                    {"side": "buy", "size": 8.0},
-                    {"side": "buy", "size": 5.5},
-                    {"side": "sell", "size": 2.0},
-                ],
-                "book": {
-                    "bid": 67000.0,
-                    "ask": 67010.0,
-                    "bid_size": 220.0,
-                    "ask_size": 140.0,
-                },
-            }
-        },
-    )
+    class FakeEnricher:
+        def enrich(self, snapshot: OrderflowSnapshot, symbol: str) -> OrderflowSnapshot:
+            snapshot.metrics.obi_k = 0.42
+            snapshot.mode = "BINANCE"
+            return snapshot
 
-    assert snapshot.mode == "FULL"
-    assert snapshot.confidence > 0.4
-    assert snapshot.metrics.obi_k > 0.0
-    assert snapshot.metrics.delta_ratio > 0.0
-    assert snapshot.direction == "LONG"
+    provider = CompositeOrderflowProvider(enricher=FakeEnricher())  # type: ignore[arg-type]
+    snap = provider.get_snapshot("GOLD", "M5", 64, candles=candles, spread=0.2, atr_value=1.5)
+    assert snap.mode == "BINANCE"
+    assert snap.metrics.obi_k == 0.42
 
 
 def test_orderflow_divergence_drops_borderline_small_to_observe() -> None:
@@ -123,7 +112,7 @@ def test_orderflow_divergence_drops_borderline_small_to_observe() -> None:
 
     diverging_of = OrderflowSnapshot(
         confidence=0.95,
-        mode="FULL",
+        mode="LITE",
         metrics=OrderflowMetrics(
             delta_ratio=-1.0,
             aggression=1.0,
@@ -168,7 +157,7 @@ def test_orderflow_small_soft_gate_blocks_high_confidence_chop() -> None:
         snapshot={},
         metadata={
             "orderflow_snapshot": {
-                "mode": "FULL",
+                "mode": "LITE",
                 "confidence": 0.92,
                 "direction": "LONG",
                 "pressure": 0.4,

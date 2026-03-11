@@ -65,3 +65,4 @@ Thumbs.db
 
 # Local split/release scratch
 .tmp_release_split/
+.claude/

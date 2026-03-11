@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from bot.config import AppConfig, AssetConfig
 

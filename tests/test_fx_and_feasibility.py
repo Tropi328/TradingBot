@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import main as main_module
+import bot.app.config_helpers as config_helpers_module
 import bot.backtest.engine as engine_module
 from bot.config import AppConfig
 from bot.data.candles import Candle
@@ -207,7 +208,7 @@ def test_regression_usd_account_zero_fx_fee(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_optimizer_fails_fast_for_pln_without_usdpln_rate() -> None:
     with pytest.raises(RuntimeError, match="USDPLN"):
-        main_module._validate_optimizer_capitals(
+        config_helpers_module._validate_optimizer_capitals(
             capitals=[{"equity": 100.0, "currency": "PLN"}],
             fx_static_rates={"EURUSD": 1.08},
         )

@@ -42,7 +42,24 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
+select = ["E", "F", "W", "I", "B", "C4", "UP", "SIM", "RUF"]
+ignore = [
+  "E402",    # module-import-not-at-top — late imports are intentional (circular import avoidance)
+  "E501",    # line too long — handled by formatter
+  "B008",    # function call in default argument — common with Pydantic Field()
+  "UP007",   # use X | Y for union — keep Optional[] for readability in older code
+  "UP038",   # non-pep604-isinstance — isinstance(x, (A, B)) is fine
+  "SIM108",  # use ternary operator — sometimes less readable
+  "RUF001",  # ambiguous unicode char in string — Polish text is intentional
+  "RUF002",  # ambiguous unicode char in docstring — Polish text is intentional
+  "RUF003",  # ambiguous unicode char in comment — Polish text is intentional
+  "RUF012",  # mutable class variable without ClassVar — too noisy with dataclasses
+]
+
+[tool.ruff.lint.per-file-ignores]
+# B023 (loop-variable capture) needs careful manual review — tracked as follow-up
+"bot/backtest/engine.py" = ["B023"]
+"bot/app_main.py" = ["B023"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -50,3 +67,10 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --tb=short"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

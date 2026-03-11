@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import main as main_module
+import bot.app.viewer as viewer_module
 
 
 class _FakeDashboard:
@@ -30,14 +30,23 @@ class _FakeProc:
 def test_backtest_viewers_do_not_block_when_hold_disabled(monkeypatch) -> None:
     dashboard = _FakeDashboard()
     proc = _FakeProc()
-    monkeypatch.setattr(main_module, "_dashboard_server", dashboard)
-    monkeypatch.setattr(main_module, "_mc_viewer_proc", proc)
-    monkeypatch.setattr(main_module, "_mc_viewer_stderr_fh", None)
 
-    main_module._maybe_block_dashboard(hold_open=False)
+    # Patch the ViewerManager instance that _maybe_block_dashboard actually uses
+    monkeypatch.setattr(viewer_module._viewer_manager, "dashboard_server", dashboard)
+    monkeypatch.setattr(viewer_module._viewer_manager, "mc_viewer_proc", proc)
+    monkeypatch.setattr(viewer_module._viewer_manager, "mc_viewer_stderr_fh", None)
+
+    # Also patch the legacy module-level variables so _load_legacy_viewer_state
+    # doesn't overwrite the ViewerManager state
+    monkeypatch.setattr(viewer_module, "_dashboard_server", dashboard)
+    monkeypatch.setattr(viewer_module, "_mc_viewer_proc", proc)
+    monkeypatch.setattr(viewer_module, "_mc_viewer_stderr_fh", None)
+
+    viewer_module._maybe_block_dashboard(hold_open=False)
 
     assert dashboard.shutdown_called is True
     assert proc.terminated is True
     assert proc.waited is True
-    assert main_module._dashboard_server is None
-    assert main_module._mc_viewer_proc is None
+    # After cleanup, legacy state should be None
+    assert viewer_module._dashboard_server is None
+    assert viewer_module._mc_viewer_proc is None

@@ -3,18 +3,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 import requests
 
 from bot.config import AppConfig, load_config
+
+LOGGER = logging.getLogger(__name__)
 
 ERROR_SERVICE_DOWN = "E_SERVICE_DOWN"
 ERROR_HEARTBEAT_STALE = "E_HEARTBEAT_STALE"
@@ -23,11 +26,11 @@ ERROR_BACKUP_STALE = "E_BACKUP_STALE"
 
 
 def _utc_now_epoch() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
+    return int(datetime.now(UTC).timestamp())
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _runtime_dir(root: Path) -> Path:
@@ -512,7 +515,7 @@ def run_backup_now(
 
     backups_dir = _backups_dir(root)
     backups_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     backup_dir = backups_dir / timestamp
     backup_dir.mkdir(parents=True, exist_ok=False)
 
@@ -679,9 +682,10 @@ def _send_telegram_message(text: str) -> None:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
-    except Exception:
-        return
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10, verify=True)
+    except Exception as exc:
+        # Log without leaking the token value
+        LOGGER.warning("Telegram message failed (token redacted): %s", type(exc).__name__)
 
 
 def run_watchdog(
@@ -730,7 +734,7 @@ def run_watchdog(
     issue_alert_state = {str(k): int(v) for k, v in issue_alert_state.items() if str(v).isdigit()}
 
     try:
-        global_last = int((global_alert_path.read_text(encoding="utf-8").strip() if global_alert_path.exists() else "0"))
+        global_last = int(global_alert_path.read_text(encoding="utf-8").strip() if global_alert_path.exists() else "0")
     except Exception:
         global_last = 0
 

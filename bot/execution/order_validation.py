@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from bot.config import BacktestTuningConfig, RiskConfig
 
@@ -59,7 +59,7 @@ def expected_move_too_small(
 
 
 def minutes_to_next_rollover(ts: datetime, *, hour: int, minute: int) -> float:
-    ts_utc = ts.astimezone(timezone.utc)
+    ts_utc = ts.astimezone(UTC)
     rollover = ts_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if ts_utc >= rollover:
         rollover += timedelta(days=1)
@@ -78,7 +78,7 @@ def in_rollover_entry_block_window(
     if before <= 0 and after <= 0:
         return False
 
-    ts_utc = ts.astimezone(timezone.utc)
+    ts_utc = ts.astimezone(UTC)
     next_roll = ts_utc.replace(hour=swap_hour, minute=swap_minute, second=0, microsecond=0)
     if ts_utc >= next_roll:
         next_roll += timedelta(days=1)

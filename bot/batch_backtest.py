@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -17,8 +17,8 @@ from bot.backtest.data_provider import normalize_timeframe
 
 def _to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def iter_months(dt_start: datetime, dt_end: datetime) -> list[tuple[int, int]]:
@@ -26,14 +26,14 @@ def iter_months(dt_start: datetime, dt_end: datetime) -> list[tuple[int, int]]:
     end = _to_utc(dt_end)
     if start >= end:
         return []
-    current = datetime(start.year, start.month, 1, tzinfo=timezone.utc)
+    current = datetime(start.year, start.month, 1, tzinfo=UTC)
     out: list[tuple[int, int]] = []
     while current < end:
         out.append((current.year, current.month))
         if current.month == 12:
-            current = datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
+            current = datetime(current.year + 1, 1, 1, tzinfo=UTC)
         else:
-            current = datetime(current.year, current.month + 1, 1, tzinfo=timezone.utc)
+            current = datetime(current.year, current.month + 1, 1, tzinfo=UTC)
     return out
 
 
@@ -82,13 +82,13 @@ def resolve_parquet_files(
 
 def _month_start(dt: datetime) -> datetime:
     dt = _to_utc(dt)
-    return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+    return datetime(dt.year, dt.month, 1, tzinfo=UTC)
 
 
 def _next_month(dt: datetime) -> datetime:
     if dt.month == 12:
-        return datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
-    return datetime(dt.year, dt.month + 1, 1, tzinfo=timezone.utc)
+        return datetime(dt.year + 1, 1, 1, tzinfo=UTC)
+    return datetime(dt.year, dt.month + 1, 1, tzinfo=UTC)
 
 
 @dataclass(slots=True)
@@ -317,7 +317,7 @@ def merge_results(out_root: str | Path, initial_equity: float) -> dict[str, Any]
     drawdown = (rolling_peak - curve).max()
     wins = int((pnl > 0).sum())
     losses = int((pnl <= 0).sum())
-    trades = int(len(combined))
+    trades = len(combined)
     total_pnl = float(pnl.sum())
     total_fees = float(fees.sum())
     net_pnl = float(net.sum())

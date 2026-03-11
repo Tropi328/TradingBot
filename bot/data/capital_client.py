@@ -58,6 +58,10 @@ class TokenBucketLimiter:
                 self.last_refill = now
                 if self.tokens >= 1.0:
                     self.tokens -= 1.0
+                    # Add random jitter (0-200ms) to avoid burst patterns
+                    jitter = random.uniform(0.0, 0.2)  # noqa: S311
+                    if jitter > 0.01:
+                        time.sleep(jitter)
                     return
                 wait_seconds = (1.0 - self.tokens) / self.rate_per_second
             time.sleep(wait_seconds)
@@ -126,6 +130,7 @@ class CapitalClient:
         self.session_refresh_min_interval_seconds = max(1, int(session_refresh_min_interval_seconds))
 
         self.session = requests.Session()
+        self.session.verify = True
         self.session.headers.update(
             {
                 "Accept": "application/json",

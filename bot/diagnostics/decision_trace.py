@@ -7,13 +7,16 @@ Two event types:
 
 The module is designed to be safe to call in any mode (BACKTEST, PAPER, LIVE).
 If the path is ``None`` or the feature is disabled, every call is a no-op.
+
+Log rotation: when the file exceeds *max_bytes* it is renamed to ``.1``
+and older backups are shifted (``.1`` -> ``.2``, etc.) up to *max_backups*.
 """
+
 from __future__ import annotations
 
 import json
 import logging
-import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -22,23 +25,57 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Minimal schema keys (used for validation in tests)
 # ---------------------------------------------------------------------------
-DECISION_REQUIRED_KEYS = frozenset({
-    "type", "ts", "symbol", "tf", "candidates", "signal", "features_ok",
-    "score", "threshold", "reject_reason",
-})
+DECISION_REQUIRED_KEYS = frozenset(
+    {
+        "type",
+        "ts",
+        "symbol",
+        "tf",
+        "candidates",
+        "signal",
+        "features_ok",
+        "score",
+        "threshold",
+        "reject_reason",
+    }
+)
 
-FILL_REQUIRED_KEYS = frozenset({
-    "type", "ts", "symbol", "side", "pnl", "equity_after", "reason_close",
-})
+FILL_REQUIRED_KEYS = frozenset(
+    {
+        "type",
+        "ts",
+        "symbol",
+        "side",
+        "pnl",
+        "equity_after",
+        "reason_close",
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Defaults for rotation
+# ---------------------------------------------------------------------------
+_DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+_DEFAULT_MAX_BACKUPS = 5
 
 
 class DecisionTraceWriter:
-    """Append-only JSONL writer with per-line flush."""
+    """Append-only JSONL writer with per-line flush and automatic rotation."""
 
-    def __init__(self, path: str | Path | None, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        path: str | Path | None,
+        *,
+        enabled: bool = True,
+        max_bytes: int = _DEFAULT_MAX_BYTES,
+        max_backups: int = _DEFAULT_MAX_BACKUPS,
+    ) -> None:
         self._path: Path | None = Path(path) if path else None
         self._enabled = enabled and self._path is not None
         self._handle: IO[str] | None = None
+        self._max_bytes = max(1024, max_bytes)
+        self._max_backups = max(0, max_backups)
+        self._bytes_written: int = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -47,19 +84,52 @@ class DecisionTraceWriter:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self._path.open("a", encoding="utf-8")
-        LOGGER.info("DecisionTrace → %s (append)", self._path)
+        self._bytes_written = self._path.stat().st_size if self._path.exists() else 0
+        LOGGER.info(
+            "DecisionTrace → %s (append, rotation at %d MB)",
+            self._path,
+            self._max_bytes // (1024 * 1024),
+        )
 
     def close(self) -> None:
         if self._handle is not None:
             self._handle.close()
             self._handle = None
 
-    def __enter__(self) -> "DecisionTraceWriter":
+    def __enter__(self) -> DecisionTraceWriter:
         self.open()
         return self
 
     def __exit__(self, *_: Any) -> None:
         self.close()
+
+    # -- rotation ------------------------------------------------------------
+
+    def _rotate(self) -> None:
+        """Rotate log files: current -> .1, .1 -> .2, ... up to max_backups."""
+        if self._path is None:
+            return
+        self.close()
+        name = self._path.name  # e.g. "decision_trace.jsonl"
+        parent = self._path.parent
+        # Shift existing backups: drop oldest, shift rest up by 1
+        for i in range(self._max_backups, 0, -1):
+            src = parent / f"{name}.{i}"
+            if i == self._max_backups:
+                if src.exists():
+                    src.unlink()
+            else:
+                dst = parent / f"{name}.{i + 1}"
+                if src.exists():
+                    src.rename(dst)
+        # Move current file to .1
+        backup_1 = parent / f"{name}.1"
+        if self._path.exists():
+            self._path.rename(backup_1)
+        # Re-open fresh file
+        self._handle = self._path.open("a", encoding="utf-8")
+        self._bytes_written = 0
+        LOGGER.info("DecisionTrace rotated → %s", backup_1)
 
     # -- public API ----------------------------------------------------------
 
@@ -68,14 +138,19 @@ class DecisionTraceWriter:
         return self._enabled and self._handle is not None
 
     def emit(self, event: dict[str, Any]) -> None:
-        """Write one JSON line and flush immediately."""
+        """Write one JSON line and flush immediately. Rotates if size exceeded."""
         if not self.active:
             return
-        assert self._handle is not None
+        if self._handle is None:
+            return
         try:
             line = json.dumps(event, ensure_ascii=False, default=str)
-            self._handle.write(line + "\n")
+            data = line + "\n"
+            self._handle.write(data)
             self._handle.flush()
+            self._bytes_written += len(data.encode("utf-8"))
+            if self._bytes_written >= self._max_bytes and self._max_backups > 0:
+                self._rotate()
         except Exception:
             LOGGER.exception("DecisionTrace write error")
 
@@ -168,10 +243,11 @@ class DecisionTraceWriter:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _iso(dt: datetime) -> str:
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _r(val: float | None, digits: int = 4) -> float | None:

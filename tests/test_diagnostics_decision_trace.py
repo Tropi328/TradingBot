@@ -150,6 +150,66 @@ class TestDecisionTraceWriterUnit:
         assert event["custom_field"] == 42
         assert event["strategy"] == "ICT"
 
+    def test_rotation_triggers_on_max_bytes(self, trace_path: Path) -> None:
+        """File rotates when size exceeds max_bytes."""
+        writer = DecisionTraceWriter(trace_path, enabled=True, max_bytes=1024, max_backups=3)
+        writer.open()
+        # Write enough events to exceed 1 KB
+        for i in range(30):
+            writer.decision(
+                ts=datetime(2024, 6, 1, 12, i, tzinfo=timezone.utc),
+                symbol="XAUUSD",
+                score=float(i),
+                threshold=65.0,
+            )
+        writer.close()
+
+        parent = trace_path.parent
+        name = trace_path.name
+        backup_1 = parent / f"{name}.1"
+        assert trace_path.exists(), "Current file should exist"
+        assert backup_1.exists(), "Backup .1 should have been created"
+        # Current file should be smaller than max_bytes (freshly rotated)
+        assert trace_path.stat().st_size < 1024
+
+    def test_rotation_respects_max_backups(self, trace_path: Path) -> None:
+        """Only max_backups backup files are kept."""
+        writer = DecisionTraceWriter(trace_path, enabled=True, max_bytes=512, max_backups=2)
+        writer.open()
+        # Write many events to force multiple rotations
+        for i in range(100):
+            writer.decision(
+                ts=datetime(2024, 6, 1, 12, i % 60, tzinfo=timezone.utc),
+                symbol="XAUUSD",
+                score=float(i),
+                threshold=65.0,
+            )
+        writer.close()
+
+        parent = trace_path.parent
+        name = trace_path.name
+        assert (parent / f"{name}.1").exists()
+        assert (parent / f"{name}.2").exists()
+        assert not (parent / f"{name}.3").exists(), "Should not exceed max_backups=2"
+
+    def test_no_rotation_when_max_backups_zero(self, trace_path: Path) -> None:
+        """With max_backups=0, rotation is disabled entirely."""
+        writer = DecisionTraceWriter(trace_path, enabled=True, max_bytes=512, max_backups=0)
+        writer.open()
+        for i in range(50):
+            writer.decision(
+                ts=datetime(2024, 6, 1, 12, i % 60, tzinfo=timezone.utc),
+                symbol="XAUUSD",
+                score=float(i),
+                threshold=65.0,
+            )
+        writer.close()
+
+        parent = trace_path.parent
+        name = trace_path.name
+        assert trace_path.exists()
+        assert not (parent / f"{name}.1").exists(), "No backups should be created"
+
     def test_score_breakdown_roundtrip(self, trace_path: Path) -> None:
         breakdown = [
             {"k": "bias", "v": 20.0},

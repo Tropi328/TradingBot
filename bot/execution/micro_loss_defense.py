@@ -44,7 +44,7 @@ class MicroLossDefenseConfig(BaseModel):
     be_buffer_ticks: float = 0.05
 
     @model_validator(mode="after")
-    def validate(self) -> "MicroLossDefenseConfig":
+    def validate(self) -> MicroLossDefenseConfig:
         if self.micro_loss_k <= 0:
             raise ValueError("micro_loss_k must be > 0")
         if self.min_stop_spread_mult < 0:

@@ -17,6 +17,7 @@ from bot.strategy.contracts import (
 from bot.strategy.indicators import atr, ema, latest_value, real_body
 from bot.strategy.state_machine import StrategySignal
 from bot.strategy.trace import closed_candles
+from bot.strategy.utils import as_float, as_int
 
 
 @dataclass(slots=True)
@@ -44,19 +45,8 @@ class TrendPullbackM15Strategy(StrategyPlugin):
             return raw
         return {}
 
-    @staticmethod
-    def _as_float(value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _as_int(value: Any, default: int) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
+    _as_float = staticmethod(as_float)
+    _as_int = staticmethod(as_int)
 
     def preprocess(self, symbol: str, data: StrategyDataBundle) -> None:
         self._symbol_state(symbol)

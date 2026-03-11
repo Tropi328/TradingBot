@@ -44,7 +44,12 @@ class AlertDispatcher:
 
         details = f"[{level.upper()}] {event}: {message}"
         if context:
-            context_suffix = " | " + " ".join(f"{k}={v}" for k, v in context.items())
+            _sensitive = {"token", "password", "secret", "api_key", "private_key", "chat_id", "credential"}
+            safe_ctx = {
+                k: "***REDACTED***" if any(s in k.lower() for s in _sensitive) else v
+                for k, v in context.items()
+            }
+            context_suffix = " | " + " ".join(f"{k}={v}" for k, v in safe_ctx.items())
             details += context_suffix
 
         self._send_discord(details)
@@ -55,9 +60,9 @@ class AlertDispatcher:
         if not webhook:
             return
         try:
-            response = requests.post(webhook, json={"content": text}, timeout=10)
+            response = requests.post(webhook, json={"content": text}, timeout=10, verify=True)
             response.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             LOGGER.warning("Discord alert failed: %s", exc)
 
     def _send_telegram(self, text: str) -> None:
@@ -68,7 +73,7 @@ class AlertDispatcher:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": text}
         try:
-            response = requests.post(url, json=payload, timeout=10)
+            response = requests.post(url, json=payload, timeout=10, verify=True)
             response.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Telegram alert failed: %s", exc)
+        except Exception as exc:
+            LOGGER.warning("Telegram alert failed (token and chat_id redacted): %s", exc)

@@ -5,6 +5,33 @@ from dataclasses import dataclass
 
 from bot.data.candles import Candle
 
+# ---------------------------------------------------------------------------
+# EMA cache (mirrors ATR cache pattern)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class _EmaCacheEntry:
+    output: list[float | None]
+    prev_ema: float
+
+
+_EMA_CACHE: OrderedDict[tuple, _EmaCacheEntry] = OrderedDict()
+_EMA_CACHE_MAX_ENTRIES = 64
+
+
+def _ema_cache_key(values: list[float], period: int) -> tuple:
+    n = len(values)
+    v0 = round(values[0], 8) if n else None
+    vN = round(values[-1], 8) if n else None
+    return (n, v0, vN, int(period))
+
+
+def _ema_cache_store(key: tuple, entry: _EmaCacheEntry) -> None:
+    _EMA_CACHE[key] = entry
+    _EMA_CACHE.move_to_end(key)
+    while len(_EMA_CACHE) > _EMA_CACHE_MAX_ENTRIES:
+        _EMA_CACHE.popitem(last=False)
+
 
 def ema(values: list[float], period: int) -> list[float | None]:
     if not values:
@@ -14,6 +41,13 @@ def ema(values: list[float], period: int) -> list[float | None]:
     output: list[float | None] = [None] * len(values)
     if len(values) < period:
         return output
+
+    key = _ema_cache_key(values, period)
+    cached = _EMA_CACHE.get(key)
+    if cached is not None and len(cached.output) == len(values):
+        _EMA_CACHE.move_to_end(key)
+        return cached.output
+
     seed = sum(values[:period]) / period
     output[period - 1] = seed
     alpha = 2 / (period + 1)
@@ -21,6 +55,8 @@ def ema(values: list[float], period: int) -> list[float | None]:
     for i in range(period, len(values)):
         prev = (values[i] - prev) * alpha + prev
         output[i] = prev
+
+    _ema_cache_store(key, _EmaCacheEntry(output=output, prev_ema=prev))
     return output
 
 

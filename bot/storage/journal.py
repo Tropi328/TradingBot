@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 from bot.capital_ramp import CapitalRampEvent, CapitalRampState
 from bot.storage.models import (
@@ -20,8 +21,8 @@ def _to_iso(dt: datetime | None) -> str | None:
     if dt is None:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
 
 
 def _from_iso(value: str | None) -> datetime | None:
@@ -53,7 +54,7 @@ class Journal:
             self.conn.commit()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self) -> Generator[None, None, None]:
         self._transaction_depth += 1
         try:
             yield
@@ -244,13 +245,13 @@ class Journal:
             stats = DailyStats(
                 trading_day=trading_day,
                 epic=epic,
-                updated_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(UTC),
             )
             self.upsert_daily_stats(stats)
             return stats
         return DailyStats(
             trading_day=row["trading_day"],
-            epic=row["epic"] if "epic" in row.keys() else epic,
+            epic=row["epic"] if "epic" in row else epic,
             pnl=float(row["pnl"]),
             trades_count=int(row["trades_count"]),
             status=row["status"],
@@ -258,7 +259,7 @@ class Journal:
         )
 
     def upsert_daily_stats(self, stats: DailyStats) -> None:
-        updated_at = stats.updated_at or datetime.now(timezone.utc)
+        updated_at = stats.updated_at or datetime.now(UTC)
         with self.lock:
             self.conn.execute(
                 """
@@ -284,21 +285,21 @@ class Journal:
     def increment_daily_trades(self, trading_day: str, increment: int = 1, epic: str = "GLOBAL") -> DailyStats:
         stats = self.get_daily_stats(trading_day, epic=epic)
         stats.trades_count += increment
-        stats.updated_at = datetime.now(timezone.utc)
+        stats.updated_at = datetime.now(UTC)
         self.upsert_daily_stats(stats)
         return stats
 
     def add_daily_pnl(self, trading_day: str, pnl_delta: float, epic: str = "GLOBAL") -> DailyStats:
         stats = self.get_daily_stats(trading_day, epic=epic)
         stats.pnl += pnl_delta
-        stats.updated_at = datetime.now(timezone.utc)
+        stats.updated_at = datetime.now(UTC)
         self.upsert_daily_stats(stats)
         return stats
 
     def set_daily_status(self, trading_day: str, status: str, epic: str = "GLOBAL") -> DailyStats:
         stats = self.get_daily_stats(trading_day, epic=epic)
         stats.status = status
-        stats.updated_at = datetime.now(timezone.utc)
+        stats.updated_at = datetime.now(UTC)
         self.upsert_daily_stats(stats)
         return stats
 
@@ -308,7 +309,7 @@ class Journal:
             (scope,),
         ).fetchone()
         if row is None:
-            state = RiskState(scope=scope, updated_at=datetime.now(timezone.utc))
+            state = RiskState(scope=scope, updated_at=datetime.now(UTC))
             self.upsert_risk_state(state)
             return state
         return RiskState(
@@ -319,7 +320,7 @@ class Journal:
         )
 
     def upsert_risk_state(self, state: RiskState) -> None:
-        now = state.updated_at or datetime.now(timezone.utc)
+        now = state.updated_at or datetime.now(UTC)
         with self.lock:
             self.conn.execute(
                 """
@@ -357,7 +358,7 @@ class Journal:
         return CapitalRampState(
             scope=str(row["scope"]),
             timezone_name=str(row["timezone_name"]),
-            start_ts_utc=_from_iso(row["start_ts_utc"]) or datetime.now(timezone.utc),
+            start_ts_utc=_from_iso(row["start_ts_utc"]) or datetime.now(UTC),
             start_year_local=int(row["start_year_local"]),
             start_equity=float(row["start_equity"]),
             monthly_topup=float(row["monthly_topup"]),
@@ -373,7 +374,7 @@ class Journal:
         )
 
     def upsert_capital_ramp_state(self, state: CapitalRampState) -> None:
-        now = state.updated_at_utc or datetime.now(timezone.utc)
+        now = state.updated_at_utc or datetime.now(UTC)
         with self.lock:
             self.conn.execute(
                 """
@@ -461,8 +462,8 @@ class Journal:
                 CapitalRampEvent(
                     scope=str(row["scope"]),
                     event_type=str(row["event_type"]),
-                    event_ts_utc=_from_iso(row["event_ts_utc"]) or datetime.now(timezone.utc),
-                    local_date=_from_iso_date(row["local_date"]) or datetime.now(timezone.utc).date(),
+                    event_ts_utc=_from_iso(row["event_ts_utc"]) or datetime.now(UTC),
+                    local_date=_from_iso_date(row["local_date"]) or datetime.now(UTC).date(),
                     amount=float(row["amount"]),
                     model_equity=float(row["model_equity"]),
                     payload=payload,
@@ -507,9 +508,9 @@ class Journal:
             status=row["status"],
             remote_status=row["remote_status"] if "remote_status" in row_keys else None,
             filled_size=float(row["filled_size"]) if "filled_size" in row_keys else 0.0,
-            expires_at=_from_iso(row["expires_at"]) or datetime.now(timezone.utc),
-            created_at=_from_iso(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=_from_iso(row["updated_at"]) or datetime.now(timezone.utc),
+            expires_at=_from_iso(row["expires_at"]) or datetime.now(UTC),
+            created_at=_from_iso(row["created_at"]) or datetime.now(UTC),
+            updated_at=_from_iso(row["updated_at"]) or datetime.now(UTC),
             reason_codes=json.loads(row["reason_codes"] or "[]"),
             metadata=json.loads(row["metadata"] or "{}"),
         )
@@ -525,7 +526,7 @@ class Journal:
             stop_price=float(row["stop_price"]),
             take_profit=float(row["take_profit"]),
             status=row["status"],
-            opened_at=_from_iso(row["opened_at"]) or datetime.now(timezone.utc),
+            opened_at=_from_iso(row["opened_at"]) or datetime.now(UTC),
             closed_at=_from_iso(row["closed_at"]),
             partial_closed_size=float(row["partial_closed_size"]),
             pnl=float(row["pnl"]),

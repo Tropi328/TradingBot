@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -34,8 +34,8 @@ def _parse_dt(value: str) -> datetime:
         normalized = normalized[:-1] + "+00:00"
     dt = datetime.fromisoformat(normalized)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _is_relevant_event(event: Event) -> bool:
@@ -97,10 +97,10 @@ class HttpCalendarProvider:
         self.timeout_seconds = timeout_seconds
         self.cache_ttl_seconds = cache_ttl_seconds
         self._cache_events: list[Event] = []
-        self._cache_expiry: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._cache_expiry: datetime = datetime.min.replace(tzinfo=UTC)
 
     def get_high_impact_events(self, start_dt: datetime, end_dt: datetime) -> list[Event]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if now >= self._cache_expiry:
             self._cache_events = self._fetch_events()
             self._cache_expiry = now + timedelta(seconds=self.cache_ttl_seconds)
@@ -114,7 +114,7 @@ class HttpCalendarProvider:
         headers: dict[str, str] = {}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        response = requests.get(self.url, headers=headers, timeout=self.timeout_seconds)
+        response = requests.get(self.url, headers=headers, timeout=self.timeout_seconds, verify=True)
         response.raise_for_status()
         payload = response.json()
         raw_events = payload.get("events", payload) if isinstance(payload, dict) else payload

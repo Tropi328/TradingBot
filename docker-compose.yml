@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   trading-bot-paper:
     build: .
@@ -11,3 +9,9 @@ services:
       - ./logs:/app/logs
       - ./state:/app/state
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import bot; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

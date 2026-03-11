@@ -12,7 +12,14 @@ from bot.strategy.contracts import (
     StrategyEvaluation,
     StrategyPlugin,
 )
-from bot.strategy.state_machine import H1Snapshot, M15Snapshot, M5Snapshot, StrategyDecision, StrategyEngine, StrategySignal
+from bot.strategy.state_machine import (
+    H1Snapshot,
+    M5Snapshot,
+    M15Snapshot,
+    StrategyDecision,
+    StrategyEngine,
+    StrategySignal,
+)
 from bot.strategy.trace import closed_candles
 
 
@@ -43,9 +50,7 @@ class IndexExistingStrategy(StrategyPlugin):
 
     def compute_bias(self, symbol: str, data: StrategyDataBundle) -> BiasState:
         state = self._state(symbol)
-        if data.h1_new_close and data.candles_h1:
-            state.h1_snapshot = self.engine.evaluate_h1(closed_candles(data.candles_h1))
-        elif state.h1_snapshot is None and data.candles_h1:
+        if (data.h1_new_close and data.candles_h1) or (state.h1_snapshot is None and data.candles_h1):
             state.h1_snapshot = self.engine.evaluate_h1(closed_candles(data.candles_h1))
 
         direction = "NEUTRAL"

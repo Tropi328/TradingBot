@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from bot.research.objective import (
     OBJECTIVE_FAIL_VALUE,
@@ -14,7 +15,6 @@ from bot.research.objective import (
     evaluate_dd_constraints,
     objective_rank_key,
 )
-
 
 DEFAULT_DEEP_BUDGET = "deep"
 
@@ -33,15 +33,15 @@ def _parse_datetime_utc(value: str, *, end_value: bool = False) -> datetime:
         normalized = normalized[:-1] + "+00:00"
     dt = datetime.fromisoformat(normalized)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    dt = dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    dt = dt.astimezone(UTC)
     if end_value and len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
         dt += timedelta(days=1)
     return dt
 
 
 def _date_floor_utc(dt: datetime) -> datetime:
-    return datetime.combine(dt.date(), time.min, tzinfo=timezone.utc)
+    return datetime.combine(dt.date(), time.min, tzinfo=UTC)
 
 
 def _cli_end_from_exclusive(end_exclusive: datetime) -> str:
@@ -110,7 +110,7 @@ def build_time_split(
 
     ratio = float(split_ratio_is)
     ratio = max(0.05, min(0.95, ratio))
-    target_is_days = max(1, min(total_days - 1, int(round(total_days * ratio))))
+    target_is_days = max(1, min(total_days - 1, round(total_days * ratio)))
 
     min_is = max(1, int(min_days_is))
     min_oos = max(1, int(min_days_oos))

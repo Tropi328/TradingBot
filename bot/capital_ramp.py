@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 
 START_EQUITY_PLN = 100.0
 MONTHLY_TOPUP_PLN = 100.0
@@ -34,8 +33,8 @@ def _first_day_next_month(local_day: date) -> date:
 
 def _as_utc(ts: datetime) -> datetime:
     if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 @dataclass(slots=True)
@@ -85,7 +84,7 @@ class CapitalRampRuntime:
         now_utc: datetime,
         timezone_name: str,
         current_closed_pnl: float,
-    ) -> "CapitalRampRuntime":
+    ) -> CapitalRampRuntime:
         now = _as_utc(now_utc)
         local_day = now.astimezone(_zone(timezone_name)).date()
         state = CapitalRampState(

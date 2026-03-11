@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 
@@ -136,8 +137,6 @@ def compute_metrics(
         if raw is not None:
             entry_timestamps.append(str(raw))
     if len(entry_timestamps) >= 2:
-        from datetime import datetime
-
         sorted_ts = sorted(entry_timestamps)
         first = _parse_timestamp(sorted_ts[0])
         last = _parse_timestamp(sorted_ts[-1])
@@ -223,7 +222,7 @@ def compute_metrics(
     return metrics
 
 
-def _parse_timestamp(raw: str):
+def _parse_timestamp(raw: str) -> datetime | None:
     from datetime import datetime
 
     raw = raw.strip()

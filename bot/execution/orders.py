@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from bot.data.capital_client import CapitalAPIError, CapitalClient
 from bot.execution.utils import strip_mode_prefix as _strip_mode_prefix
@@ -59,7 +59,7 @@ class OrderExecutor:
         currency: str | None = None,
         idempotency_key: str | None = None,
     ) -> OrderRecord:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         order_epic = epic or self.default_epic
         order_currency = currency or self.default_currency
         request_id = idempotency_key or f"{self.mode_prefix}-REQ-{uuid.uuid4().hex[:20]}"
@@ -133,7 +133,7 @@ class OrderExecutor:
         return record
 
     def cancel_order(self, order_id: str) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if not self.dry_run and self.client is not None:
             try:
                 self.client.cancel_working_order(_strip_mode_prefix(order_id))
@@ -183,7 +183,7 @@ class OrderExecutor:
             if deal_id:
                 remote_by_id[str(deal_id)] = data
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for order in self.get_pending_orders():
             remote = remote_by_id.get(_strip_mode_prefix(order.order_id))
             if remote is not None:

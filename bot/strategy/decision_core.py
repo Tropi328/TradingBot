@@ -19,6 +19,7 @@ from bot.strategy.contracts import (
 )
 from bot.strategy.orderflow import OrderflowSnapshot
 from bot.strategy.schedule import is_schedule_open
+from bot.strategy.utils import DEFAULT_MAX_SPREAD_RATIO, as_float, as_int
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +83,7 @@ def clamp_value(value: float, min_value: float, max_value: float) -> float:
 
 
 def resolve_spread(
-    evaluation: "StrategyEvaluation",
+    evaluation: StrategyEvaluation,
     *,
     policy_source: str = "snapshot_only",
 ) -> float | None:
@@ -141,16 +142,15 @@ def pick_best_candidate(
     return best_candidate, best_eval
 
 
-def resolve_orderflow_mode(*, symbol: str, route_params: dict[str, object], default_mode: str, full_symbols: set[str]) -> str:
-    params = route_params.get("orderflow")
-    if isinstance(params, dict):
-        mode = str(params.get("mode", "")).strip().upper()
-        if mode in {"LITE", "FULL"}:
-            return mode
-    if symbol.strip().upper() in full_symbols:
-        return "FULL"
-    mode = default_mode.strip().upper()
-    return mode if mode in {"LITE", "FULL"} else "LITE"
+def resolve_orderflow_mode(
+    *, symbol: str, route_params: dict[str, object], default_mode: str = "LITE", full_symbols: set[str] | None = None
+) -> str:
+    """Always returns ``"LITE"`` — FULL mode has been removed.
+
+    The *default_mode* and *full_symbols* parameters are accepted for backward
+    compatibility but ignored.
+    """
+    return "LITE"
 
 
 def orderflow_param(
@@ -224,7 +224,9 @@ def compute_v2_score_core(
     bias_raw = float(max(raw.get("bias", 0.0), raw.get("trend_strength", 0.0), raw.get("breakout_quality", 0.0)))
     sweep_raw = float(max(raw.get("sweep", 0.0), raw.get("liquidity_setup", 0.0), raw.get("retest_quality", 0.0)))
     mss_raw = float(max(raw.get("mss", 0.0), raw.get("confirmation_strength", 0.0), raw.get("trigger_quality", 0.0)))
-    displacement_raw = float(max(raw.get("displacement", 0.0), raw.get("trigger_quality", 0.0), raw.get("confirmation_strength", 0.0)))
+    displacement_raw = float(
+        max(raw.get("displacement", 0.0), raw.get("trigger_quality", 0.0), raw.get("confirmation_strength", 0.0))
+    )
     fvg_raw = float(max(raw.get("fvg", 0.0), raw.get("mitigation_quality", 0.0), raw.get("retest_quality", 0.0)))
 
     bias_regime = clamp_value((bias_raw / 20.0) * 15.0, 0.0, 15.0)
@@ -265,10 +267,10 @@ def compute_v2_score_core(
                 spread_ratio = spread_float / atr_float
         except (TypeError, ValueError):
             spread_ratio = None
-    max_spread_ratio = 0.15
+    max_spread_ratio = DEFAULT_MAX_SPREAD_RATIO
     gates_cfg = route_params.get("quality_gates")
     if isinstance(gates_cfg, dict):
-        max_spread_ratio = float(gates_cfg.get("spread_ratio_max", 0.15))
+        max_spread_ratio = float(gates_cfg.get("spread_ratio_max", DEFAULT_MAX_SPREAD_RATIO))
     if spread_ratio is None:
         spread_ratio_score = 3.0
         slippage_risk_score = 2.0
@@ -346,7 +348,9 @@ def compute_v2_score_core(
                 trigger_bonus_cap,
             )
             execution_quality = clamp_value(1.0 - (of_spread_ratio / max(max_spread_ratio, 1e-9)), 0.0, 1.0)
-            of_execution_bonus = clamp_value(confidence * execution_quality * execution_bonus_cap, 0.0, execution_bonus_cap)
+            of_execution_bonus = clamp_value(
+                confidence * execution_quality * execution_bonus_cap, 0.0, execution_bonus_cap
+            )
         else:
             of_trigger_bonus = 0.0
             of_execution_bonus = 0.0
@@ -382,7 +386,12 @@ def compute_v2_score_core(
     if of_divergence_penalty > 0:
         penalties["OF_DIVERGENCE"] = max(penalties.get("OF_DIVERGENCE", 0.0), of_divergence_penalty)
 
-    if policy.apply_ohlc_soft_spread_penalty and spread_mode == "ASSUMED_OHLC" and spread_ratio is not None and spread_ratio > max_spread_ratio:
+    if (
+        policy.apply_ohlc_soft_spread_penalty
+        and spread_mode == "ASSUMED_OHLC"
+        and spread_ratio is not None
+        and spread_ratio > max_spread_ratio
+    ):
         if config is None:
             raise ValueError("config is required when apply_ohlc_soft_spread_penalty=True")
         soft_penalty = float(config.backtest_tuning.ohlc_only_spread_soft_penalty)
@@ -472,23 +481,14 @@ def evaluate_hard_gates_core(
 
     gates_cfg = route_params.get("quality_gates")
     if isinstance(gates_cfg, dict):
-        max_spread_ratio = float(gates_cfg.get("spread_ratio_max", 0.15))
-        try:
-            min_confirm = max(0, int(gates_cfg.get("min_confirm", 0)))
-        except (TypeError, ValueError):
-            min_confirm = 0
-        try:
-            min_confirm_trade = max(0, int(gates_cfg.get("min_confirm_trade", min_confirm)))
-        except (TypeError, ValueError):
-            min_confirm_trade = min_confirm
-        try:
-            min_confirm_small = max(0, int(gates_cfg.get("min_confirm_small", max(0, min_confirm_trade - 1))))
-        except (TypeError, ValueError):
-            min_confirm_small = max(0, min_confirm_trade - 1)
+        max_spread_ratio = float(gates_cfg.get("spread_ratio_max", DEFAULT_MAX_SPREAD_RATIO))
+        min_confirm = max(0, as_int(gates_cfg.get("min_confirm"), 0))
+        min_confirm_trade = max(0, as_int(gates_cfg.get("min_confirm_trade"), min_confirm))
+        min_confirm_small = max(0, as_int(gates_cfg.get("min_confirm_small"), max(0, min_confirm_trade - 1)))
         if min_confirm_small > min_confirm_trade:
             min_confirm_small = min_confirm_trade
     else:
-        max_spread_ratio = 0.15
+        max_spread_ratio = DEFAULT_MAX_SPREAD_RATIO
         min_confirm = 0
         min_confirm_trade = 0
         min_confirm_small = 0
@@ -498,7 +498,11 @@ def evaluate_hard_gates_core(
     # Use resolve_spread() — same helper used by scoring — for consistent spread source.
     _gate_spread_source = (
         "snapshot_or_metadata"
-        if (policy.allow_mid_close_fallback_without_spread or policy.allow_ohlc_spread_soft_skip or policy.enable_confirmation_rules)
+        if (
+            policy.allow_mid_close_fallback_without_spread
+            or policy.allow_ohlc_spread_soft_skip
+            or policy.enable_confirmation_rules
+        )
         else "snapshot_only"
     )
     spread_value = resolve_spread(evaluation, policy_source=_gate_spread_source)
@@ -578,8 +582,7 @@ def evaluate_hard_gates_core(
 
     if policy.enable_confirmation_rules:
         has_candidate = (
-            evaluation.metadata.get("candidate_id") is not None
-            or evaluation.metadata.get("setup_id") is not None
+            evaluation.metadata.get("candidate_id") is not None or evaluation.metadata.get("setup_id") is not None
         )
         required_confirm = 0
         if has_candidate:
@@ -588,16 +591,15 @@ def evaluate_hard_gates_core(
             elif evaluation.action == DecisionAction.SMALL:
                 required_confirm = min_confirm_small
         if required_confirm > 0 and has_candidate:
-            trigger_raw = evaluation.metadata.get("trigger_confirmations", evaluation.snapshot.get("trigger_confirmations"))
+            trigger_raw = evaluation.metadata.get(
+                "trigger_confirmations", evaluation.snapshot.get("trigger_confirmations")
+            )
             if trigger_raw is None:
                 missing_features.append("trigger_confirmations")
                 gates["ExecutionGate"] = False
                 reasons.append("EXEC_FAIL_MISSING_FEATURES")
             else:
-                try:
-                    trigger_int = int(trigger_raw)
-                except (TypeError, ValueError):
-                    trigger_int = -1
+                trigger_int = as_int(trigger_raw, -1)
                 if trigger_int < required_confirm:
                     can_downgrade_to_small = (
                         policy.enable_trade_to_small_downgrade
@@ -684,6 +686,10 @@ def apply_orderflow_small_soft_gate(
     evaluation: StrategyEvaluation,
     orderflow_settings: dict[str, float] | None,
 ) -> StrategyEvaluation:
+    # When V3 is active, chop is handled by the of_chop_score feature +
+    # of_high_chop penalty inside heuristic_score_v3.  Skip the legacy gate.
+    if evaluation.metadata.get("score_v3") is not None:
+        return evaluation
     if evaluation.action != DecisionAction.SMALL:
         return evaluation
     snapshot_raw = evaluation.metadata.get("orderflow_snapshot")
@@ -693,14 +699,8 @@ def apply_orderflow_small_soft_gate(
     if not isinstance(metrics, dict):
         return evaluation
 
-    try:
-        confidence = float(snapshot_raw.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    try:
-        chop_score = float(metrics.get("chop_score", 0.0))
-    except (TypeError, ValueError):
-        chop_score = 0.0
+    confidence = as_float(snapshot_raw.get("confidence"), 0.0)
+    chop_score = as_float(metrics.get("chop_score"), 0.0)
 
     conf_threshold = orderflow_param(
         route_params=route_params,

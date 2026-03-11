@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -15,7 +15,7 @@ def _get_zone(timezone_name: str) -> ZoneInfo:
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def warsaw_now() -> datetime:
@@ -98,11 +98,11 @@ def expected_closed_candle_utc(
     close_grace_seconds: int,
 ) -> datetime:
     if now_utc.tzinfo is None:
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
-    anchor = now_utc.astimezone(timezone.utc) - timedelta(seconds=max(0, close_grace_seconds))
+        now_utc = now_utc.replace(tzinfo=UTC)
+    anchor = now_utc.astimezone(UTC) - timedelta(seconds=max(0, close_grace_seconds))
     interval_seconds = timeframe_minutes * 60
     closed_epoch = int(anchor.timestamp()) // interval_seconds * interval_seconds
-    return datetime.fromtimestamp(closed_epoch, tz=timezone.utc)
+    return datetime.fromtimestamp(closed_epoch, tz=UTC)
 
 
 def should_poll_closed_candle(

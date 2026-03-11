@@ -18,6 +18,7 @@ Public API
 - ``run_monte_carlo_simulation(...)`` — one-shot simulation + file output.
 - ``MonteCarloResult`` — dataclass with all computed statistics.
 """
+
 from __future__ import annotations
 
 import json
@@ -26,10 +27,14 @@ import math
 import os
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from bot.config import MonteCarloConfig
 
 import numpy as np
 
@@ -44,6 +49,7 @@ _EQUITY_MODE_CURRENT = "current"
 # ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class MonteCarloResult:
@@ -74,7 +80,7 @@ class MonteCarloResult:
     prob_ruin: float = 0.0  # fraction of paths that hit ruin
 
     # Additional metrics
-    min_equity_p5: float = 0.0   # 5th-percentile lowest equity reached
+    min_equity_p5: float = 0.0  # 5th-percentile lowest equity reached
     median_return_pct: float = 0.0  # median total-return percentage
     max_consecutive_loss_p95: int = 0  # 95th-percentile longest loss streak
 
@@ -147,6 +153,7 @@ class MonteCarloResult:
 # Core simulation
 # ---------------------------------------------------------------------------
 
+
 def _compute_equity_paths(
     pnls: np.ndarray,
     starting_equity: float,
@@ -183,8 +190,7 @@ def _normalize_sampling_mode(sampling_mode: str) -> str:
     mode = str(sampling_mode or _SAMPLING_IID).strip().lower()
     if mode not in {_SAMPLING_IID, _SAMPLING_MBB}:
         raise ValueError(
-            "sampling_mode must be 'iid_bootstrap' or 'moving_block_bootstrap', "
-            f"got {sampling_mode!r}",
+            f"sampling_mode must be 'iid_bootstrap' or 'moving_block_bootstrap', got {sampling_mode!r}",
         )
     return mode
 
@@ -237,7 +243,7 @@ def _sample_trade_indices_mbb(
 ) -> np.ndarray:
     if block_size < 2:
         raise ValueError(f"block_size must be >= 2, got {block_size}")
-    num_blocks = int(math.ceil(n_trades / float(block_size)))
+    num_blocks = math.ceil(n_trades / float(block_size))
     starts = rng.integers(0, n_trades, size=(num_simulations, num_blocks))
     offsets = np.arange(block_size, dtype=np.int64)
     indices = (starts[..., None] + offsets[None, None, :]) % n_trades
@@ -301,9 +307,7 @@ def _input_trade_stats(pnl_arr: np.ndarray) -> dict[str, float]:
     losses = pnl_arr[pnl_arr <= 0]
     total_wins = float(wins.sum()) if len(wins) else 0.0
     total_losses = float(abs(losses.sum())) if len(losses) else 0.0
-    profit_factor = (total_wins / total_losses) if total_losses > 0 else (
-        float("inf") if total_wins > 0 else 0.0
-    )
+    profit_factor = (total_wins / total_losses) if total_losses > 0 else (float("inf") if total_wins > 0 else 0.0)
     return {
         "win_rate": float(len(wins) / n),
         "avg_pnl": float(pnl_arr.mean()),
@@ -315,6 +319,7 @@ def _input_trade_stats(pnl_arr: np.ndarray) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 # Health score
 # ---------------------------------------------------------------------------
+
 
 def mc_health_score(
     result: MonteCarloResult,
@@ -350,6 +355,7 @@ def mc_health_score(
 # ---------------------------------------------------------------------------
 # Core simulation
 # ---------------------------------------------------------------------------
+
 
 def simulate(
     pnls: Sequence[float],
@@ -396,9 +402,7 @@ def simulate(
     if num_simulations < 1:
         raise ValueError(f"num_simulations must be >= 1, got {num_simulations}")
     if not (0 < ruin_dd_threshold <= 1.0):
-        raise ValueError(
-            f"ruin_dd_threshold must be in (0, 1], got {ruin_dd_threshold}"
-        )
+        raise ValueError(f"ruin_dd_threshold must be in (0, 1], got {ruin_dd_threshold}")
     if ruin_equity_floor_pct is not None and not (0.0 <= float(ruin_equity_floor_pct) <= 1.0):
         raise ValueError("ruin_equity_floor_pct must be in [0, 1]")
     if ruin_equity_floor_abs is not None and float(ruin_equity_floor_abs) < 0:
@@ -412,7 +416,7 @@ def simulate(
     if mode == _SAMPLING_IID and block_size_norm < 1:
         raise ValueError(f"block_size must be >= 1, got {block_size}")
 
-    now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    now_iso = datetime.now(tz=UTC).isoformat(timespec="seconds")
 
     pnl_arr = np.asarray(pnls, dtype=np.float64)
     n_trades = len(pnl_arr)
@@ -469,9 +473,7 @@ def simulate(
     prob_ruin = float(np.mean(ruin_mask))
 
     # Median total-return percentage
-    median_return_pct = float(
-        ((np.median(ends) - starting_equity) / starting_equity) * 100
-    )
+    median_return_pct = float(((np.median(ends) - starting_equity) / starting_equity) * 100)
 
     # Max consecutive-loss streak (separate RNG fork for determinism)
     rng_streak = np.random.default_rng(seed)
@@ -535,6 +537,7 @@ def simulate(
 # Chart generation
 # ---------------------------------------------------------------------------
 
+
 def _render_chart(
     result: MonteCarloResult,
     png_path: Path,
@@ -549,6 +552,7 @@ def _render_chart(
     instead of a Python loop — significantly faster for large path counts.
     """
     import matplotlib
+
     # _render_chart always saves to a file — use the non-interactive Agg
     # backend unconditionally.  The live viewer runs in a separate process
     # with its own TkAgg backend, so there is no conflict.
@@ -594,8 +598,9 @@ def _render_chart(
 
     # Ruin threshold line
     ruin_equity = result.starting_equity * (1 - result.ruin_dd)
-    ax.axhline(y=ruin_equity, color="#f38ba8", linewidth=1.2, linestyle=":", alpha=0.8,
-               label=f"Ruin ({result.ruin_dd:.0%} DD)")
+    ax.axhline(
+        y=ruin_equity, color="#f38ba8", linewidth=1.2, linestyle=":", alpha=0.8, label=f"Ruin ({result.ruin_dd:.0%} DD)"
+    )
     if result.ruin_floor_pct is not None:
         floor_pct_equity = result.starting_equity * float(result.ruin_floor_pct)
         ax.axhline(
@@ -622,7 +627,10 @@ def _render_chart(
     # ── labels ───────────────────────────────────────────────────────
     ax.set_title(
         f"Monte Carlo Simulation \u2014 {result.num_simulations:,} paths \u00d7 {result.num_trades} trades",
-        color="#cdd6f4", fontsize=13, fontweight="bold", pad=12,
+        color="#cdd6f4",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
     )
     ax.set_xlabel("Trade #", color="#a6adc8", fontsize=10)
     ax.set_ylabel("Equity", color="#a6adc8", fontsize=10)
@@ -631,11 +639,7 @@ def _render_chart(
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
 
     # ── stats text box (two-column layout) ───────────────────────────
-    pf_str = (
-        f"{result.input_profit_factor:.2f}"
-        if result.input_profit_factor < 9999
-        else "\u221e"
-    )
+    pf_str = f"{result.input_profit_factor:.2f}" if result.input_profit_factor < 9999 else "\u221e"
     stats_text = (
         f"P(ruin \u2265 {result.ruin_dd:.0%}) = {result.prob_ruin:.1%}  "
         f"Health = {result.health_score:.0%}\n"
@@ -651,7 +655,9 @@ def _render_chart(
         f"Consec.Loss p95 = {result.max_consecutive_loss_p95}"
     )
     ax.text(
-        0.02, 0.97, stats_text,
+        0.02,
+        0.97,
+        stats_text,
         transform=ax.transAxes,
         fontsize=8.5,
         verticalalignment="top",
@@ -660,8 +666,9 @@ def _render_chart(
         bbox=dict(boxstyle="round,pad=0.4", facecolor="#313244", edgecolor="#45475a", alpha=0.9),
     )
 
-    ax.legend(loc="lower right", fontsize=8, facecolor="#313244", edgecolor="#45475a",
-              labelcolor="#cdd6f4", framealpha=0.9)
+    ax.legend(
+        loc="lower right", fontsize=8, facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4", framealpha=0.9
+    )
     ax.tick_params(colors="#6c7086")
     for spine in ax.spines.values():
         spine.set_color("#45475a")
@@ -693,6 +700,7 @@ def _render_chart(
 # JSON output
 # ---------------------------------------------------------------------------
 
+
 def _write_json(result: MonteCarloResult, json_path: Path) -> None:
     """Write the summary JSON atomically."""
     payload = result.to_dict()
@@ -712,6 +720,7 @@ def _write_json(result: MonteCarloResult, json_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # High-level API
 # ---------------------------------------------------------------------------
+
 
 def run_monte_carlo_simulation(
     trade_pnls: Sequence[float],
@@ -827,6 +836,7 @@ def run_monte_carlo_simulation(
 # Adaptive Monte-Carlo model
 # ---------------------------------------------------------------------------
 
+
 class MCAdaptiveModel:
     """Real-time MC-based risk scaling model.
 
@@ -892,8 +902,8 @@ class MCAdaptiveModel:
         self._max_step_down = max(0.0, float(max_step_down))
         self._sampling_mode = _normalize_sampling_mode(sampling_mode)
         self._block_size = max(2, int(block_size))
-        self._ruin_floor_pct = (float(ruin_equity_floor_pct) if ruin_equity_floor_pct is not None else None)
-        self._ruin_floor_abs = (float(ruin_equity_floor_abs) if ruin_equity_floor_abs is not None else None)
+        self._ruin_floor_pct = float(ruin_equity_floor_pct) if ruin_equity_floor_pct is not None else None
+        self._ruin_floor_abs = float(ruin_equity_floor_abs) if ruin_equity_floor_abs is not None else None
         self._count_be_as_loss = bool(count_breakeven_as_loss)
         self._equity_mode = _normalize_equity_mode(equity_mode)
 
@@ -1015,8 +1025,10 @@ class MCAdaptiveModel:
             self.health_score,
             target_mult,
             self.risk_multiplier,
-            result.prob_ruin * 100, result.max_dd_p95 * 100,
-            result.input_profit_factor, result.input_win_rate * 100,
+            result.prob_ruin * 100,
+            result.max_dd_p95 * 100,
+            result.input_profit_factor,
+            result.input_win_rate * 100,
         )
         return self.risk_multiplier
 
@@ -1040,14 +1052,13 @@ class MCAdaptiveModel:
     @classmethod
     def from_config(
         cls,
-        mc_config: "MonteCarloConfig",
+        mc_config: MonteCarloConfig,
         *,
         png_path: str | Path | None = None,
         json_path: str | Path | None = None,
-    ) -> "MCAdaptiveModel":
+    ) -> MCAdaptiveModel:
         """Create from a ``MonteCarloConfig`` (reads the ``adaptive`` sub-section)."""
         # Avoid circular import at module level
-        from bot.config import MonteCarloConfig as _MC  # noqa: F811
         a = mc_config.adaptive
         return cls(
             min_trades=a.min_trades,
